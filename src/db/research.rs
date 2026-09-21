@@ -6,7 +6,7 @@ use std::{
 
 use rusqlite::{
     params,
-    types::Type,
+    types::{Type, ValueRef},
     Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
 };
 use serde::Deserialize;
@@ -24,6 +24,10 @@ use crate::{
     reconcile::{
         managed_task_run_signature, managed_task_run_signature_for_observation, task_signature,
     },
+    research_checkpoint::{
+        checkpoint_support_from_persisted_context, select_checkpoint_support,
+        CheckpointSupportEvidenceV1,
+    },
     research_protocol::{parse_research_answer, ResearchAnswer},
     AppError,
 };
@@ -37,6 +41,9 @@ const OPEN_OPERATION_STAGES: &str =
     "('intent','stop_requested','stop_confirmed','successor_reserved')";
 const RESEARCH_RETRY_FAILURE_UNSAFE: &str = "research_session_unsafe";
 const RESEARCH_RETRY_FAILURE_POLICY: &str = "research_policy_blocked";
+const MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES: usize =
+    crate::research_checkpoint::MAX_PREPARED_CHECKPOINT_BYTES;
+const _: () = assert!(MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES == 131_072);
 
 #[derive(Debug)]
 struct RunningResearchCandidate {
@@ -126,7 +133,27 @@ pub struct ResearchReview {
     pub termination_request_id: Option<i64>,
     pub successor_experiment_id: Option<String>,
     pub checkpoint_json: Option<String>,
+    pub(crate) checkpoint_json_state: CheckpointJsonState,
     pub session_generation: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckpointSqliteStorageClass {
+    Null,
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckpointJsonState {
+    Missing,
+    BoundedText,
+    Invalid {
+        storage_class: CheckpointSqliteStorageClass,
+        byte_len: Option<i64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,7 +229,13 @@ const REVIEW_SELECT: &str = "SELECT review_id, campaign_id, experiment_id,
         context_json, context_digest, response_json, termination_request_id,
         successor_experiment_id, evidence_schema_version, session_generation,
         event_id, not_before, notes_json, failure_code, decision_cycle_id,
-        checkpoint_json, created_at, started_at, finished_at, updated_at
+        CASE
+          WHEN typeof(checkpoint_json) = 'text'
+           AND length(CAST(checkpoint_json AS BLOB)) BETWEEN 1 AND 131072
+          THEN checkpoint_json
+        END,
+        created_at, started_at, finished_at, updated_at,
+        typeof(checkpoint_json), length(CAST(checkpoint_json AS BLOB))
     FROM research_reviews";
 const LAUNCH_REVIEW_SELECT: &str = "SELECT review.review_id, review.campaign_id,
         review.experiment_id, review.task_signature, review.attempt, review.state,
@@ -211,8 +244,14 @@ const LAUNCH_REVIEW_SELECT: &str = "SELECT review.review_id, review.campaign_id,
         review.successor_experiment_id, review.evidence_schema_version,
         review.session_generation, review.event_id, review.not_before,
         review.notes_json, review.failure_code, review.decision_cycle_id,
-        review.checkpoint_json, review.created_at, review.started_at,
-        review.finished_at, review.updated_at
+        CASE
+          WHEN typeof(review.checkpoint_json) = 'text'
+           AND length(CAST(review.checkpoint_json AS BLOB)) BETWEEN 1 AND 131072
+          THEN review.checkpoint_json
+        END,
+        review.created_at, review.started_at, review.finished_at,
+        review.updated_at, typeof(review.checkpoint_json),
+        length(CAST(review.checkpoint_json AS BLOB))
     FROM research_reviews AS review";
 
 impl<'db> ResearchRepository<'db> {
@@ -4573,18 +4612,18 @@ pub(crate) fn completed_research_handoff_in_transaction(
             "linked research response does not match its owner",
         ));
     }
-    let context_evidence_refs = context_evidence_refs(&context);
-    if answer
-        .evidence_refs
-        .iter()
-        .any(|evidence_ref| !context_evidence_refs.contains(evidence_ref))
-        || answer.checkpoint.as_ref().is_some_and(|checkpoint| {
-            checkpoint
-                .support_evidence_refs
-                .iter()
-                .any(|evidence_ref| !context_evidence_refs.contains(evidence_ref))
-        })
-    {
+    if !research_answer_evidence_refs_are_bound(
+        &context,
+        &context_json,
+        &context_digest,
+        &answer,
+    )
+    .map_err(|_| {
+        validation_error(
+            "research.handoff",
+            "linked research response cites invalid or unbound evidence",
+        )
+    })? {
         return Err(validation_error(
             "research.handoff",
             "linked research response cites evidence outside its context",
@@ -4648,7 +4687,8 @@ pub(crate) fn ready_research_action_in_transaction(
              LEFT JOIN events AS event
                ON event.event_id = review.event_id
              WHERE review.review_id = ?1
-               AND campaign.project_id = ?2",
+               AND campaign.project_id = ?2
+               AND review.checkpoint_json IS NULL",
             params![review_id, project_id],
             |row| {
                 Ok((
@@ -4808,17 +4848,13 @@ pub(crate) fn ready_research_action_in_transaction(
     ) {
         return Ok(None);
     }
-    let evidence_refs = context_evidence_refs(&context);
-    if answer
-        .evidence_refs
-        .iter()
-        .any(|evidence_ref| !evidence_refs.contains(evidence_ref))
-        || answer.checkpoint.as_ref().is_some_and(|checkpoint| {
-            checkpoint
-                .support_evidence_refs
-                .iter()
-                .any(|evidence_ref| !evidence_refs.contains(evidence_ref))
-        })
+    if !research_answer_evidence_refs_are_bound(
+        &context,
+        &context_json,
+        &context_digest,
+        &answer,
+    )
+    .unwrap_or(false)
     {
         return Ok(None);
     }
@@ -5107,6 +5143,62 @@ pub(super) fn context_evidence_refs(value: &Value) -> BTreeSet<String> {
     }
     visit(value, &mut refs);
     refs
+}
+
+pub(super) fn research_answer_evidence_refs_are_bound(
+    context: &Value,
+    context_json: &str,
+    context_digest: &str,
+    answer: &ResearchAnswer,
+) -> Result<bool, AppError> {
+    let legacy_refs = context_evidence_refs(context);
+    let has_nonlegacy_reference = answer
+        .evidence_refs
+        .iter()
+        .any(|reference| !legacy_refs.contains(reference));
+    if answer.checkpoint.is_none() && !has_nonlegacy_reference {
+        return Ok(true);
+    }
+
+    let support = checkpoint_support_from_persisted_context(context_json, context_digest)?;
+    let CheckpointSupportEvidenceV1::Available {
+        loader_support,
+        checkpoint_candidates,
+        ..
+    } = &support
+    else {
+        return Ok(false);
+    };
+    let mut allowed = legacy_refs;
+    allowed.extend(loader_support.iter().map(|loader| loader.reference.clone()));
+    allowed.extend(
+        checkpoint_candidates
+            .iter()
+            .map(|candidate| candidate.reference.clone()),
+    );
+    if answer
+        .evidence_refs
+        .iter()
+        .any(|reference| !allowed.contains(reference))
+    {
+        return Ok(false);
+    }
+    if let Some(checkpoint) = answer.checkpoint.as_ref() {
+        let selected = select_checkpoint_support(&support, checkpoint)?;
+        if checkpoint.support_evidence_refs.len() != 2
+            || !checkpoint
+                .support_evidence_refs
+                .iter()
+                .any(|reference| reference == &selected.loader.reference)
+            || !checkpoint
+                .support_evidence_refs
+                .iter()
+                .any(|reference| reference == &selected.candidate.reference)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn bind_research_termination_intent_in_transaction(
@@ -6427,6 +6519,7 @@ fn research_review_id(
 }
 
 fn review_from_row(row: &Row<'_>) -> rusqlite::Result<ResearchReview> {
+    let (checkpoint_json, checkpoint_json_state) = checkpoint_json_from_row(row)?;
     Ok(ResearchReview {
         review_id: row.get(0)?,
         campaign_id: row.get(1)?,
@@ -6441,9 +6534,93 @@ fn review_from_row(row: &Row<'_>) -> rusqlite::Result<ResearchReview> {
         response_json: row.get(10)?,
         termination_request_id: row.get(11)?,
         successor_experiment_id: row.get(12)?,
-        checkpoint_json: row.get(20)?,
+        checkpoint_json,
+        checkpoint_json_state,
         session_generation: row.get(14)?,
     })
+}
+
+fn checkpoint_sqlite_storage_class(
+    value: &str,
+    column: usize,
+) -> rusqlite::Result<CheckpointSqliteStorageClass> {
+    match value {
+        "null" => Ok(CheckpointSqliteStorageClass::Null),
+        "integer" => Ok(CheckpointSqliteStorageClass::Integer),
+        "real" => Ok(CheckpointSqliteStorageClass::Real),
+        "text" => Ok(CheckpointSqliteStorageClass::Text),
+        "blob" => Ok(CheckpointSqliteStorageClass::Blob),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unknown SQLite storage class",
+            )),
+        )),
+    }
+}
+
+fn checkpoint_json_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<(Option<String>, CheckpointJsonState)> {
+    let storage_class = checkpoint_sqlite_storage_class(&row.get::<_, String>(25)?, 25)?;
+    let byte_len = row.get::<_, Option<i64>>(26)?;
+    if storage_class == CheckpointSqliteStorageClass::Null {
+        return Ok((None, CheckpointJsonState::Missing));
+    }
+    if storage_class != CheckpointSqliteStorageClass::Text {
+        return Ok((
+            None,
+            CheckpointJsonState::Invalid {
+                storage_class,
+                byte_len,
+            },
+        ));
+    }
+    let Some(byte_len) = byte_len else {
+        return Ok((
+            None,
+            CheckpointJsonState::Invalid {
+                storage_class,
+                byte_len: None,
+            },
+        ));
+    };
+    let Ok(byte_len_usize) = usize::try_from(byte_len) else {
+        return Ok((
+            None,
+            CheckpointJsonState::Invalid {
+                storage_class,
+                byte_len: Some(byte_len),
+            },
+        ));
+    };
+    if !(1..=MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES).contains(&byte_len_usize) {
+        return Ok((
+            None,
+            CheckpointJsonState::Invalid {
+                storage_class,
+                byte_len: Some(byte_len),
+            },
+        ));
+    }
+    let value = match row.get_ref(20)? {
+        ValueRef::Text(bytes) if bytes.len() == byte_len_usize => {
+            String::from_utf8(bytes.to_vec()).ok()
+        }
+        _ => None,
+    };
+    match value {
+        Some(value) => Ok((Some(value), CheckpointJsonState::BoundedText)),
+        None => Ok((
+            None,
+            CheckpointJsonState::Invalid {
+                storage_class,
+                byte_len: Some(byte_len),
+            },
+        )),
+    }
 }
 
 fn validation_error(field: &'static str, message: &'static str) -> AppError {
@@ -6795,6 +6972,143 @@ mod tests {
         (temp, db, run.run_id, project_id.to_owned())
     }
 
+    fn available_checkpoint_context_response(
+        project_id: &str,
+        campaign_id: &str,
+        experiment_id: &str,
+        review_id: &str,
+        task_signature: &str,
+        objective_digest: &str,
+        proposal_id: &str,
+        submission_id: &str,
+        action: &str,
+    ) -> (String, String, String) {
+        let root = crate::environment::ResearchDirectoryRecord {
+            device: 1,
+            inode: 2,
+            owner: 3,
+            mode: 0o700,
+            mount_identity: [4, 5],
+        };
+        let source = "x = 1\n";
+        let source_digest = format!("{:x}", Sha256::digest(source.as_bytes()));
+        let source_file = crate::environment::ResearchFileRecord {
+            relative_path: "train.py".to_owned(),
+            root: root.clone(),
+            parent: root.clone(),
+            device: 6,
+            inode: 7,
+            owner: 3,
+            mode: 0o600,
+            mount_identity: [4, 5],
+            logical_bytes: source.len() as u64,
+            allocated_bytes: 512,
+            sha256: source_digest.clone(),
+        };
+        let candidate = b"checkpoint";
+        let candidate_digest = format!("{:x}", Sha256::digest(candidate));
+        let candidate_path = format!(
+            ".pueue-agent/artifacts/{experiment_id}/checkpoint.json"
+        );
+        let candidate_file = crate::environment::ResearchFileRecord {
+            relative_path: candidate_path.clone(),
+            root: root.clone(),
+            parent: root,
+            device: 8,
+            inode: 9,
+            owner: 3,
+            mode: 0o600,
+            mount_identity: [4, 5],
+            logical_bytes: candidate.len() as u64,
+            allocated_bytes: 512,
+            sha256: candidate_digest.clone(),
+        };
+        let loader_reference = format!("loader-source:{source_digest}");
+        let candidate_reference = format!("checkpoint:{experiment_id}:0:{candidate_digest}");
+        let support = CheckpointSupportEvidenceV1::Available {
+            support_version: crate::research_checkpoint::CHECKPOINT_SUPPORT_VERSION,
+            source_experiment_id: experiment_id.to_owned(),
+            source_proposal_id: proposal_id.to_owned(),
+            source_submission_id: submission_id.to_owned(),
+            normalized_working_directory: ".".to_owned(),
+            working_directory_record: source_file.root.clone(),
+            loader_support: vec![crate::research_checkpoint::CheckpointLoaderEvidenceV1 {
+                reference: loader_reference.clone(),
+                role: crate::research_checkpoint::CheckpointLoaderRole::Entrypoint,
+                argv_index: 1,
+                argv_token: "train.py".to_owned(),
+                root_relative_path: "train.py".to_owned(),
+                length: source.len() as u64,
+                sha256: source_digest,
+                file: source_file,
+                content: source.to_owned(),
+            }],
+            checkpoint_candidates: vec![
+                crate::research_checkpoint::CheckpointCandidateEvidenceV1 {
+                    reference: candidate_reference.clone(),
+                    source_experiment_id: experiment_id.to_owned(),
+                    argv_path: candidate_path.clone(),
+                    root_relative_path: candidate_path.clone(),
+                    length: candidate.len() as u64,
+                    sha256: candidate_digest,
+                    file: candidate_file,
+                },
+            ],
+            candidates_complete: true,
+            candidates_omitted_at_least: 0,
+            candidate_limit: crate::research_checkpoint::MAX_CHECKPOINT_CANDIDATES,
+        };
+        let context = json!({
+            "schema_version": crate::research_evidence::RESEARCH_CONTEXT_SCHEMA_VERSION,
+            "facts": {
+                "review": {
+                    "review_id": review_id,
+                    "experiment_id": experiment_id,
+                    "task_signature": task_signature,
+                },
+                "campaign": {"campaign_id": campaign_id},
+                "project": {"project_id": project_id},
+                "objective": {"digest": objective_digest},
+                "target": {
+                    "experiment_id": experiment_id,
+                    "pueue_task_id": 41,
+                    "task_signature": task_signature,
+                    "proposal_id": proposal_id,
+                    "submission_id": submission_id,
+                }
+            },
+            "operations": {"checkpoint_support": support}
+        });
+        let context_json = context.to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let checkpoint = if action == "resume_from_checkpoint" {
+            Some(json!({
+                "path": candidate_path,
+                "argv": ["python", "train.py", "--resume", candidate_path],
+                "working_directory": ".",
+                "support_evidence_refs": [loader_reference.clone(), candidate_reference.clone()]
+            }))
+        } else {
+            None
+        };
+        let mut response = json!({
+            "schema_version": 1,
+            "review_id": review_id,
+            "experiment_id": experiment_id,
+            "context_digest": context_digest,
+            "action": action,
+            "reason": "use the verified checkpoint evidence",
+            "evidence_refs": [loader_reference, candidate_reference],
+            "notes": "verified support",
+            "checkpoint": checkpoint,
+        });
+        if action == "stop_and_next" {
+            response["next_direction"] = json!("continue the bounded experiment");
+        }
+        let response_json = response.to_string();
+        (context_json, context_digest, response_json)
+    }
+
     fn complete_owner_row() -> NativeResearchOwnerRow {
         NativeResearchOwnerRow {
             review_id: "review".to_owned(),
@@ -7131,5 +7445,828 @@ mod tests {
             Some(41),
             "objective",
         ));
+    }
+
+    #[test]
+    fn bounded_checkpoint_row_projection_classifies_sql_storage() {
+        let connection = Connection::open_in_memory().unwrap();
+        let projection = |value: &dyn rusqlite::ToSql| {
+            connection
+                .query_row(
+                    "SELECT 'review', 'campaign', 'experiment', 'task', 0,
+                            'pending', NULL, NULL, NULL, NULL, NULL, NULL,
+                            NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL,
+                            CASE WHEN typeof(?1) = 'text'
+                                      AND length(CAST(?1 AS BLOB)) BETWEEN 1 AND 131072
+                                 THEN ?1 END,
+                            0, NULL, NULL, 0, typeof(?1),
+                            length(CAST(?1 AS BLOB))",
+                    [value],
+                    review_from_row,
+                )
+                .unwrap()
+        };
+
+        let missing = projection(&rusqlite::types::Null);
+        assert_eq!(missing.checkpoint_json, None);
+        assert_eq!(missing.checkpoint_json_state, CheckpointJsonState::Missing);
+
+        let blob = projection(&vec![0xff_u8]);
+        assert_eq!(blob.checkpoint_json, None);
+        assert!(matches!(
+            blob.checkpoint_json_state,
+            CheckpointJsonState::Invalid {
+                storage_class: CheckpointSqliteStorageClass::Blob,
+                byte_len: Some(1),
+            }
+        ));
+
+        let empty = projection(&String::new());
+        assert_eq!(empty.checkpoint_json, None);
+        assert_eq!(
+            empty.checkpoint_json_state,
+            CheckpointJsonState::Invalid {
+                storage_class: CheckpointSqliteStorageClass::Text,
+                byte_len: Some(0),
+            }
+        );
+
+        let bounded = "é{}".to_owned();
+        let bounded_row = projection(&bounded);
+        assert_eq!(bounded_row.checkpoint_json.as_deref(), Some(bounded.as_str()));
+        assert_eq!(
+            bounded_row.checkpoint_json_state,
+            CheckpointJsonState::BoundedText
+        );
+
+        let exact = "x".repeat(MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES);
+        let exact_row = projection(&exact);
+        assert_eq!(exact_row.checkpoint_json.as_deref(), Some(exact.as_str()));
+        assert_eq!(
+            exact_row.checkpoint_json_state,
+            CheckpointJsonState::BoundedText
+        );
+
+        let oversized = "x".repeat(MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES + 1);
+        let oversized_row = projection(&oversized);
+        assert_eq!(oversized_row.checkpoint_json, None);
+        assert_eq!(
+            oversized_row.checkpoint_json_state,
+            CheckpointJsonState::Invalid {
+                storage_class: CheckpointSqliteStorageClass::Text,
+                byte_len: Some((MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES + 1) as i64),
+            }
+        );
+
+        let integer = projection(&7_i64);
+        assert_eq!(integer.checkpoint_json, None);
+        assert!(matches!(
+            integer.checkpoint_json_state,
+            CheckpointJsonState::Invalid {
+                storage_class: CheckpointSqliteStorageClass::Integer,
+                byte_len: Some(_),
+            }
+        ));
+
+        let real = projection(&1.5_f64);
+        assert_eq!(real.checkpoint_json, None);
+        assert!(matches!(
+            real.checkpoint_json_state,
+            CheckpointJsonState::Invalid {
+                storage_class: CheckpointSqliteStorageClass::Real,
+                byte_len: Some(_),
+            }
+        ));
+
+        assert_eq!(
+            MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES,
+            crate::research_checkpoint::MAX_PREPARED_CHECKPOINT_BYTES
+        );
+        assert!(REVIEW_SELECT.contains("BETWEEN 1 AND 131072"));
+        assert!(LAUNCH_REVIEW_SELECT.contains("BETWEEN 1 AND 131072"));
+    }
+
+    #[test]
+    fn evidence_binding_keeps_legacy_refs_and_rejects_unrelated_reference_keys() {
+        let context = json!({
+            "legacy": {"evidence_ref": "legacy:1"},
+            "nested": {"reference": "unrelated:1"},
+            "operations": {"checkpoint_support": {"status": "malformed"}}
+        });
+        let context_json = serde_json::to_string(&context).unwrap();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let mut answer = ResearchAnswer {
+            schema_version: 1,
+            review_id: "review".to_owned(),
+            experiment_id: "experiment".to_owned(),
+            context_digest: context_digest.clone(),
+            action: "continue".to_owned(),
+            reason: "continue".to_owned(),
+            evidence_refs: vec!["legacy:1".to_owned()],
+            notes: "notes".to_owned(),
+            next_direction: None,
+            checkpoint: None,
+        };
+        assert!(research_answer_evidence_refs_are_bound(
+            &context,
+            &context_json,
+            &context_digest,
+            &answer,
+        )
+        .unwrap());
+
+        answer.evidence_refs = vec!["unrelated:1".to_owned()];
+        assert!(research_answer_evidence_refs_are_bound(
+            &context,
+            &context_json,
+            &context_digest,
+            &answer,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn evidence_binding_rejects_unavailable_support_for_new_reference() {
+        let context = json!({
+            "schema_version": crate::research_evidence::RESEARCH_CONTEXT_SCHEMA_VERSION,
+            "operations": {
+                "checkpoint_support": {
+                    "status": "unavailable",
+                    "support_version": crate::research_checkpoint::CHECKPOINT_SUPPORT_VERSION,
+                    "reason": "discovery unavailable",
+                    "loader_support": [],
+                    "checkpoint_candidates": [],
+                    "candidates_complete": false,
+                    "candidates_omitted_at_least": 0,
+                    "candidate_limit": crate::research_checkpoint::MAX_CHECKPOINT_CANDIDATES
+                }
+            }
+        });
+        let context_json = serde_json::to_string(&context).unwrap();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let answer = ResearchAnswer {
+            schema_version: 1,
+            review_id: "review".to_owned(),
+            experiment_id: "experiment".to_owned(),
+            context_digest: context_digest.clone(),
+            action: "continue".to_owned(),
+            reason: "continue".to_owned(),
+            evidence_refs: vec!["loader-source:unknown".to_owned()],
+            notes: "notes".to_owned(),
+            next_direction: None,
+            checkpoint: None,
+        };
+        assert!(!research_answer_evidence_refs_are_bound(
+            &context,
+            &context_json,
+            &context_digest,
+            &answer,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn evidence_binding_requires_exact_available_loader_and_candidate_selection() {
+        let root = crate::environment::ResearchDirectoryRecord {
+            device: 1,
+            inode: 2,
+            owner: 3,
+            mode: 0o700,
+            mount_identity: [4, 5],
+        };
+        let source = "x = 1\n";
+        let source_digest = format!("{:x}", Sha256::digest(source.as_bytes()));
+        let source_file = crate::environment::ResearchFileRecord {
+            relative_path: "train.py".to_owned(),
+            root: root.clone(),
+            parent: root.clone(),
+            device: 6,
+            inode: 7,
+            owner: 3,
+            mode: 0o600,
+            mount_identity: [4, 5],
+            logical_bytes: source.len() as u64,
+            allocated_bytes: 512,
+            sha256: source_digest.clone(),
+        };
+        let candidate = b"checkpoint";
+        let candidate_digest = format!("{:x}", Sha256::digest(candidate));
+        let candidate_path = ".pueue-agent/artifacts/experiment/checkpoint.json";
+        let candidate_file = crate::environment::ResearchFileRecord {
+            relative_path: candidate_path.to_owned(),
+            root: root.clone(),
+            parent: root,
+            device: 8,
+            inode: 9,
+            owner: 3,
+            mode: 0o600,
+            mount_identity: [4, 5],
+            logical_bytes: candidate.len() as u64,
+            allocated_bytes: 512,
+            sha256: candidate_digest.clone(),
+        };
+        let loader_reference = format!("loader-source:{source_digest}");
+        let candidate_reference = format!("checkpoint:experiment:0:{candidate_digest}");
+        let support = CheckpointSupportEvidenceV1::Available {
+            support_version: crate::research_checkpoint::CHECKPOINT_SUPPORT_VERSION,
+            source_experiment_id: "experiment".to_owned(),
+            source_proposal_id: "proposal".to_owned(),
+            source_submission_id: "submission".to_owned(),
+            normalized_working_directory: ".".to_owned(),
+            working_directory_record: source_file.root.clone(),
+            loader_support: vec![crate::research_checkpoint::CheckpointLoaderEvidenceV1 {
+                reference: loader_reference.clone(),
+                role: crate::research_checkpoint::CheckpointLoaderRole::Entrypoint,
+                argv_index: 1,
+                argv_token: "train.py".to_owned(),
+                root_relative_path: "train.py".to_owned(),
+                length: source.len() as u64,
+                sha256: source_digest,
+                file: source_file,
+                content: source.to_owned(),
+            }],
+            checkpoint_candidates: vec![
+                crate::research_checkpoint::CheckpointCandidateEvidenceV1 {
+                    reference: candidate_reference.clone(),
+                    source_experiment_id: "experiment".to_owned(),
+                    argv_path: candidate_path.to_owned(),
+                    root_relative_path: candidate_path.to_owned(),
+                    length: candidate.len() as u64,
+                    sha256: candidate_digest,
+                    file: candidate_file,
+                },
+            ],
+            candidates_complete: true,
+            candidates_omitted_at_least: 0,
+            candidate_limit: crate::research_checkpoint::MAX_CHECKPOINT_CANDIDATES,
+        };
+        let context = json!({
+            "schema_version": crate::research_evidence::RESEARCH_CONTEXT_SCHEMA_VERSION,
+            "facts": {
+                "review": {"experiment_id": "experiment"},
+                "target": {
+                    "experiment_id": "experiment",
+                    "proposal_id": "proposal",
+                    "submission_id": "submission"
+                }
+            },
+            "operations": {"checkpoint_support": support}
+        });
+        let context_json = serde_json::to_string(&context).unwrap();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let request = crate::research_protocol::CheckpointRequest {
+            path: candidate_path.to_owned(),
+            argv: vec![
+                "python".to_owned(),
+                "train.py".to_owned(),
+                "--resume".to_owned(),
+                candidate_path.to_owned(),
+            ],
+            working_directory: ".".to_owned(),
+            support_evidence_refs: vec![loader_reference.clone(), candidate_reference.clone()],
+        };
+        let answer = ResearchAnswer {
+            schema_version: 1,
+            review_id: "review".to_owned(),
+            experiment_id: "experiment".to_owned(),
+            context_digest: context_digest.clone(),
+            action: "resume_from_checkpoint".to_owned(),
+            reason: "resume".to_owned(),
+            evidence_refs: vec![loader_reference, candidate_reference],
+            notes: "notes".to_owned(),
+            next_direction: None,
+            checkpoint: Some(request),
+        };
+        assert!(research_answer_evidence_refs_are_bound(
+            &context,
+            &context_json,
+            &context_digest,
+            &answer,
+        )
+        .unwrap());
+
+        let mut wrong_path = answer;
+        wrong_path.checkpoint.as_mut().unwrap().path = "other.json".to_owned();
+        assert!(research_answer_evidence_refs_are_bound(
+            &context,
+            &context_json,
+            &context_digest,
+            &wrong_path,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn evidence_binding_available_citation_matrix_is_strict_for_callers() {
+        let (context_json, context_digest, continue_response) =
+            available_checkpoint_context_response(
+                "project",
+                "campaign",
+                "experiment",
+                "review",
+                "pueue-managed-run:v1:managed",
+                "objective",
+                "proposal",
+                "submission",
+                "continue",
+            );
+        let context: Value = serde_json::from_str(&context_json).unwrap();
+        let continue_answer = parse_research_answer(continue_response.as_bytes()).unwrap();
+        assert!(research_answer_evidence_refs_are_bound(
+            &context,
+            &context_json,
+            &context_digest,
+            &continue_answer,
+        )
+        .unwrap());
+
+        let (stop_context_json, stop_context_digest, stop_response) =
+            available_checkpoint_context_response(
+                "project",
+                "campaign",
+                "experiment",
+                "review",
+                "pueue-managed-run:v1:managed",
+                "objective",
+                "proposal",
+                "submission",
+                "stop_and_next",
+            );
+        let stop_context: Value = serde_json::from_str(&stop_context_json).unwrap();
+        let stop_answer = parse_research_answer(stop_response.as_bytes()).unwrap();
+        assert!(research_answer_evidence_refs_are_bound(
+            &stop_context,
+            &stop_context_json,
+            &stop_context_digest,
+            &stop_answer,
+        )
+        .unwrap());
+
+        let (_, _, resume_response) = available_checkpoint_context_response(
+            "project",
+            "campaign",
+            "experiment",
+            "review",
+            "pueue-managed-run:v1:managed",
+            "objective",
+            "proposal",
+            "submission",
+            "resume_from_checkpoint",
+        );
+        let _resume_answer = parse_research_answer(resume_response.as_bytes()).unwrap();
+
+        let wrong_context_digest = "0".repeat(64);
+        let mut wrong_digest_answer = continue_answer;
+        wrong_digest_answer.context_digest = wrong_context_digest.clone();
+        assert!(research_answer_evidence_refs_are_bound(
+            &context,
+            &context_json,
+            &wrong_context_digest,
+            &wrong_digest_answer,
+        )
+        .is_err());
+
+        let mut foreign_answer = parse_research_answer(continue_response.as_bytes()).unwrap();
+        foreign_answer.evidence_refs = vec!["foreign:reference".to_owned()];
+        assert!(!research_answer_evidence_refs_are_bound(
+            &context,
+            &context_json,
+            &context_digest,
+            &foreign_answer,
+        )
+        .unwrap());
+
+        let mut duplicate_answer = parse_research_answer(resume_response.as_bytes()).unwrap();
+        let duplicate_loader = duplicate_answer
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .support_evidence_refs[0]
+            .clone();
+        duplicate_answer
+            .checkpoint
+            .as_mut()
+            .unwrap()
+            .support_evidence_refs[1] = duplicate_loader;
+        assert!(research_answer_evidence_refs_are_bound(
+            &context,
+            &context_json,
+            &context_digest,
+            &duplicate_answer,
+        )
+        .is_err());
+
+        let mut pruned_context = context.clone();
+        let candidates = pruned_context["operations"]["checkpoint_support"]
+            ["checkpoint_candidates"]
+            .as_array_mut()
+            .unwrap();
+        let candidate = &mut candidates[0];
+        let alternate_path = ".pueue-agent/artifacts/experiment/other.json";
+        candidate["argv_path"] = json!(alternate_path);
+        candidate["root_relative_path"] = json!(alternate_path);
+        candidate["file"]["relative_path"] = json!(alternate_path);
+        let alternate_digest = "0".repeat(64);
+        candidate["sha256"] = json!(&alternate_digest);
+        candidate["file"]["sha256"] = json!(&alternate_digest);
+        candidate["reference"] = json!(format!("checkpoint:experiment:0:{alternate_digest}"));
+        pruned_context["operations"]["checkpoint_support"]["candidates_complete"] =
+            json!(false);
+        pruned_context["operations"]["checkpoint_support"]["candidates_omitted_at_least"] =
+            json!(1);
+        let pruned_context_json = pruned_context.to_string();
+        let pruned_context_digest =
+            format!("{:x}", Sha256::digest(pruned_context_json.as_bytes()));
+        let mut pruned_answer = parse_research_answer(resume_response.as_bytes()).unwrap();
+        pruned_answer.context_digest = pruned_context_digest.clone();
+        pruned_answer.checkpoint.as_mut().unwrap().path = alternate_path.to_owned();
+        assert!(!research_answer_evidence_refs_are_bound(
+            &pruned_context,
+            &pruned_context_json,
+            &pruned_context_digest,
+            &pruned_answer,
+        )
+        .unwrap());
+
+        let mut wrong_path_answer = parse_research_answer(resume_response.as_bytes()).unwrap();
+        wrong_path_answer.checkpoint.as_mut().unwrap().path = "other.json".to_owned();
+        assert!(research_answer_evidence_refs_are_bound(
+            &context,
+            &context_json,
+            &context_digest,
+            &wrong_path_answer,
+        )
+        .is_err());
+
+        let mut unrelated_context = context.clone();
+        unrelated_context["nested"] = json!({"reference": "unrelated:reference"});
+        let unrelated_context_json = unrelated_context.to_string();
+        let unrelated_context_digest =
+            format!("{:x}", Sha256::digest(unrelated_context_json.as_bytes()));
+        let mut unrelated_answer = parse_research_answer(continue_response.as_bytes()).unwrap();
+        unrelated_answer.context_digest = unrelated_context_digest.clone();
+        unrelated_answer.evidence_refs = vec!["unrelated:reference".to_owned()];
+        assert!(!research_answer_evidence_refs_are_bound(
+            &unrelated_context,
+            &unrelated_context_json,
+            &unrelated_context_digest,
+            &unrelated_answer,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn all_research_review_routes_preserve_bounded_checkpoint_classification() {
+        let (_temp, db, _run_id, _project_id) = detached_history_fixture();
+        let review_id: String = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT review_id FROM research_reviews
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let repository = ResearchRepository::new(&db);
+
+        let assert_routes = |value: &dyn rusqlite::ToSql,
+                             expected_state: CheckpointJsonState,
+                             expected_json: Option<&str>,
+                             expected_storage_class: &str,
+                             expected_byte_len: Option<i64>,
+                             expected_bytes: Option<&[u8]>| {
+            let connection = db.connect().unwrap();
+            connection
+                .execute(
+                    "UPDATE research_reviews
+                     SET state = 'retry_wait', operation_stage = NULL,
+                         agent_run_id = NULL, not_before = 3001,
+                         checkpoint_json = ?1
+                     WHERE review_id = ?2",
+                    rusqlite::params![value, review_id.as_str()],
+                )
+                .unwrap();
+            let persisted: (String, Option<i64>, Option<Vec<u8>>) = connection
+                .query_row(
+                    "SELECT typeof(checkpoint_json),
+                            length(CAST(checkpoint_json AS BLOB)),
+                            CAST(checkpoint_json AS BLOB)
+                     FROM research_reviews WHERE review_id = ?1",
+                    [&review_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(persisted.0, expected_storage_class);
+            assert_eq!(persisted.1, expected_byte_len);
+            assert_eq!(persisted.2.as_deref(), expected_bytes);
+            drop(connection);
+
+            let assert_row = |row: &ResearchReview| {
+                assert_eq!(row.checkpoint_json.as_deref(), expected_json);
+                assert_eq!(row.checkpoint_json_state, expected_state);
+            };
+            let assert_persisted = || {
+                let connection = db.connect().unwrap();
+                let persisted: (String, Option<i64>, Option<Vec<u8>>) = connection
+                    .query_row(
+                        "SELECT typeof(checkpoint_json),
+                                length(CAST(checkpoint_json AS BLOB)),
+                                CAST(checkpoint_json AS BLOB)
+                         FROM research_reviews WHERE review_id = ?1",
+                        [&review_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(persisted.0, expected_storage_class);
+                assert_eq!(persisted.1, expected_byte_len);
+                assert_eq!(persisted.2.as_deref(), expected_bytes);
+            };
+            let due = repository.due_reviews(3_002, 10).unwrap();
+            assert_persisted();
+            assert_eq!(due.len(), 1);
+            assert_row(&due[0]);
+            let launch = repository.due_launch_reviews(3_002, 10, 10).unwrap();
+            assert_persisted();
+            assert_eq!(launch.len(), 1);
+            assert_row(&launch[0]);
+            let found = repository.find(&review_id).unwrap();
+            assert_persisted();
+            assert_row(&found);
+            let recent = repository
+                .recent("detached-history-campaign", 10)
+                .unwrap();
+            assert_persisted();
+            assert_eq!(recent.len(), 1);
+            assert_row(&recent[0]);
+
+            let connection = db.connect().unwrap();
+            connection
+                .execute(
+                    "UPDATE research_reviews
+                     SET state = 'ready', operation_stage = NULL
+                     WHERE review_id = ?1",
+                    [&review_id],
+                )
+                .unwrap();
+            drop(connection);
+            let ready = repository.ready_reviews(10).unwrap();
+            assert_persisted();
+            assert_eq!(ready.len(), 1);
+            assert_row(&ready[0]);
+
+            let connection = db.connect().unwrap();
+            connection
+                .execute(
+                    "UPDATE research_reviews
+                     SET operation_stage = 'intent'
+                     WHERE review_id = ?1",
+                    [&review_id],
+                )
+                .unwrap();
+            drop(connection);
+            let open = repository.open_action_reviews(10).unwrap();
+            assert_persisted();
+            assert_eq!(open.len(), 1);
+            assert_row(&open[0]);
+        };
+
+        let missing = rusqlite::types::Null;
+        assert_routes(&missing, CheckpointJsonState::Missing, None, "null", None, None);
+        let blob = vec![0xff_u8];
+        assert_routes(
+            &blob,
+            CheckpointJsonState::Invalid {
+                storage_class: CheckpointSqliteStorageClass::Blob,
+                byte_len: Some(1),
+            },
+            None,
+            "blob",
+            Some(1),
+            Some(blob.as_slice()),
+        );
+        let empty = String::new();
+        assert_routes(
+            &empty,
+            CheckpointJsonState::Invalid {
+                storage_class: CheckpointSqliteStorageClass::Text,
+                byte_len: Some(0),
+            },
+            None,
+            "text",
+            Some(0),
+            Some(&[]),
+        );
+        let exact = "x".repeat(MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES);
+        assert_routes(
+            &exact,
+            CheckpointJsonState::BoundedText,
+            Some(&exact),
+            "text",
+            Some(MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES as i64),
+            Some(exact.as_bytes()),
+        );
+        let oversized = "x".repeat(MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES + 1);
+        assert_routes(
+            &oversized,
+            CheckpointJsonState::Invalid {
+                storage_class: CheckpointSqliteStorageClass::Text,
+                byte_len: Some((MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES + 1) as i64),
+            },
+            None,
+            "text",
+            Some((MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES + 1) as i64),
+            Some(oversized.as_bytes()),
+        );
+    }
+
+    #[test]
+    fn ready_action_accepts_available_support_then_rejects_non_null_checkpoint_column() {
+        let (_temp, db, run_id, project_id) = detached_history_fixture();
+        let review_id: String = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT review_id FROM research_reviews
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let managed_task_signature: String = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT task_signature FROM research_reviews WHERE review_id = ?1",
+                [&review_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (context_json, context_digest, response_json) =
+            available_checkpoint_context_response(
+                &project_id,
+                "detached-history-campaign",
+                "detached-history-experiment",
+                &review_id,
+                &managed_task_signature,
+                "detached-history-objective",
+                "detached-history-proposal",
+                "detached-history-submission",
+                "resume_from_checkpoint",
+            );
+        let authority = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT json_extract(notes_json, '$.retry_history[0].native_recovery')
+                 FROM research_reviews WHERE review_id = ?1",
+                [&review_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let session_id = "11111111-1111-4111-8111-111111111111";
+        let notes_json = json!({
+            "native_recovery": serde_json::from_str::<Value>(&authority).unwrap(),
+            "planned_session_id": session_id,
+            "confirmed_session_id": session_id,
+            "session_binding": "confirmed",
+        })
+        .to_string();
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET session_id = ?1, session_generation = 0
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [session_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE events
+                 SET status = 'completed', lease_until = NULL,
+                     completed_at = 3_002
+                 WHERE event_id = (SELECT event_id FROM research_reviews WHERE review_id = ?1)",
+                [&review_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'ready', attempt = 1, operation_stage = NULL,
+                     agent_run_id = ?1, context_json = ?2, context_digest = ?3,
+                     response_json = ?4, termination_request_id = NULL,
+                     failure_code = NULL, notes_json = ?5, checkpoint_json = NULL,
+                     not_before = 3_003, finished_at = NULL, updated_at = 3_003
+                 WHERE review_id = ?6",
+                rusqlite::params![
+                    run_id,
+                    context_json,
+                    context_digest,
+                    response_json,
+                    notes_json,
+                    review_id,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let live_task = PueueTask {
+            id: 41,
+            group: "detached-history-group".to_owned(),
+            command: "python train.py".to_owned(),
+            state: "Running".to_owned(),
+            enqueued_at: Some("900".to_owned()),
+            started_at: Some("1000".to_owned()),
+            ended_at: None,
+            result: None,
+        };
+        let mut connection = db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let read_mutation_snapshot = |transaction: &Transaction<'_>| {
+            transaction
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM incidents WHERE project_id = ?1),
+                         (SELECT COUNT(*) FROM termination_requests WHERE project_id = ?1),
+                         (SELECT COUNT(*) FROM proposals WHERE campaign_id = 'detached-history-campaign'),
+                         (SELECT COUNT(*) FROM submissions WHERE project_id = ?1),
+                         (SELECT COUNT(*) FROM experiments WHERE campaign_id = 'detached-history-campaign'),
+                         (SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = 'detached-history-campaign'),
+                         state, operation_stage, agent_run_id, termination_request_id,
+                         successor_experiment_id, checkpoint_json, context_digest,
+                         response_json, notes_json, failure_code, attempt
+                     FROM research_reviews WHERE review_id = ?2",
+                    rusqlite::params![project_id, review_id],
+                    |row| {
+                        Ok((
+                            (
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, i64>(5)?,
+                            ),
+                            (
+                                row.get::<_, String>(6)?,
+                                row.get::<_, Option<String>>(7)?,
+                                row.get::<_, Option<i64>>(8)?,
+                                row.get::<_, Option<i64>>(9)?,
+                                row.get::<_, Option<String>>(10)?,
+                                row.get::<_, Option<String>>(11)?,
+                                row.get::<_, Option<String>>(12)?,
+                                row.get::<_, Option<String>>(13)?,
+                                row.get::<_, Option<String>>(14)?,
+                                row.get::<_, Option<String>>(15)?,
+                                row.get::<_, i64>(16)?,
+                            ),
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let before = read_mutation_snapshot(&transaction);
+        let first = ready_research_action_in_transaction(
+            &transaction,
+            &project_id,
+            &review_id,
+            &live_task,
+        )
+        .unwrap();
+        assert!(first.is_some(), "verified Available support must be consumable");
+        assert_eq!(read_mutation_snapshot(&transaction), before);
+        transaction
+            .execute(
+                "UPDATE research_reviews SET checkpoint_json = '{}' WHERE review_id = ?1",
+                [&review_id],
+            )
+            .unwrap();
+        let with_non_null_checkpoint = read_mutation_snapshot(&transaction);
+        let second = ready_research_action_in_transaction(
+            &transaction,
+            &project_id,
+            &review_id,
+            &live_task,
+        )
+        .unwrap();
+        assert!(second.is_none(), "non-NULL checkpoint column must be rejected");
+        assert_eq!(
+            read_mutation_snapshot(&transaction),
+            with_non_null_checkpoint
+        );
+        transaction.commit().unwrap();
+
+        let persisted: (String, Option<String>, Option<String>) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT state, operation_stage, termination_request_id
+                 FROM research_reviews WHERE review_id = ?1",
+                [&review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, ("ready".to_owned(), None, None));
     }
 }

@@ -21,7 +21,7 @@ use super::{
     database_error,
     repositories::insert_event_idempotent_in_transaction,
     research::{
-        context_evidence_refs, research_context_identity_matches,
+        research_answer_evidence_refs_are_bound, research_context_identity_matches,
         research_ownership_in_transaction, ResearchOwnership, ResearchOwnershipSnapshot,
     },
     Db,
@@ -2901,18 +2901,18 @@ fn research_handoff_notes(
             "research response does not match the confirmed owner",
         ));
     }
-    let context_evidence_refs = context_evidence_refs(&context);
-    if answer
-        .evidence_refs
-        .iter()
-        .any(|evidence_ref| !context_evidence_refs.contains(evidence_ref))
-        || answer.checkpoint.as_ref().is_some_and(|checkpoint| {
-            checkpoint
-                .support_evidence_refs
-                .iter()
-                .any(|evidence_ref| !context_evidence_refs.contains(evidence_ref))
-        })
-    {
+    if !research_answer_evidence_refs_are_bound(
+        &context,
+        context_json,
+        context_digest,
+        &answer,
+    )
+    .map_err(|_| {
+        validation_error(
+            "research.handoff",
+            "research response cites invalid or unbound evidence",
+        )
+    })? {
         return Err(validation_error(
             "research.handoff",
             "research response cites evidence outside its context",
@@ -4209,10 +4209,138 @@ mod decision_successor_tests {
         run_id.to_owned()
     }
 
+    fn available_research_context_response(
+        review_id: &str,
+        managed_task_signature: &str,
+        action: &str,
+    ) -> (String, String, String) {
+        let root = serde_json::json!({
+            "device": 1,
+            "inode": 2,
+            "owner": 3,
+            "mode": 448,
+            "mount_identity": [4, 5],
+        });
+        let source = "x = 1\n";
+        let source_digest = format!("{:x}", Sha256::digest(source.as_bytes()));
+        let source_file = serde_json::json!({
+            "relative_path": "train.py",
+            "root": root.clone(),
+            "parent": root.clone(),
+            "device": 6,
+            "inode": 7,
+            "owner": 3,
+            "mode": 384,
+            "mount_identity": [4, 5],
+            "logical_bytes": source.len(),
+            "allocated_bytes": 512,
+            "sha256": source_digest.clone(),
+        });
+        let candidate = b"checkpoint";
+        let candidate_digest = format!("{:x}", Sha256::digest(candidate));
+        let candidate_path = ".pueue-agent/artifacts/experiment-1/checkpoint.json";
+        let candidate_file = serde_json::json!({
+            "relative_path": candidate_path,
+            "root": root.clone(),
+            "parent": root.clone(),
+            "device": 8,
+            "inode": 9,
+            "owner": 3,
+            "mode": 384,
+            "mount_identity": [4, 5],
+            "logical_bytes": candidate.len(),
+            "allocated_bytes": 512,
+            "sha256": candidate_digest.clone(),
+        });
+        let loader_reference = format!("loader-source:{source_digest}");
+        let candidate_reference = format!("checkpoint:experiment-1:0:{candidate_digest}");
+        let support = serde_json::json!({
+            "status": "available",
+            "support_version": 1,
+            "source_experiment_id": "experiment-1",
+            "source_proposal_id": "proposal-baseline",
+            "source_submission_id": "submission-baseline",
+            "normalized_working_directory": ".",
+            "working_directory_record": root,
+            "loader_support": [{
+                "reference": loader_reference.clone(),
+                "role": "entrypoint",
+                "argv_index": 1,
+                "argv_token": "train.py",
+                "root_relative_path": "train.py",
+                "length": source.len(),
+                "sha256": source_digest.clone(),
+                "file": source_file,
+                "content": source,
+            }],
+            "checkpoint_candidates": [{
+                "reference": candidate_reference.clone(),
+                "source_experiment_id": "experiment-1",
+                "argv_path": candidate_path,
+                "root_relative_path": candidate_path,
+                "length": candidate.len(),
+                "sha256": candidate_digest.clone(),
+                "file": candidate_file,
+            }],
+            "candidates_complete": true,
+            "candidates_omitted_at_least": 0,
+            "candidate_limit": 4,
+        });
+        let context = serde_json::json!({
+            "schema_version": crate::research_evidence::RESEARCH_CONTEXT_SCHEMA_VERSION,
+            "facts": {
+                "review": {
+                    "review_id": review_id,
+                    "experiment_id": "experiment-1",
+                    "task_signature": managed_task_signature,
+                },
+                "campaign": {"campaign_id": "campaign-1"},
+                "project": {"project_id": "project-1"},
+                "objective": {"digest": "objective-digest"},
+                "target": {
+                    "experiment_id": "experiment-1",
+                    "pueue_task_id": 41,
+                    "task_signature": managed_task_signature,
+                    "proposal_id": "proposal-baseline",
+                    "submission_id": "submission-baseline",
+                },
+            },
+            "operations": {"checkpoint_support": support},
+        });
+        let context_json = context.to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let checkpoint = if action == "resume_from_checkpoint" {
+            Some(serde_json::json!({
+                "path": candidate_path,
+                "argv": ["python", "train.py", "--resume", candidate_path],
+                "working_directory": ".",
+                "support_evidence_refs": [loader_reference.clone(), candidate_reference.clone()],
+            }))
+        } else {
+            None
+        };
+        let mut response = serde_json::json!({
+            "schema_version": 1,
+            "review_id": review_id,
+            "experiment_id": "experiment-1",
+            "context_digest": context_digest,
+            "action": action,
+            "reason": "verified historical support",
+            "evidence_refs": [loader_reference, candidate_reference],
+            "notes": "verified support",
+            "checkpoint": checkpoint,
+        });
+        if action != "resume_from_checkpoint" {
+            response["next_direction"] = serde_json::json!("try the next bounded experiment");
+        }
+        (context_json, context_digest, response.to_string())
+    }
+
     fn attach_real_research_owner(
         fixture: &Fixture,
         successor_experiment_id: Option<&str>,
         seed_terminal_event: bool,
+        available_checkpoint_support: bool,
     ) -> Result<(), AppError> {
         let task = PueueTask {
             id: 41,
@@ -4374,40 +4502,46 @@ mod decision_successor_tests {
                 [session_id],
             )
             .unwrap();
-        let context_json = serde_json::json!({
-            "schema_version": 1,
-            "facts": {
-                "review": {
+        let (context_json, context_digest, response_json) =
+            if available_checkpoint_support {
+                available_research_context_response(review_id, &managed_task_signature, "stop_and_next")
+            } else {
+                let context_json = serde_json::json!({
+                    "schema_version": 1,
+                    "facts": {
+                        "review": {
+                            "review_id": review_id,
+                            "experiment_id": "experiment-1",
+                            "task_signature": managed_task_signature,
+                        },
+                        "campaign": {"campaign_id": "campaign-1"},
+                        "project": {"project_id": "project-1"},
+                        "objective": {"digest": "objective-digest"},
+                        "target": {
+                            "experiment_id": "experiment-1",
+                            "pueue_task_id": 41,
+                            "task_signature": managed_task_signature,
+                        },
+                        "evidence": [{"evidence_ref": format!("research:{review_id}")}],
+                    },
+                })
+                .to_string();
+                let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+                let response_json = serde_json::json!({
+                    "schema_version": 1,
                     "review_id": review_id,
                     "experiment_id": "experiment-1",
-                    "task_signature": managed_task_signature,
-                },
-                "campaign": {"campaign_id": "campaign-1"},
-                "project": {"project_id": "project-1"},
-                "objective": {"digest": "objective-digest"},
-                "target": {
-                    "experiment_id": "experiment-1",
-                    "pueue_task_id": 41,
-                    "task_signature": managed_task_signature,
-                },
-                "evidence": [{"evidence_ref": format!("research:{review_id}")}],
-            },
-        })
-        .to_string();
-        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
-        let response_json = serde_json::json!({
-            "schema_version": 1,
-            "review_id": review_id,
-            "experiment_id": "experiment-1",
-            "context_digest": context_digest,
-            "action": "stop_and_next",
-            "reason": "the baseline should be pruned",
-            "evidence_refs": [format!("research:{review_id}")],
-            "notes": "save this bounded advice",
-            "next_direction": "try a smaller learning rate",
-            "checkpoint": null,
-        })
-        .to_string();
+                    "context_digest": context_digest,
+                    "action": "stop_and_next",
+                    "reason": "the baseline should be pruned",
+                    "evidence_refs": [format!("research:{review_id}")],
+                    "notes": "save this bounded advice",
+                    "next_direction": "try a smaller learning rate",
+                    "checkpoint": null,
+                })
+                .to_string();
+                (context_json, context_digest, response_json)
+            };
         let native_notes = serde_json::json!({
             "native_recovery": {
                 "version": 1,
@@ -4523,7 +4657,7 @@ mod decision_successor_tests {
         Ok(())
     }
 
-    fn attached_unlinked_fixture() -> Fixture {
+    fn attached_unlinked_fixture_with_support(available_checkpoint_support: bool) -> Fixture {
         let BaseFixture {
             _temp: temp,
             db,
@@ -4554,7 +4688,7 @@ mod decision_successor_tests {
             reservation: reservation_seed,
             proposal,
         };
-        attach_real_research_owner(&fixture, None, true).unwrap();
+        attach_real_research_owner(&fixture, None, true, available_checkpoint_support).unwrap();
         let Fixture {
             _temp: temp,
             db,
@@ -4655,6 +4789,41 @@ mod decision_successor_tests {
         fixture
     }
 
+    fn attached_unlinked_fixture() -> Fixture {
+        attached_unlinked_fixture_with_support(false)
+    }
+
+    #[test]
+    fn historical_handoff_callers_accept_available_checkpoint_support() {
+        let legacy_fixture = attached_unlinked_fixture();
+        let mut legacy_connection = legacy_fixture.db.connect().unwrap();
+        let legacy_transaction = legacy_connection.transaction().unwrap();
+        let legacy_handoff = crate::db::research::completed_research_handoff_in_transaction(
+            &legacy_transaction,
+            "project-1",
+            "campaign-1",
+            "experiment-1",
+            &legacy_fixture.reservation.cycle_id,
+        )
+        .unwrap();
+        assert!(legacy_handoff.is_some());
+        legacy_transaction.commit().unwrap();
+
+        let fixture = attached_unlinked_fixture_with_support(true);
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let handoff = crate::db::research::completed_research_handoff_in_transaction(
+            &transaction,
+            "project-1",
+            "campaign-1",
+            "experiment-1",
+            &fixture.reservation.cycle_id,
+        )
+        .unwrap();
+        assert!(handoff.is_some());
+        transaction.commit().unwrap();
+    }
+
     fn attached_fixture() -> Fixture {
         let fixture = attached_unlinked_fixture();
         persist_ordinary_successor_fixture(&fixture);
@@ -4692,7 +4861,7 @@ mod decision_successor_tests {
             reservation: reservation_seed,
             proposal,
         };
-        attach_real_research_owner(&fixture, None, true).unwrap();
+        attach_real_research_owner(&fixture, None, true, false).unwrap();
         let Fixture {
             _temp: temp,
             db,
@@ -5569,7 +5738,7 @@ mod decision_successor_tests {
     #[test]
     fn attachment_rejects_an_absent_terminal_event_when_the_cycle_already_has_an_attempt() {
         let fixture = fixture();
-        assert!(attach_real_research_owner(&fixture, None, false).is_err());
+        assert!(attach_real_research_owner(&fixture, None, false, false).is_err());
     }
 
     #[test]
