@@ -699,6 +699,25 @@ fn running_task_for(id: i64, group: &str) -> PueueTask {
     task
 }
 
+#[cfg(target_os = "linux")]
+fn research_runtime_command(
+    project_root: &Path,
+    campaign_id: &str,
+    experiment_id: &str,
+    argv: &[String],
+) -> String {
+    pueue_agent::environment::campaign_experiment_runtime_argv(
+        project_root,
+        campaign_id,
+        experiment_id,
+        argv,
+    )
+    .iter()
+    .map(|value| value.to_string_lossy().into_owned())
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
 #[tokio::test]
 async fn decision_recovery_marks_a_terminal_agent_without_output_missing_before_scheduling() {
     let harness = DaemonHarness::new();
@@ -1990,7 +2009,15 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
     prepare_healthy_research_fixture(&harness);
     harness.register_project("project-b", "pb-project", "codex");
     let experiment_id = harness.campaign_experiment();
-    let task = running_task();
+    let initial_argv = vec!["python".to_owned(), "train.py".to_owned()];
+    let mut task = running_task();
+    task.command = research_runtime_command(
+        &harness.registered_root("project-a"),
+        "daemon-campaign",
+        &experiment_id,
+        &initial_argv,
+    );
+    harness.fake_pueue.set_tasks(vec![task.clone()]);
     let live_task_signature = pueue_agent::reconcile::task_signature(&task);
     let task_signature = pueue_agent::reconcile::managed_task_run_signature(&task)
         .expect("managed research task identity");
@@ -3391,6 +3418,25 @@ fn research_controller_crash_subprocess() {
     let paths = ResearchCrashFixturePaths::new(&fixture_root);
     let db = Db::open(&db_path).expect("open shared research database");
     let policy = research_policy_from_fixture_paths(&db, &fixture_root);
+    let review = ResearchRepository::new(&db)
+        .find(&review_id)
+        .expect("read crash controller research review");
+    let initial_argv = vec!["python".to_owned(), "train.py".to_owned()];
+    let task = PueueTask {
+        id: 41,
+        group: "pa-project".to_owned(),
+        command: research_runtime_command(
+            &fixture_root.join("project-a"),
+            &review.campaign_id,
+            &review.experiment_id,
+            &initial_argv,
+        ),
+        state: "Running".to_owned(),
+        enqueued_at: Some("100".to_owned()),
+        started_at: Some("101".to_owned()),
+        ended_at: None,
+        result: None,
+    };
     let runner = AgentRunner::new(
         AgentRunnerConfig::production()
             .with_codex_capabilities(pueue_agent::codex_command::CodexCapabilities::all()),
@@ -3398,7 +3444,7 @@ fn research_controller_crash_subprocess() {
     );
     let mut daemon = Daemon::new(
         db.clone(),
-        FakePueue::with_tasks(vec![running_task()]),
+        FakePueue::with_tasks(vec![task]),
         Arc::clone(&policy),
         runner,
         DaemonConfig {
@@ -3496,7 +3542,15 @@ async fn research_controller_crash_restarts_only_after_group_quiescence() {
     let harness = DaemonHarness::new();
     prepare_healthy_research_fixture(&harness);
     let experiment_id = harness.campaign_experiment();
-    let task = running_task();
+    let initial_argv = vec!["python".to_owned(), "train.py".to_owned()];
+    let mut task = running_task();
+    task.command = research_runtime_command(
+        &harness.registered_root("project-a"),
+        "daemon-campaign",
+        &experiment_id,
+        &initial_argv,
+    );
+    harness.fake_pueue.set_tasks(vec![task.clone()]);
     let live_task_signature = pueue_agent::reconcile::task_signature(&task);
     let task_signature = pueue_agent::reconcile::managed_task_run_signature(&task)
         .expect("managed research task identity");
