@@ -59,7 +59,7 @@ pub struct ResearchAnswer {
     pub checkpoint: Option<CheckpointRequest>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointRequest {
     pub path: String,

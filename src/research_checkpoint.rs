@@ -14,7 +14,11 @@ use crate::{
     output::permits_lossless_evidence_text,
     proposals::{self, ProposalInput},
     pueue::validate_add_argv,
-    research_protocol::CheckpointRequest,
+    process::MAX_FIELD_SIZE,
+    research_protocol::{
+        CheckpointRequest, MAX_RESEARCH_ANSWER_BYTES, MAX_RESEARCH_ARGV,
+        MAX_RESEARCH_EVIDENCE_REF_BYTES,
+    },
     AppError,
 };
 
@@ -138,6 +142,69 @@ impl CheckpointArgvDelta {
     pub(crate) fn flag(&self) -> &str {
         &self.flag
     }
+}
+
+pub(crate) const PREPARED_CHECKPOINT_VERSION: u8 = 1;
+pub(crate) const MAX_PREPARED_CHECKPOINT_BYTES: usize = MAX_RESEARCH_ANSWER_BYTES;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CheckpointSourceRuntimeV1 {
+    OriginalProjectRoot,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointSuccessorIds {
+    pub(crate) proposal_id: String,
+    pub(crate) experiment_id: String,
+    pub(crate) submission_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedCheckpoint {
+    pub(crate) schema_version: u8,
+
+    pub(crate) project_id: String,
+    pub(crate) campaign_id: String,
+    pub(crate) review_id: String,
+    pub(crate) review_attempt: i64,
+    pub(crate) review_session_generation: i64,
+    pub(crate) review_agent_run_id: i64,
+    pub(crate) review_event_id: i64,
+
+    pub(crate) source_experiment_id: String,
+    pub(crate) source_proposal_id: String,
+    pub(crate) source_submission_id: String,
+    pub(crate) source_task_id: i64,
+    pub(crate) source_managed_task_signature: String,
+    pub(crate) source_raw_task_signature: String,
+
+    pub(crate) context_digest: String,
+    pub(crate) response_digest: String,
+    pub(crate) campaign_objective_digest: String,
+    pub(crate) source_proposal_canonical_digest: String,
+    pub(crate) learning_spec_digest: String,
+
+    pub(crate) source_runtime: CheckpointSourceRuntimeV1,
+    pub(crate) source_root_canonical_path: String,
+    pub(crate) source_root_resolution_fingerprint: String,
+    pub(crate) source_root_record: ResearchDirectoryRecord,
+    pub(crate) source_working_directory_record: ResearchDirectoryRecord,
+
+    pub(crate) support_version: u8,
+    pub(crate) loader: CheckpointLoaderEvidenceV1,
+    pub(crate) source_checkpoint: CheckpointCandidateEvidenceV1,
+    pub(crate) retained_checkpoint: ResearchFileRecord,
+
+    pub(crate) source_argv: Vec<String>,
+    pub(crate) source_working_directory: String,
+    pub(crate) request: CheckpointRequest,
+    pub(crate) delta: CheckpointArgvDelta,
+    pub(crate) retained_argv: Vec<String>,
+
+    pub(crate) successor_ids: CheckpointSuccessorIds,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -326,6 +393,544 @@ pub(crate) fn checkpoint_candidate_argv_path(
         return None;
     }
     Some(argv_path)
+}
+
+pub(crate) fn serialize_prepared_checkpoint(
+    checkpoint: &PreparedCheckpoint,
+) -> Result<String, AppError> {
+    validate_prepared_checkpoint(checkpoint)?;
+    let encoded = serde_json::to_string(checkpoint).map_err(|source| AppError::Serialization {
+        operation: "serialize prepared checkpoint",
+        source,
+    })?;
+    if encoded.is_empty() || encoded.len() > MAX_PREPARED_CHECKPOINT_BYTES {
+        return Err(prepared_checkpoint_error(
+            "serialized prepared checkpoint exceeds the durable bound",
+        ));
+    }
+    Ok(encoded)
+}
+
+pub(crate) fn parse_prepared_checkpoint(
+    checkpoint_json: &str,
+) -> Result<PreparedCheckpoint, AppError> {
+    if checkpoint_json.is_empty() || checkpoint_json.len() > MAX_PREPARED_CHECKPOINT_BYTES {
+        return Err(prepared_checkpoint_error(
+            "prepared checkpoint exceeds the durable bound",
+        ));
+    }
+    let value = parse_strict_json_value(checkpoint_json.as_bytes())?;
+    let checkpoint =
+        serde_json::from_value::<PreparedCheckpoint>(value).map_err(|source| {
+            AppError::Serialization {
+                operation: "parse prepared checkpoint schema",
+                source,
+            }
+        })?;
+    validate_prepared_checkpoint(&checkpoint)?;
+    Ok(checkpoint)
+}
+
+pub(crate) fn checkpoint_learning_spec_digest(
+    source_argv: &[String],
+    normalized_working_directory: &str,
+) -> Result<String, AppError> {
+    let proposal = validate_command_proposal(source_argv, normalized_working_directory)?;
+    if proposal.working_directory() != normalized_working_directory {
+        return Err(prepared_checkpoint_error(
+            "learning working directory is not normalized",
+        ));
+    }
+    validate_argv_vector("learning_spec.argv", source_argv)?;
+    if normal_relative_components(normalized_working_directory).is_none() {
+        return Err(prepared_checkpoint_error(
+            "learning working directory is invalid",
+        ));
+    }
+    #[derive(Serialize)]
+    struct LearningSpec<'a> {
+        domain: &'static str,
+        schema_version: u8,
+        argv: &'a [String],
+        working_directory: &'a str,
+    }
+    let canonical = LearningSpec {
+        domain: "pueue-research-checkpoint-learning",
+        schema_version: PREPARED_CHECKPOINT_VERSION,
+        argv: source_argv,
+        working_directory: normalized_working_directory,
+    };
+    let bytes = serde_json::to_vec(&canonical).map_err(|source| AppError::Serialization {
+        operation: "serialize checkpoint learning specification",
+        source,
+    })?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+pub(crate) fn checkpoint_successor_ids(
+    review_id: &str,
+    review_attempt: i64,
+) -> Result<CheckpointSuccessorIds, AppError> {
+    if !valid_bounded_identity(review_id) {
+        return Err(prepared_checkpoint_error(
+            "successor review identity is invalid",
+        ));
+    }
+    if review_attempt <= 0 {
+        return Err(prepared_checkpoint_error(
+            "successor review attempt must be positive",
+        ));
+    }
+    Ok(CheckpointSuccessorIds {
+        proposal_id: checkpoint_successor_id("proposal", review_id, review_attempt)?,
+        experiment_id: checkpoint_successor_id("experiment", review_id, review_attempt)?,
+        submission_id: checkpoint_successor_id("submission", review_id, review_attempt)?,
+    })
+}
+
+fn checkpoint_successor_id(
+    kind: &'static str,
+    review_id: &str,
+    review_attempt: i64,
+) -> Result<String, AppError> {
+    #[derive(Serialize)]
+    struct Successor<'a> {
+        domain: &'static str,
+        schema_version: u8,
+        resource_kind: &'static str,
+        review_id: &'a str,
+        review_attempt: i64,
+    }
+    let canonical = Successor {
+        domain: "pueue-research-checkpoint-successor",
+        schema_version: PREPARED_CHECKPOINT_VERSION,
+        resource_kind: kind,
+        review_id,
+        review_attempt,
+    };
+    let bytes = serde_json::to_vec(&canonical).map_err(|source| AppError::Serialization {
+        operation: "serialize checkpoint successor identity",
+        source,
+    })?;
+    let id = format!(
+        "research-checkpoint-{kind}:{:x}",
+        Sha256::digest(bytes)
+    );
+    if valid_bounded_identity(&id) {
+        Ok(id)
+    } else {
+        Err(prepared_checkpoint_error(
+            "derived checkpoint successor identity is invalid",
+        ))
+    }
+}
+
+fn validate_prepared_checkpoint(checkpoint: &PreparedCheckpoint) -> Result<(), AppError> {
+    if checkpoint.schema_version != PREPARED_CHECKPOINT_VERSION {
+        return Err(prepared_checkpoint_error(
+            "prepared checkpoint schema version is unsupported",
+        ));
+    }
+    for identity in [
+        &checkpoint.project_id,
+        &checkpoint.campaign_id,
+        &checkpoint.review_id,
+        &checkpoint.source_experiment_id,
+        &checkpoint.source_proposal_id,
+        &checkpoint.source_submission_id,
+    ] {
+        if !valid_bounded_identity(identity) {
+            return Err(prepared_checkpoint_error(
+                "prepared checkpoint identity is invalid",
+            ));
+        }
+    }
+    if checkpoint.review_attempt <= 0
+        || checkpoint.review_session_generation < 0
+        || checkpoint.review_agent_run_id <= 0
+        || checkpoint.review_event_id <= 0
+        || checkpoint.source_task_id < 0
+    {
+        return Err(prepared_checkpoint_error(
+            "prepared checkpoint numeric identity is invalid",
+        ));
+    }
+    for (field, value) in [
+        (
+            "source_managed_task_signature",
+            checkpoint.source_managed_task_signature.as_str(),
+        ),
+        (
+            "source_raw_task_signature",
+            checkpoint.source_raw_task_signature.as_str(),
+        ),
+        (
+            "source_root_canonical_path",
+            checkpoint.source_root_canonical_path.as_str(),
+        ),
+        (
+            "source_root_resolution_fingerprint",
+            checkpoint.source_root_resolution_fingerprint.as_str(),
+        ),
+    ] {
+        validate_bounded_field(field, value, MAX_FIELD_SIZE, true)?;
+    }
+    if !Path::new(&checkpoint.source_root_canonical_path).is_absolute() {
+        return Err(prepared_checkpoint_error(
+            "source root canonical path must be absolute",
+        ));
+    }
+    for digest in [
+        &checkpoint.context_digest,
+        &checkpoint.response_digest,
+        &checkpoint.campaign_objective_digest,
+        &checkpoint.source_proposal_canonical_digest,
+        &checkpoint.learning_spec_digest,
+    ] {
+        if !is_lower_hex_digest(digest) {
+            return Err(prepared_checkpoint_error(
+                "prepared checkpoint digest is invalid",
+            ));
+        }
+    }
+    if checkpoint.source_runtime != CheckpointSourceRuntimeV1::OriginalProjectRoot
+        || checkpoint.support_version != CHECKPOINT_SUPPORT_VERSION
+    {
+        return Err(prepared_checkpoint_error(
+            "prepared checkpoint runtime or support version is unsupported",
+        ));
+    }
+    validate_directory_record(&checkpoint.source_root_record)?;
+    validate_directory_record(&checkpoint.source_working_directory_record)?;
+    if checkpoint.source_working_directory_record.mount_identity
+        != checkpoint.source_root_record.mount_identity
+    {
+        return Err(prepared_checkpoint_error(
+            "source working directory is on a different mount",
+        ));
+    }
+    if normal_relative_components(&checkpoint.source_working_directory).is_none() {
+        return Err(prepared_checkpoint_error(
+            "source working directory is not normalized",
+        ));
+    }
+    if checkpoint.source_working_directory == "."
+        && checkpoint.source_working_directory_record != checkpoint.source_root_record
+    {
+        return Err(prepared_checkpoint_error(
+            "root working directory record does not match the source root",
+        ));
+    }
+    validate_argv_vector("source_argv", &checkpoint.source_argv)?;
+    validate_argv_vector("request.argv", &checkpoint.request.argv)?;
+    validate_argv_vector("retained_argv", &checkpoint.retained_argv)?;
+    if checkpoint.request.support_evidence_refs.len() != 2 {
+        return Err(prepared_checkpoint_error(
+            "checkpoint request must contain exactly two evidence references",
+        ));
+    }
+    if checkpoint.request.support_evidence_refs[0]
+        == checkpoint.request.support_evidence_refs[1]
+    {
+        return Err(prepared_checkpoint_error(
+            "checkpoint request evidence references must be unique",
+        ));
+    }
+    for reference in &checkpoint.request.support_evidence_refs {
+        validate_bounded_field(
+            "request.support_evidence_refs",
+            reference,
+            MAX_RESEARCH_EVIDENCE_REF_BYTES,
+            true,
+        )?;
+    }
+
+    let command = validate_checkpoint_command(
+        &checkpoint.source_argv,
+        &checkpoint.source_working_directory,
+        &checkpoint.request,
+    )?;
+    if command.delta() != &checkpoint.delta {
+        return Err(prepared_checkpoint_error(
+            "checkpoint argv delta does not match the request",
+        ));
+    }
+    validate_retained_argv(&command, &checkpoint.retained_argv)?;
+
+    validate_loader_evidence(
+        &checkpoint.loader,
+        &checkpoint.source_working_directory,
+    )?;
+    let source_layout = checkpoint_source_layout(
+        &checkpoint.source_argv,
+        &checkpoint.source_working_directory,
+    )?;
+    if checkpoint.loader.argv_index != source_layout.entrypoint_index
+        || checkpoint.loader.argv_token != source_layout.entrypoint_token
+        || checkpoint.loader.root_relative_path != source_layout.entrypoint_root_relative_path
+    {
+        return Err(prepared_checkpoint_error(
+            "checkpoint loader does not match the source command layout",
+        ));
+    }
+    validate_research_file_record(&checkpoint.loader.file, MAX_CHECKPOINT_SOURCE_BYTES as u64)?;
+    if checkpoint.loader.file.root != checkpoint.source_root_record
+        || checkpoint.loader.reference
+            != format!("loader-source:{}", checkpoint.loader.sha256)
+    {
+        return Err(prepared_checkpoint_error(
+            "checkpoint loader does not match the source root or digest",
+        ));
+    }
+    if loader_is_direct_child_of_cwd(
+        &checkpoint.loader,
+        &checkpoint.source_working_directory,
+    ) && checkpoint.loader.file.parent != checkpoint.source_working_directory_record
+    {
+        return Err(prepared_checkpoint_error(
+            "checkpoint loader parent does not match the source working directory",
+        ));
+    }
+
+    let artifact_prefix = [
+        ".pueue-agent".to_owned(),
+        "artifacts".to_owned(),
+        checkpoint.source_experiment_id.clone(),
+    ];
+    validate_candidate_evidence(
+        &checkpoint.source_checkpoint,
+        &checkpoint.source_experiment_id,
+        &checkpoint.source_working_directory,
+        &artifact_prefix,
+    )?;
+    validate_research_file_record(
+        &checkpoint.source_checkpoint.file,
+        crate::environment::MAX_PRIVATE_TEMP_ALLOCATED_BYTES,
+    )?;
+    if checkpoint.source_checkpoint.file.root != checkpoint.source_root_record
+        || checkpoint.source_checkpoint.argv_path != checkpoint.request.path
+    {
+        return Err(prepared_checkpoint_error(
+            "selected checkpoint does not match the request or source root",
+        ));
+    }
+    validate_checkpoint_candidate_reference(
+        &checkpoint.source_checkpoint.reference,
+        &checkpoint.source_experiment_id,
+        &checkpoint.source_checkpoint.sha256,
+    )?;
+    if !checkpoint
+        .request
+        .support_evidence_refs
+        .iter()
+        .any(|reference| reference == &checkpoint.loader.reference)
+        || !checkpoint
+            .request
+            .support_evidence_refs
+            .iter()
+            .any(|reference| reference == &checkpoint.source_checkpoint.reference)
+    {
+        return Err(prepared_checkpoint_error(
+            "checkpoint request references do not select the loader and candidate",
+        ));
+    }
+    if checkpoint.source_checkpoint.length != checkpoint.retained_checkpoint.logical_bytes
+        || checkpoint.source_checkpoint.sha256 != checkpoint.retained_checkpoint.sha256
+    {
+        return Err(prepared_checkpoint_error(
+            "retained checkpoint does not match the selected source checkpoint",
+        ));
+    }
+    validate_research_file_record(
+        &checkpoint.retained_checkpoint,
+        crate::environment::MAX_PRIVATE_TEMP_ALLOCATED_BYTES,
+    )?;
+    let expected_retained_path = format!(
+        "research-checkpoints/{}/{}/checkpoint",
+        checkpoint.campaign_id, checkpoint.review_id
+    );
+    if checkpoint.retained_checkpoint.relative_path != expected_retained_path {
+        return Err(prepared_checkpoint_error(
+            "retained checkpoint path is invalid",
+        ));
+    }
+
+    let learning_spec_digest = checkpoint_learning_spec_digest(
+        &checkpoint.source_argv,
+        &checkpoint.source_working_directory,
+    )?;
+    if checkpoint.learning_spec_digest != learning_spec_digest {
+        return Err(prepared_checkpoint_error(
+            "learning specification digest does not match the source command",
+        ));
+    }
+    let successor_ids = checkpoint_successor_ids(&checkpoint.review_id, checkpoint.review_attempt)?;
+    if checkpoint.successor_ids != successor_ids {
+        return Err(prepared_checkpoint_error(
+            "successor identities do not match the review",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_argv_vector(field: &'static str, argv: &[String]) -> Result<(), AppError> {
+    if argv.is_empty() || argv.len() > MAX_RESEARCH_ARGV {
+        return Err(prepared_checkpoint_error("argv cardinality is out of bounds"));
+    }
+    for value in argv {
+        validate_bounded_field(field, value, MAX_FIELD_SIZE, false)?;
+    }
+    Ok(())
+}
+
+fn validate_bounded_field(
+    _field: &'static str,
+    value: &str,
+    maximum_bytes: usize,
+    require_nonempty: bool,
+) -> Result<(), AppError> {
+    if (require_nonempty && value.is_empty())
+        || value.len() > maximum_bytes
+        || value.chars().any(char::is_control)
+    {
+        return Err(prepared_checkpoint_error(
+            "prepared checkpoint field is empty, oversized, or contains control text",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_directory_record(record: &ResearchDirectoryRecord) -> Result<(), AppError> {
+    if record.mode & 0o022 != 0 {
+        return Err(prepared_checkpoint_error(
+            "prepared directory record has unsafe permissions",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_research_file_record(
+    record: &ResearchFileRecord,
+    maximum_bytes: u64,
+) -> Result<(), AppError> {
+    if normal_relative_components(&record.relative_path).is_none()
+        || record.mode & 0o022 != 0
+        || record.logical_bytes > maximum_bytes
+        || record.allocated_bytes > crate::environment::MAX_PRIVATE_TEMP_ALLOCATED_BYTES
+        || !is_lower_hex_digest(&record.sha256)
+    {
+        return Err(prepared_checkpoint_error(
+            "prepared research file record is invalid",
+        ));
+    }
+    validate_directory_record(&record.root)?;
+    validate_directory_record(&record.parent)?;
+    if record.root.mount_identity != record.parent.mount_identity
+        || record.mount_identity != record.root.mount_identity
+    {
+        return Err(prepared_checkpoint_error(
+            "prepared research file crosses a mount boundary",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_candidate_reference(
+    reference: &str,
+    source_experiment_id: &str,
+    sha256: &str,
+) -> Result<(), AppError> {
+    let prefix = "checkpoint:";
+    let body = reference
+        .strip_prefix(prefix)
+        .ok_or_else(|| prepared_checkpoint_error("checkpoint candidate reference is invalid"))?;
+    let (body, digest) = body
+        .rsplit_once(':')
+        .ok_or_else(|| prepared_checkpoint_error("checkpoint candidate reference is invalid"))?;
+    if digest != sha256 || !is_lower_hex_digest(digest) {
+        return Err(prepared_checkpoint_error(
+            "checkpoint candidate reference digest is invalid",
+        ));
+    }
+    let (source_id, ordinal_text) = body
+        .rsplit_once(':')
+        .ok_or_else(|| prepared_checkpoint_error("checkpoint candidate reference is invalid"))?;
+    let ordinal = ordinal_text
+        .parse::<usize>()
+        .map_err(|_| prepared_checkpoint_error("checkpoint candidate ordinal is invalid"))?;
+    if source_id != source_experiment_id
+        || ordinal >= MAX_CHECKPOINT_CANDIDATES
+        || ordinal_text != ordinal.to_string()
+    {
+        return Err(prepared_checkpoint_error(
+            "checkpoint candidate reference identity is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retained_argv(
+    command: &ValidatedCheckpointCommand,
+    retained_argv: &[String],
+) -> Result<(), AppError> {
+    if retained_argv.len() != command.request_argv().len() {
+        return Err(prepared_checkpoint_error(
+            "retained argv does not preserve the request shape",
+        ));
+    }
+    let path_index = match command.delta().form {
+        CheckpointArgvDeltaForm::Pair => command
+            .delta()
+            .index
+            .checked_add(1)
+            .ok_or_else(|| prepared_checkpoint_error("retained argv index overflow"))?,
+        CheckpointArgvDeltaForm::Equals => command.delta().index,
+    };
+    for (index, (expected, actual)) in command
+        .request_argv()
+        .iter()
+        .zip(retained_argv)
+        .enumerate()
+    {
+        if index == path_index {
+            continue;
+        }
+        if expected != actual {
+            return Err(prepared_checkpoint_error(
+                "retained argv changes the learning command",
+            ));
+        }
+    }
+    match command.delta().form {
+        CheckpointArgvDeltaForm::Pair => {
+            if retained_argv[command.delta().index] != command.delta().flag {
+                return Err(prepared_checkpoint_error(
+                    "retained argv loses the checkpoint flag",
+                ));
+            }
+            validate_retained_path(&retained_argv[path_index])?;
+            if retained_argv[path_index] == command.checkpoint_path() {
+                return Err(prepared_checkpoint_error(
+                    "retained argv did not replace the source checkpoint path",
+                ));
+            }
+        }
+        CheckpointArgvDeltaForm::Equals => {
+            let prefix = format!("{}=", command.delta().flag);
+            let Some(path) = retained_argv[path_index].strip_prefix(&prefix) else {
+                return Err(prepared_checkpoint_error(
+                    "retained argv loses the checkpoint flag",
+                ));
+            };
+            validate_retained_path(path)?;
+            if path == command.checkpoint_path() {
+                return Err(prepared_checkpoint_error(
+                    "retained argv did not replace the source checkpoint path",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn checkpoint_support_from_persisted_context(
@@ -1092,9 +1697,41 @@ fn validate_checkpoint_path(path: &str) -> Result<(), AppError> {
 }
 
 fn validate_retained_path(path: &str) -> Result<(), AppError> {
-    if path.is_empty() || path.chars().any(char::is_control) || has_shell_payload(path) {
+    if path.is_empty()
+        || path.len() > MAX_CHECKPOINT_PATH_BYTES
+        || path.chars().any(char::is_control)
+        || has_shell_payload(path)
+        || !Path::new(path).is_absolute()
+    {
         return Err(checkpoint_validation_error(
             "retained checkpoint path is invalid",
+        ));
+    }
+    let mut normal_components = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::RootDir if normal_components.is_empty() => {}
+            Component::Normal(component) => {
+                normal_components.push(component.to_string_lossy().into_owned())
+            }
+            Component::CurDir
+            | Component::ParentDir
+            | Component::Prefix(_)
+            | Component::RootDir => {
+                return Err(checkpoint_validation_error(
+                    "retained checkpoint path must use absolute normal components",
+                ));
+            }
+        }
+    }
+    if normal_components.is_empty() {
+        return Err(checkpoint_validation_error(
+            "retained checkpoint path must name a file",
+        ));
+    }
+    if path != format!("/{}", normal_components.join("/")) {
+        return Err(checkpoint_validation_error(
+            "retained checkpoint path must use absolute normal components",
         ));
     }
     Ok(())
@@ -1205,6 +1842,13 @@ fn checkpoint_validation_error(message: &'static str) -> AppError {
 fn checkpoint_evidence_error(message: &'static str) -> AppError {
     AppError::Validation {
         field: "checkpoint_support",
+        message,
+    }
+}
+
+fn prepared_checkpoint_error(message: &'static str) -> AppError {
+    AppError::Validation {
+        field: "prepared_checkpoint",
         message,
     }
 }
@@ -1564,6 +2208,7 @@ mod tests {
 
     fn sample_file(relative_path: &str, bytes: &[u8]) -> ResearchFileRecord {
         let directory = sample_directory();
+        let mount_identity = directory.mount_identity;
         ResearchFileRecord {
             relative_path: relative_path.to_owned(),
             root: directory.clone(),
@@ -1572,7 +2217,7 @@ mod tests {
             inode: 7,
             owner: 3,
             mode: 0o600,
-            mount_identity: [8, 9],
+            mount_identity,
             logical_bytes: bytes.len() as u64,
             allocated_bytes: 512,
             sha256: format!("{:x}", Sha256::digest(bytes)),
@@ -2047,6 +2692,407 @@ mod tests {
                 ".",
             );
             assert!(validate_checkpoint_command(&source_argv, ".", &request).is_err());
+        }
+    }
+
+    fn prepared_file(
+        relative_path: &str,
+        bytes: &[u8],
+        root: &ResearchDirectoryRecord,
+        parent: &ResearchDirectoryRecord,
+    ) -> ResearchFileRecord {
+        ResearchFileRecord {
+            relative_path: relative_path.to_owned(),
+            root: root.clone(),
+            parent: parent.clone(),
+            device: 6,
+            inode: 7,
+            owner: 3,
+            mode: 0o600,
+            mount_identity: root.mount_identity,
+            logical_bytes: bytes.len() as u64,
+            allocated_bytes: 512,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }
+    }
+
+    fn prepared_fixture(
+        working_directory: &str,
+        form: CheckpointArgvDeltaForm,
+        ordinal: usize,
+    ) -> PreparedCheckpoint {
+        let root = sample_directory();
+        let cwd = if working_directory == "." {
+            root.clone()
+        } else {
+            ResearchDirectoryRecord {
+                device: 1,
+                inode: 10,
+                owner: 3,
+                mode: 0o700,
+                mount_identity: [4, 5],
+            }
+        };
+        let source = b"print('trainer')\n";
+        let candidate = b"checkpoint-bytes";
+        let source_path = if working_directory == "." {
+            "train.py".to_owned()
+        } else {
+            format!("{working_directory}/train.py")
+        };
+        let candidate_root_path = ".pueue-agent/artifacts/experiment/step.json";
+        let candidate_argv_path = if working_directory == "." {
+            candidate_root_path.to_owned()
+        } else {
+            "artifacts/experiment/step.json".to_owned()
+        };
+        let loader_sha256 = format!("{:x}", Sha256::digest(source));
+        let candidate_sha256 = format!("{:x}", Sha256::digest(candidate));
+        let loader = CheckpointLoaderEvidenceV1 {
+            reference: format!("loader-source:{loader_sha256}"),
+            role: CheckpointLoaderRole::Entrypoint,
+            argv_index: 1,
+            argv_token: "train.py".to_owned(),
+            root_relative_path: source_path.clone(),
+            length: source.len() as u64,
+            sha256: loader_sha256,
+            file: prepared_file(&source_path, source, &root, &cwd),
+            content: String::from_utf8(source.to_vec()).unwrap(),
+        };
+        let source_checkpoint = CheckpointCandidateEvidenceV1 {
+            reference: format!("checkpoint:experiment:{ordinal}:{candidate_sha256}"),
+            source_experiment_id: "experiment".to_owned(),
+            argv_path: candidate_argv_path.clone(),
+            root_relative_path: candidate_root_path.to_owned(),
+            length: candidate.len() as u64,
+            sha256: candidate_sha256.clone(),
+            file: prepared_file(candidate_root_path, candidate, &root, &root),
+        };
+        let request_path = candidate_argv_path;
+        let (request_argv, retained_argv) = match form {
+            CheckpointArgvDeltaForm::Pair => (
+                vec![
+                    "python".to_owned(),
+                    "train.py".to_owned(),
+                    "--resume".to_owned(),
+                    request_path.clone(),
+                    "--lr".to_owned(),
+                    "0.001".to_owned(),
+                ],
+                vec![
+                    "python".to_owned(),
+                    "train.py".to_owned(),
+                    "--resume".to_owned(),
+                    "/private/state/research-checkpoints/campaign/review/checkpoint"
+                        .to_owned(),
+                    "--lr".to_owned(),
+                    "0.001".to_owned(),
+                ],
+            ),
+            CheckpointArgvDeltaForm::Equals => (
+                vec![
+                    "python".to_owned(),
+                    "train.py".to_owned(),
+                    "--lr".to_owned(),
+                    "0.001".to_owned(),
+                    format!("--resume={request_path}"),
+                ],
+                vec![
+                    "python".to_owned(),
+                    "train.py".to_owned(),
+                    "--lr".to_owned(),
+                    "0.001".to_owned(),
+                    "--resume=/private/state/research-checkpoints/campaign/review/checkpoint"
+                        .to_owned(),
+                ],
+            ),
+        };
+        let request = CheckpointRequest {
+            path: request_path,
+            argv: request_argv.clone(),
+            working_directory: working_directory.to_owned(),
+            support_evidence_refs: vec![
+                loader.reference.clone(),
+                source_checkpoint.reference.clone(),
+            ],
+        };
+        let source_argv = vec![
+            "python".to_owned(),
+            "train.py".to_owned(),
+            "--lr".to_owned(),
+            "0.001".to_owned(),
+        ];
+        let delta = validate_checkpoint_argv_delta(
+            &source_argv,
+            &request_argv,
+            &request.path,
+        )
+        .unwrap();
+        let learning_spec_digest =
+            checkpoint_learning_spec_digest(&source_argv, working_directory).unwrap();
+        let retained_root = ResearchDirectoryRecord {
+            device: 11,
+            inode: 12,
+            owner: 3,
+            mode: 0o700,
+            mount_identity: [14, 15],
+        };
+        let retained_parent = ResearchDirectoryRecord {
+            device: 11,
+            inode: 13,
+            owner: 3,
+            mode: 0o700,
+            mount_identity: retained_root.mount_identity,
+        };
+        PreparedCheckpoint {
+            schema_version: PREPARED_CHECKPOINT_VERSION,
+            project_id: "project".to_owned(),
+            campaign_id: "campaign".to_owned(),
+            review_id: "review".to_owned(),
+            review_attempt: 1,
+            review_session_generation: 0,
+            review_agent_run_id: 7,
+            review_event_id: 8,
+            source_experiment_id: "experiment".to_owned(),
+            source_proposal_id: "proposal".to_owned(),
+            source_submission_id: "submission".to_owned(),
+            source_task_id: 0,
+            source_managed_task_signature: "managed-task".to_owned(),
+            source_raw_task_signature: "raw-task".to_owned(),
+            context_digest: "a".repeat(64),
+            response_digest: "b".repeat(64),
+            campaign_objective_digest: "c".repeat(64),
+            source_proposal_canonical_digest: "d".repeat(64),
+            learning_spec_digest,
+            source_runtime: CheckpointSourceRuntimeV1::OriginalProjectRoot,
+            source_root_canonical_path: "/private/project".to_owned(),
+            source_root_resolution_fingerprint: "root-fingerprint".to_owned(),
+            source_root_record: root,
+            source_working_directory_record: cwd,
+            support_version: CHECKPOINT_SUPPORT_VERSION,
+            loader,
+            source_checkpoint,
+            retained_checkpoint: ResearchFileRecord {
+                relative_path: "research-checkpoints/campaign/review/checkpoint".to_owned(),
+                root: retained_root,
+                parent: retained_parent,
+                device: 16,
+                inode: 17,
+                owner: 3,
+                mode: 0o600,
+                mount_identity: [14, 15],
+                logical_bytes: candidate.len() as u64,
+                allocated_bytes: 512,
+                sha256: candidate_sha256,
+            },
+            source_argv,
+            source_working_directory: working_directory.to_owned(),
+            request,
+            delta,
+            retained_argv,
+            successor_ids: checkpoint_successor_ids("review", 1).unwrap(),
+        }
+    }
+
+    #[test]
+    fn prepared_checkpoint_roundtrips_root_nested_and_both_delta_forms() {
+        for (working_directory, form) in [
+            (".", CheckpointArgvDeltaForm::Pair),
+            (".pueue-agent", CheckpointArgvDeltaForm::Equals),
+        ] {
+            let checkpoint = prepared_fixture(working_directory, form, 0);
+            let encoded = serialize_prepared_checkpoint(&checkpoint).unwrap();
+            assert!(encoded.len() <= MAX_PREPARED_CHECKPOINT_BYTES);
+            assert_eq!(parse_prepared_checkpoint(&encoded).unwrap(), checkpoint);
+        }
+    }
+
+    #[test]
+    fn prepared_checkpoint_preserves_selected_candidate_ordinal_two() {
+        let checkpoint = prepared_fixture(".", CheckpointArgvDeltaForm::Pair, 2);
+        let encoded = serialize_prepared_checkpoint(&checkpoint).unwrap();
+        let parsed = parse_prepared_checkpoint(&encoded).unwrap();
+        assert_eq!(parsed.source_checkpoint.reference, checkpoint.source_checkpoint.reference);
+        assert!(parsed.source_checkpoint.reference.starts_with("checkpoint:experiment:2:"));
+    }
+
+    #[test]
+    fn prepared_codec_rejects_cross_mount_records_and_loader_not_bound_to_source_layout() {
+        let checkpoint = prepared_fixture(".", CheckpointArgvDeltaForm::Pair, 0);
+
+        let mut source_mount = checkpoint.clone();
+        source_mount.source_checkpoint.file.mount_identity = [99, 100];
+        assert!(serialize_prepared_checkpoint(&source_mount).is_err());
+
+        let mut cwd_mount = checkpoint.clone();
+        cwd_mount.source_working_directory_record.mount_identity = [99, 100];
+        assert!(serialize_prepared_checkpoint(&cwd_mount).is_err());
+
+        let mut loader = checkpoint;
+        loader.loader.argv_token = "other.py".to_owned();
+        loader.loader.root_relative_path = "other.py".to_owned();
+        loader.loader.file.relative_path = "other.py".to_owned();
+        assert!(serialize_prepared_checkpoint(&loader).is_err());
+    }
+
+    #[test]
+    fn prepared_codec_rejects_noncanonical_ordinals_and_retained_paths() {
+        let checkpoint = prepared_fixture(".", CheckpointArgvDeltaForm::Pair, 2);
+        for ordinal in ["02", "+2"] {
+            let mut invalid = checkpoint.clone();
+            let previous_reference = invalid.source_checkpoint.reference.clone();
+            invalid.source_checkpoint.reference = format!(
+                "checkpoint:experiment:{ordinal}:{}",
+                invalid.source_checkpoint.sha256
+            );
+            for reference in &mut invalid.request.support_evidence_refs {
+                if *reference == previous_reference {
+                    *reference = invalid.source_checkpoint.reference.clone();
+                }
+            }
+            assert!(serialize_prepared_checkpoint(&invalid).is_err());
+        }
+        for path in [
+            "/private//state/research-checkpoints/campaign/review/checkpoint",
+            "/private/./state/research-checkpoints/campaign/review/checkpoint",
+            "/private/state/research-checkpoints/campaign/review/checkpoint/",
+        ] {
+            let mut invalid = checkpoint.clone();
+            invalid.retained_argv[3] = path.to_owned();
+            assert!(serialize_prepared_checkpoint(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn prepared_checkpoint_allows_zero_task_and_generation_but_rejects_negative_or_nonpositive_ids() {
+        let checkpoint = prepared_fixture(".", CheckpointArgvDeltaForm::Pair, 0);
+        assert!(serialize_prepared_checkpoint(&checkpoint).is_ok());
+        for mutation in [
+            |value: &mut PreparedCheckpoint| value.source_task_id = -1,
+            |value: &mut PreparedCheckpoint| value.review_session_generation = -1,
+            |value: &mut PreparedCheckpoint| value.review_attempt = 0,
+            |value: &mut PreparedCheckpoint| value.review_agent_run_id = 0,
+            |value: &mut PreparedCheckpoint| value.review_event_id = 0,
+        ] {
+            let mut invalid = checkpoint.clone();
+            mutation(&mut invalid);
+            assert!(serialize_prepared_checkpoint(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn prepared_successor_ids_are_stable_and_domain_separated() {
+        let first = checkpoint_successor_ids("review", 1).unwrap();
+        assert_eq!(first, checkpoint_successor_ids("review", 1).unwrap());
+        assert_ne!(first.proposal_id, first.experiment_id);
+        assert_ne!(first.proposal_id, first.submission_id);
+        assert_ne!(first.experiment_id, first.submission_id);
+        assert_ne!(first, checkpoint_successor_ids("other-review", 1).unwrap());
+        assert_ne!(first, checkpoint_successor_ids("review", 2).unwrap());
+        for id in [first.proposal_id, first.experiment_id, first.submission_id] {
+            assert!(valid_bounded_identity(&id));
+        }
+    }
+
+    #[test]
+    fn learning_digest_ignores_retained_path_but_changes_learning_spec() {
+        let first = prepared_fixture(".", CheckpointArgvDeltaForm::Pair, 0);
+        let mut second = first.clone();
+        second.retained_argv[3] = "/private/other/checkpoint".to_owned();
+        assert_eq!(
+            checkpoint_learning_spec_digest(&first.source_argv, &first.source_working_directory)
+                .unwrap(),
+            checkpoint_learning_spec_digest(&second.source_argv, &second.source_working_directory)
+                .unwrap()
+        );
+        second.source_argv[3] = "0.002".to_owned();
+        assert_ne!(
+            first.learning_spec_digest,
+            checkpoint_learning_spec_digest(&second.source_argv, &second.source_working_directory)
+                .unwrap()
+        );
+        assert_ne!(
+            first.learning_spec_digest,
+            checkpoint_learning_spec_digest(&first.source_argv, "nested").unwrap()
+        );
+    }
+
+    #[test]
+    fn prepared_codec_rejects_duplicate_unknown_version_and_raw_size() {
+        for working_directory in [".", ".pueue-agent"] {
+            let checkpoint = prepared_fixture(working_directory, CheckpointArgvDeltaForm::Pair, 0);
+            let encoded = serialize_prepared_checkpoint(&checkpoint).unwrap();
+            let duplicate = encoded.replacen(
+                "\"schema_version\":1,",
+                "\"schema_version\":1,\"schema_version\":1,",
+                1,
+            );
+            assert!(parse_prepared_checkpoint(&duplicate).is_err());
+
+            let mut unknown: Value = serde_json::from_str(&encoded).unwrap();
+            unknown["unexpected"] = Value::Bool(true);
+            assert!(parse_prepared_checkpoint(&serde_json::to_string(&unknown).unwrap()).is_err());
+            let mut nested_unknown: Value = serde_json::from_str(&encoded).unwrap();
+            nested_unknown["loader"]["unexpected"] = Value::Bool(true);
+            assert!(
+                parse_prepared_checkpoint(&serde_json::to_string(&nested_unknown).unwrap())
+                    .is_err()
+            );
+            let nested_duplicate = encoded.replacen(
+                "\"source_root_record\":{\"device\":1,",
+                "\"source_root_record\":{\"device\":1,\"device\":1,",
+                1,
+            );
+            assert!(parse_prepared_checkpoint(&nested_duplicate).is_err());
+
+            let mut version: Value = serde_json::from_str(&encoded).unwrap();
+            version["schema_version"] = Value::from(2);
+            assert!(parse_prepared_checkpoint(&serde_json::to_string(&version).unwrap()).is_err());
+
+            let mut oversized = checkpoint.clone();
+            oversized.retained_argv[0] = "x".repeat(MAX_PREPARED_CHECKPOINT_BYTES);
+            let oversized = serde_json::to_string(&oversized).unwrap();
+            assert!(oversized.len() > MAX_PREPARED_CHECKPOINT_BYTES);
+            assert!(parse_prepared_checkpoint(&oversized).is_err());
+        }
+    }
+
+    #[test]
+    fn prepared_codec_rejects_mutated_authority_fields_and_retained_path_syntax() {
+        let checkpoint = prepared_fixture(".", CheckpointArgvDeltaForm::Pair, 0);
+        let mut cases = Vec::new();
+        let mut loader_digest = checkpoint.clone();
+        loader_digest.loader.sha256 = "e".repeat(64);
+        cases.push(loader_digest);
+        let mut loader_record = checkpoint.clone();
+        loader_record.loader.file.logical_bytes += 1;
+        cases.push(loader_record);
+        let mut candidate_record = checkpoint.clone();
+        candidate_record.source_checkpoint.file.root.inode += 1;
+        cases.push(candidate_record);
+        let mut retained_digest = checkpoint.clone();
+        retained_digest.retained_checkpoint.sha256 = "f".repeat(64);
+        cases.push(retained_digest);
+        let mut source_id = checkpoint.clone();
+        source_id.source_experiment_id = "foreign".to_owned();
+        cases.push(source_id);
+        let mut delta = checkpoint.clone();
+        delta.delta.index += 1;
+        cases.push(delta);
+        let mut argv = checkpoint.clone();
+        argv.request.argv[0] = "python3".to_owned();
+        cases.push(argv);
+        let mut path = checkpoint.clone();
+        path.request.path = "foreign/checkpoint.json".to_owned();
+        cases.push(path);
+        let mut refs = checkpoint.clone();
+        refs.request.support_evidence_refs[1] = refs.request.support_evidence_refs[0].clone();
+        cases.push(refs);
+        let mut retained_path = checkpoint.clone();
+        retained_path.retained_argv[3] = "../checkpoint".to_owned();
+        cases.push(retained_path);
+        for invalid in cases {
+            assert!(serialize_prepared_checkpoint(&invalid).is_err());
         }
     }
 }
