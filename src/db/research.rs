@@ -15,26 +15,27 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     environment::{
-        campaign_experiment_runtime_argv, PrivateRunTempRecoveryIdentityV1, PrivateRunTempRecoveryRootIdentity,
-        PrivateRunTempRecoveryTempIdentity,
-        RecoveredPrivateRunTempCleanup, validate_research_id,
+        campaign_experiment_runtime_argv, validate_research_id, PrivateRunTempRecoveryIdentityV1,
+        PrivateRunTempRecoveryRootIdentity, PrivateRunTempRecoveryTempIdentity,
+        RecoveredPrivateRunTempCleanup,
     },
     models::{
-        CampaignState, EventStatus, ExperimentStatus, Incident, ProposalKind, ProposalStatus,
-        Project, SubmissionKind, SubmissionStatus, TaskObservation, TerminationRequest,
+        CampaignState, EventStatus, ExperimentStatus, Incident, Project, ProposalKind,
+        ProposalStatus, SubmissionKind, SubmissionStatus, TaskObservation, TerminationRequest,
     },
-    pueue::PueueTask,
     proposals::{self, ProposalInput},
+    pueue::PueueTask,
     reconcile::{
         managed_task_run_signature, managed_task_run_signature_for_observation, task_signature,
         try_canonical_command_display_os,
     },
     research_checkpoint::{
-        checkpoint_source_layout, checkpoint_support_from_persisted_context,
-        checkpoint_learning_spec_digest, parse_prepared_checkpoint, select_checkpoint_support,
-        CheckpointSupportEvidenceV1, PreparedCheckpoint,
+        checkpoint_learning_spec_digest, checkpoint_source_layout,
+        checkpoint_support_from_persisted_context, parse_prepared_checkpoint,
+        select_checkpoint_support, CheckpointSupportEvidenceV1, PreparedCheckpoint,
     },
     research_protocol::{parse_research_answer, CheckpointRequest, ResearchAnswer},
+    termination::UNDISPATCHED_CONFIRMATION_PREFIX,
     AppError,
 };
 
@@ -49,6 +50,61 @@ const RESEARCH_RETRY_FAILURE_UNSAFE: &str = "research_session_unsafe";
 const RESEARCH_RETRY_FAILURE_POLICY: &str = "research_policy_blocked";
 const MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES: usize =
     crate::research_checkpoint::MAX_PREPARED_CHECKPOINT_BYTES;
+const MAX_CHECKPOINT_UNSUPPORTED_REASON_BYTES: usize = 1024;
+const MAX_CHECKPOINT_CLEANUP_TERMINATION_TEXT_BYTES: usize = crate::process::MAX_FIELD_SIZE;
+const MAX_CHECKPOINT_CLEANUP_TERMINATION_STATUS_BYTES: usize = 32;
+const MAX_CHECKPOINT_CLEANUP_FAILURE_CODE_BYTES: usize = 128;
+// `prepare_attempt` appends at most nine prior entries because the policy
+// validator caps max_decision_attempts_per_cycle at ten.  Every context is
+// already bounded to MAX_RESEARCH_CONTEXT_BYTES and is embedded as a JSON
+// string; six bytes per input byte covers serde_json's worst-case escape.
+// The metadata terms below enumerate every producer field in the durable
+// envelope instead of treating MAX_RESEARCH_NOTES_BYTES as its cap: the
+// native authority, retry entry metadata, planned/confirmed session IDs,
+// budget reservation ID, recovery reason, saved_advice (the answer notes
+// bound), and checkpoint_unsupported reason.  The native authority's
+// resolution fingerprint is checked against MAX_FIELD_SIZE when it is first
+// recorded, so this is a closed producer bound.
+const MAX_CHECKPOINT_CLEANUP_RETRY_ENTRIES: usize = 9;
+const MAX_CHECKPOINT_CLEANUP_JSON_ESCAPE_BYTES: usize = 6;
+const MAX_CHECKPOINT_CLEANUP_BINDING_ID_BYTES: usize = 256 * 4;
+const MAX_CHECKPOINT_CLEANUP_SESSION_ID_BYTES: usize = 36;
+const MAX_CHECKPOINT_CLEANUP_RECOVERY_REASON_BYTES: usize = 128;
+const MAX_CHECKPOINT_CLEANUP_SAVED_ADVICE_BYTES: usize =
+    crate::research_protocol::MAX_RESEARCH_NOTES_BYTES;
+const MAX_CHECKPOINT_CLEANUP_UNSUPPORTED_REASON_BYTES: usize =
+    MAX_CHECKPOINT_UNSUPPORTED_REASON_BYTES;
+const MAX_CHECKPOINT_CLEANUP_NATIVE_INTEGER_FIELDS: usize = 23;
+const MAX_CHECKPOINT_CLEANUP_JSON_STRUCTURE_BYTES: usize = 1024;
+const MAX_CHECKPOINT_CLEANUP_NATIVE_AUTHORITY_BYTES: usize =
+    MAX_CHECKPOINT_CLEANUP_JSON_ESCAPE_BYTES
+        * (3 * MAX_CHECKPOINT_CLEANUP_BINDING_ID_BYTES
+            + crate::process::MAX_FIELD_SIZE
+            + MAX_CHECKPOINT_CLEANUP_SESSION_ID_BYTES
+            + 8)
+        + MAX_CHECKPOINT_CLEANUP_NATIVE_INTEGER_FIELDS * 20
+        + MAX_CHECKPOINT_CLEANUP_JSON_STRUCTURE_BYTES;
+const MAX_CHECKPOINT_CLEANUP_RETRY_ENTRY_BYTES: usize =
+    MAX_CHECKPOINT_CLEANUP_JSON_ESCAPE_BYTES
+        * (crate::research_evidence::MAX_RESEARCH_CONTEXT_BYTES
+            + MAX_CHECKPOINT_CLEANUP_FAILURE_CODE_BYTES
+            + 64
+            + 2 * MAX_CHECKPOINT_CLEANUP_SESSION_ID_BYTES
+            + 9)
+        + MAX_CHECKPOINT_CLEANUP_NATIVE_AUTHORITY_BYTES
+        + 2 * 20
+        + MAX_CHECKPOINT_CLEANUP_JSON_STRUCTURE_BYTES;
+const MAX_CHECKPOINT_CLEANUP_NOTES_BYTES: usize =
+    MAX_CHECKPOINT_CLEANUP_RETRY_ENTRIES * MAX_CHECKPOINT_CLEANUP_RETRY_ENTRY_BYTES
+        + MAX_CHECKPOINT_CLEANUP_NATIVE_AUTHORITY_BYTES
+        + MAX_CHECKPOINT_CLEANUP_JSON_ESCAPE_BYTES
+            * (2 * MAX_CHECKPOINT_CLEANUP_SESSION_ID_BYTES
+                + MAX_CHECKPOINT_CLEANUP_BINDING_ID_BYTES
+                + MAX_CHECKPOINT_CLEANUP_RECOVERY_REASON_BYTES
+                + MAX_CHECKPOINT_CLEANUP_SAVED_ADVICE_BYTES
+                + MAX_CHECKPOINT_CLEANUP_UNSUPPORTED_REASON_BYTES)
+        + 20
+        + MAX_CHECKPOINT_CLEANUP_JSON_STRUCTURE_BYTES;
 const _: () = assert!(MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES == 131_072);
 
 /// Rows that claim a checkpoint successor either carry a non-null checkpoint
@@ -84,7 +140,9 @@ impl RunningResearchCandidate {
     }
 }
 
-fn running_research_candidate_from_row(row: &Row<'_>) -> rusqlite::Result<RunningResearchCandidate> {
+fn running_research_candidate_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<RunningResearchCandidate> {
     let campaign_id = row.get(0)?;
     let experiment_id = row.get(1)?;
     let managed_signature = row.get(2)?;
@@ -214,6 +272,32 @@ pub(crate) struct ReadyResearchAction {
     pub raw_task_signature: String,
 }
 
+#[derive(Debug)]
+pub(crate) enum ReadyResearchActionSelection {
+    Authorized(ReadyResearchAction),
+    CheckpointUnsupported(CheckpointUnsupportedReview),
+    NotReady,
+}
+
+#[derive(Debug)]
+pub(crate) struct CheckpointUnsupportedReview {
+    review_id: String,
+    project_id: String,
+    campaign_id: String,
+    source_experiment_id: String,
+    managed_task_signature: String,
+    attempt: i64,
+    session_generation: i64,
+    agent_run_id: i64,
+    event_id: i64,
+    context_json: String,
+    context_digest: String,
+    response_json: String,
+    notes_json: String,
+    failure_code: Option<String>,
+    reason: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CheckpointSourceAuthority {
     pub(crate) project: Project,
@@ -232,6 +316,13 @@ pub(crate) enum CheckpointSourceAuthorityRead {
 pub(crate) enum CheckpointSuccessorPreflight {
     Available,
     Deferred,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckpointReviewClaim {
+    Checkpoint,
+    Ordinary,
+    Invalid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +350,67 @@ pub(crate) struct CheckpointDispatchAuthority {
     pub(super) successor_attempt: Option<i64>,
     pub(super) reservation_window_ends_at: Option<i64>,
     pub(super) termination_request_id: Option<i64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CheckpointCleanupAuthority {
+    dispatch: CheckpointDispatchAuthority,
+    shape: CheckpointCleanupShape,
+    witness: CheckpointCleanupWitness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckpointCleanupWitness {
+    review_state: String,
+    review_operation_stage: Option<String>,
+    review_task_signature: String,
+    review_attempt: i64,
+    review_session_generation: i64,
+    review_agent_run_id: Option<i64>,
+    review_event_id: Option<i64>,
+    review_context_json: Option<String>,
+    review_context_digest: Option<String>,
+    review_response_json: Option<String>,
+    review_notes_json: Option<String>,
+    review_failure_code: Option<String>,
+    review_not_before: Option<i64>,
+    review_created_at: Option<i64>,
+    review_started_at: Option<i64>,
+    review_finished_at: Option<i64>,
+    review_updated_at: i64,
+    review_termination_request_id: Option<i64>,
+    review_successor_experiment_id: Option<String>,
+    termination_incident_id: i64,
+    termination_project_id: String,
+    termination_task_signature: String,
+    termination_reason: String,
+    termination_status: String,
+    termination_requested_at: i64,
+    termination_dispatch_lease_until: Option<i64>,
+    termination_grace_until: Option<i64>,
+    termination_confirmed_at: Option<i64>,
+    termination_last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointCleanupShape {
+    TerminalSuccessor,
+    PreAddFailure,
+    Undispatched,
+}
+
+impl CheckpointCleanupAuthority {
+    pub(crate) fn campaign_id(&self) -> &str {
+        &self.dispatch.campaign_id
+    }
+
+    pub(crate) fn review_id(&self) -> &str {
+        &self.dispatch.review_id
+    }
+
+    pub(crate) fn retained_checkpoint(&self) -> &crate::environment::ResearchFileRecord {
+        &self.dispatch.checkpoint.retained_checkpoint
+    }
 }
 
 impl CheckpointDispatchAuthority {
@@ -378,6 +530,111 @@ const REVIEW_SELECT: &str = "SELECT review_id, campaign_id, experiment_id,
         created_at, started_at, finished_at, updated_at,
         typeof(checkpoint_json), length(CAST(checkpoint_json AS BLOB))
     FROM research_reviews";
+
+fn checkpoint_cleanup_review_select() -> String {
+    format!(
+        "SELECT review_id, campaign_id, experiment_id,
+                task_signature, attempt, state, operation_stage, agent_run_id,
+                CASE
+                  WHEN typeof(context_json) = 'text'
+                   AND length(CAST(context_json AS BLOB)) BETWEEN 1 AND {}
+                  THEN context_json
+                END,
+                CASE
+                  WHEN typeof(context_digest) = 'text'
+                   AND length(CAST(context_digest AS BLOB)) = 64
+                  THEN context_digest
+                END,
+                CASE
+                  WHEN typeof(response_json) = 'text'
+                   AND length(CAST(response_json AS BLOB)) BETWEEN 1 AND {}
+                  THEN response_json
+                END,
+                termination_request_id, successor_experiment_id,
+                evidence_schema_version, session_generation, event_id,
+                not_before,
+                CASE
+                  WHEN typeof(notes_json) = 'text'
+                   AND length(CAST(notes_json AS BLOB)) BETWEEN 1 AND {}
+                  THEN notes_json
+                END,
+                CASE
+                  WHEN typeof(failure_code) = 'text'
+                   AND length(CAST(failure_code AS BLOB)) BETWEEN 1 AND {}
+                  THEN failure_code
+                END,
+                CASE WHEN decision_cycle_id IS NULL THEN 0 ELSE 1 END,
+                CASE
+                  WHEN typeof(checkpoint_json) = 'text'
+                   AND length(CAST(checkpoint_json AS BLOB)) BETWEEN 1 AND {}
+                  THEN checkpoint_json
+                END,
+                created_at, started_at, finished_at, updated_at,
+                typeof(checkpoint_json), length(CAST(checkpoint_json AS BLOB)),
+                typeof(context_json), length(CAST(context_json AS BLOB)),
+                typeof(context_digest), length(CAST(context_digest AS BLOB)),
+                typeof(response_json), length(CAST(response_json AS BLOB)),
+                typeof(notes_json), length(CAST(notes_json AS BLOB)),
+                typeof(failure_code), length(CAST(failure_code AS BLOB))
+         FROM research_reviews",
+        crate::research_evidence::MAX_RESEARCH_CONTEXT_BYTES,
+        crate::research_protocol::MAX_RESEARCH_ANSWER_BYTES,
+        MAX_CHECKPOINT_CLEANUP_NOTES_BYTES,
+        MAX_CHECKPOINT_CLEANUP_FAILURE_CODE_BYTES,
+        MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES,
+    )
+}
+
+#[derive(Debug)]
+struct CheckpointCleanupReviewProjection {
+    review: ResearchReview,
+    notes_json: Option<String>,
+    context_storage: String,
+    response_storage: String,
+    context_digest_storage: String,
+    notes_storage: String,
+    failure_code: Option<String>,
+    failure_code_storage: String,
+    failure_code_byte_len: Option<i64>,
+    decision_cycle_present: bool,
+}
+
+impl CheckpointCleanupReviewProjection {
+    fn has_bounded_authority_text(&self) -> bool {
+        self.review.context_json.is_some()
+            && self.context_storage == "text"
+            && self.review.context_digest.is_some()
+            && self.context_digest_storage == "text"
+            && self.review.response_json.is_some()
+            && self.response_storage == "text"
+            && self.notes_json.is_some()
+            && self.notes_storage == "text"
+            && !self.decision_cycle_present
+            && ((self.failure_code_storage == "null" && self.failure_code.is_none())
+                || (self.failure_code_storage == "text"
+                    && self.failure_code.is_some()
+                    && self.failure_code_byte_len.is_some_and(|len| {
+                        (1..=MAX_CHECKPOINT_CLEANUP_FAILURE_CODE_BYTES as i64).contains(&len)
+                    })))
+    }
+}
+
+fn checkpoint_cleanup_review_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<CheckpointCleanupReviewProjection> {
+    Ok(CheckpointCleanupReviewProjection {
+        review: review_from_row(row)?,
+        notes_json: row.get(17)?,
+        context_storage: row.get(27)?,
+        response_storage: row.get(31)?,
+        context_digest_storage: row.get(29)?,
+        notes_storage: row.get(33)?,
+        failure_code: row.get(18)?,
+        failure_code_storage: row.get(35)?,
+        failure_code_byte_len: row.get(36)?,
+        decision_cycle_present: row.get::<_, i64>(19)? != 0,
+    })
+}
 const LAUNCH_REVIEW_SELECT: &str = "SELECT review.review_id, review.campaign_id,
         review.experiment_id, review.task_signature, review.attempt, review.state,
         review.operation_stage, review.agent_run_id, review.context_json,
@@ -403,9 +660,7 @@ impl<'db> ResearchRepository<'db> {
     /// Return every project with a bound native research owner whose
     /// immutable authority is not an exact cleanup-complete proof.  This is
     /// observation only; startup ownership is adopted separately.
-    pub(crate) fn native_cleanup_blocked_project_ids(
-        &self,
-    ) -> Result<BTreeSet<String>, AppError> {
+    pub(crate) fn native_cleanup_blocked_project_ids(&self) -> Result<BTreeSet<String>, AppError> {
         let connection = self.db.connect()?;
         native_cleanup_blocked_project_ids(&connection)
     }
@@ -754,7 +1009,10 @@ impl<'db> ResearchRepository<'db> {
             ))
             .map_err(database_error("prepare due research review query"))?;
         let rows = statement
-            .query_map(params![now, limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64], review_from_row)
+            .query_map(
+                params![now, limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64],
+                review_from_row,
+            )
             .map_err(database_error("query due research reviews"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read due research reviews"))
@@ -993,12 +1251,9 @@ impl<'db> ResearchRepository<'db> {
         drop(statement);
         let mut reviews = Vec::new();
         for (campaign_id, experiment_id, managed_signature) in accepted {
-            if let Some(review) = self.claim_due(
-                &campaign_id,
-                &experiment_id,
-                &managed_signature,
-                now,
-            )? {
+            if let Some(review) =
+                self.claim_due(&campaign_id, &experiment_id, &managed_signature, now)?
+            {
                 reviews.push(review);
             }
         }
@@ -1015,7 +1270,9 @@ impl<'db> ResearchRepository<'db> {
             )
             .optional()
             .map_err(database_error("read research review event"))?
-            .ok_or_else(|| validation_error("review_id", "does not identify a persisted research review"))
+            .ok_or_else(|| {
+                validation_error("review_id", "does not identify a persisted research review")
+            })
     }
 
     pub fn reservation_id_for_attempt(
@@ -1188,9 +1445,9 @@ impl<'db> ResearchRepository<'db> {
         if attempt > 0 && agent_run_id.is_none() && failure_code.is_none() {
             Ok(attempt)
         } else {
-            attempt
-                .checked_add(1)
-                .ok_or_else(|| validation_error("research.attempt", "cannot advance review attempt"))
+            attempt.checked_add(1).ok_or_else(|| {
+                validation_error("research.attempt", "cannot advance review attempt")
+            })
         }
     }
 
@@ -1674,16 +1931,31 @@ impl<'db> ResearchRepository<'db> {
                    ON owner.run_id = review.agent_run_id
                  WHERE review.review_id = ?1",
                 [review_id],
-                |row| Ok((
-                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                    row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
-                    row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
-                    row.get(12)?, row.get(13)?, row.get(14)?,
-                )),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                    ))
+                },
             )
             .optional()
             .map_err(database_error("read research attempt admission"))?
-            .ok_or_else(|| validation_error("review_id", "does not identify a persisted research review"))?;
+            .ok_or_else(|| {
+                validation_error("review_id", "does not identify a persisted research review")
+            })?;
         let (
             campaign_id,
             state,
@@ -1767,12 +2039,7 @@ impl<'db> ResearchRepository<'db> {
             })?
         };
         if target_attempt > i64::from(max_attempts) {
-            block_review_in_transaction(
-                &transaction,
-                review_id,
-                "research_attempt_limit",
-                now,
-            )?;
+            block_review_in_transaction(&transaction, review_id, "research_attempt_limit", now)?;
             transaction
                 .commit()
                 .map_err(database_error("commit research attempt limit"))?;
@@ -1888,7 +2155,10 @@ impl<'db> ResearchRepository<'db> {
             .optional()
             .map_err(database_error("read research retry state"))?;
         let Some((attempt, state, failure_code)) = row else {
-            return Err(validation_error("review_id", "does not identify a persisted research review"));
+            return Err(validation_error(
+                "review_id",
+                "does not identify a persisted research review",
+            ));
         };
         if state != "retry_wait" {
             transaction
@@ -2026,9 +2296,9 @@ impl<'db> ResearchRepository<'db> {
                 (None, None) if agent_run_id.is_none() => true,
                 (Some(context), Some(digest)) => {
                     digest.len() == 64
-                        && digest
-                            .chars()
-                            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+                        && digest.chars().all(|character| {
+                            character.is_ascii_hexdigit() && !character.is_ascii_uppercase()
+                        })
                         && format!("{:x}", Sha256::digest(context.as_bytes())) == digest
                 }
                 _ => false,
@@ -2037,9 +2307,13 @@ impl<'db> ResearchRepository<'db> {
                 .as_deref()
                 .is_some_and(|run_project| run_project == campaign_project_id);
             let valid = match state.as_str() {
-                "pending" => agent_run_id.is_none() && context_json.is_none() && context_digest.is_none(),
-                "retry_wait" => agent_run_id.is_none() && context_json.is_none() && context_digest.is_none()
-                    || agent_run_id.is_some() && context_valid && run_project_matches,
+                "pending" => {
+                    agent_run_id.is_none() && context_json.is_none() && context_digest.is_none()
+                }
+                "retry_wait" => {
+                    agent_run_id.is_none() && context_json.is_none() && context_digest.is_none()
+                        || agent_run_id.is_some() && context_valid && run_project_matches
+                }
                 "running" => agent_run_id.is_some() && context_valid && run_project_matches,
                 _ => true,
             };
@@ -2075,9 +2349,9 @@ impl<'db> ResearchRepository<'db> {
                 [now],
             )
             .map_err(database_error("complete persisted research response event"))?;
-        transaction
-            .commit()
-            .map_err(database_error("commit persisted research response recovery"))?;
+        transaction.commit().map_err(database_error(
+            "commit persisted research response recovery",
+        ))?;
 
         let connection = self.db.connect()?;
         let mut statement = connection
@@ -2233,7 +2507,10 @@ impl<'db> ResearchRepository<'db> {
 
         let owner_status = current.owner_status.as_deref().unwrap_or_default();
         let event_id = current.event_id.ok_or_else(|| {
-            validation_error("research.event_id", "startup owner event binding is missing")
+            validation_error(
+                "research.event_id",
+                "startup owner event binding is missing",
+            )
         })?;
         let event_status: EventStatus = transaction
             .query_row(
@@ -2332,9 +2609,7 @@ impl<'db> ResearchRepository<'db> {
             cleanup
                 .as_mut()
                 .expect("pending authority requires cleanup capability")
-                .cleanup_contents_before(Some(
-                    Instant::now() + Duration::from_secs(30),
-                ))
+                .cleanup_contents_before(Some(Instant::now() + Duration::from_secs(30)))
                 .map_err(AppError::from)?;
             let mut notes = parse_research_notes(current.notes_json.as_deref())?;
             let cleanup_object = notes
@@ -2343,10 +2618,7 @@ impl<'db> ResearchRepository<'db> {
                 .and_then(|authority| authority.get_mut("cleanup"))
                 .and_then(Value::as_object_mut)
                 .ok_or_else(|| {
-                    validation_error(
-                        "research.native_recovery.cleanup",
-                        "phase is missing",
-                    )
+                    validation_error("research.native_recovery.cleanup", "phase is missing")
                 })?;
             if cleanup_object.get("phase").and_then(Value::as_str) != Some("pending") {
                 return Err(validation_error(
@@ -2363,11 +2635,7 @@ impl<'db> ResearchRepository<'db> {
             let (run_status, run_error, final_gate) = if review_ready {
                 ("completed", None, "released")
             } else if review_retry {
-                (
-                    "failed",
-                    current.failure_code.as_deref(),
-                    "failed",
-                )
+                ("failed", current.failure_code.as_deref(), "failed")
             } else {
                 let final_gate = if owner.gate_state == "released" {
                     "released"
@@ -2394,9 +2662,8 @@ impl<'db> ResearchRepository<'db> {
             }
         }
         if review_running {
-            let retry_at = now.saturating_add(
-                crate::retry::retry_backoff_seconds(current.attempt.max(1)),
-            );
+            let retry_at =
+                now.saturating_add(crate::retry::retry_backoff_seconds(current.attempt.max(1)));
             let changed = transaction
                 .execute(
                     "UPDATE research_reviews
@@ -2447,9 +2714,8 @@ impl<'db> ResearchRepository<'db> {
             }
         }
         if review_running {
-            let retry_at = now.saturating_add(
-                crate::retry::retry_backoff_seconds(current.attempt.max(1)),
-            );
+            let retry_at =
+                now.saturating_add(crate::retry::retry_backoff_seconds(current.attempt.max(1)));
             let changed = transaction
                 .execute(
                     "UPDATE events
@@ -2542,12 +2808,7 @@ impl<'db> ResearchRepository<'db> {
         Ok(true)
     }
 
-    pub fn block_review(
-        &self,
-        review_id: &str,
-        reason: &str,
-        now: i64,
-    ) -> Result<(), AppError> {
+    pub fn block_review(&self, review_id: &str, reason: &str, now: i64) -> Result<(), AppError> {
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2659,9 +2920,8 @@ impl<'db> ResearchRepository<'db> {
                 .map_err(database_error("read authoritative research candidates"))?;
             let mut authority = None;
             for candidate in candidates {
-                let candidate = candidate.map_err(database_error(
-                    "read authoritative research candidate",
-                ))?;
+                let candidate =
+                    candidate.map_err(database_error("read authoritative research candidate"))?;
                 if candidate.has_managed_identity() {
                     authority = Some(candidate);
                     break;
@@ -2933,6 +3193,14 @@ impl<'db> ResearchRepository<'db> {
         now: i64,
     ) -> Result<(), AppError> {
         validate_research_binding(binding)?;
+        if identity.service_root_identity.resolution_fingerprint.len()
+            > crate::process::MAX_FIELD_SIZE
+        {
+            return Err(validation_error(
+                "research.native_recovery",
+                "resolution fingerprint is too large",
+            ));
+        }
         let authority = json!({
             "version": PrivateRunTempRecoveryIdentityV1::VERSION,
             "run_id": agent_run_id,
@@ -3048,9 +3316,9 @@ impl<'db> ResearchRepository<'db> {
                 expected_identity,
                 fresh_launch,
             ) {
-                transaction
-                    .commit()
-                    .map_err(database_error("commit idempotent native research authority"))?;
+                transaction.commit().map_err(database_error(
+                    "commit idempotent native research authority",
+                ))?;
                 return Ok(());
             }
             return Err(validation_error(
@@ -3241,12 +3509,14 @@ impl<'db> ResearchRepository<'db> {
             .and_then(Value::as_object_mut)
             .and_then(|authority| authority.get_mut("cleanup"))
             .and_then(Value::as_object_mut)
-            .ok_or_else(|| validation_error("research.native_recovery.cleanup", "phase is missing"))?;
+            .ok_or_else(|| {
+                validation_error("research.native_recovery.cleanup", "phase is missing")
+            })?;
         match cleanup.get("phase").and_then(Value::as_str) {
             Some("complete") => {
-                transaction
-                    .commit()
-                    .map_err(database_error("commit idempotent native cleanup completion"))?;
+                transaction.commit().map_err(database_error(
+                    "commit idempotent native cleanup completion",
+                ))?;
                 return Ok(());
             }
             Some("pending") => {}
@@ -3320,7 +3590,16 @@ impl<'db> ResearchRepository<'db> {
             current_run,
             current_review_generation,
             current_notes,
-            ): (String, String, Option<String>, i64, i64, Option<i64>, i64, Option<String>) = transaction
+        ): (
+            String,
+            String,
+            Option<String>,
+            i64,
+            i64,
+            Option<i64>,
+            i64,
+            Option<String>,
+        ) = transaction
             .query_row(
                 "SELECT r.campaign_id, r.experiment_id, c.session_id, c.session_generation,
                         r.attempt, r.agent_run_id, r.session_generation, r.notes_json
@@ -3671,11 +3950,21 @@ impl<'db> ResearchRepository<'db> {
                  JOIN campaign_research AS c ON c.campaign_id = r.campaign_id
                  WHERE r.review_id = ?1",
                 [&binding.review_id],
-                |row| Ok((
-                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                    row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
-                    row.get(8)?, row.get(9)?, row.get(10)?,
-                )),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
             )
             .map_err(database_error("read research session confirmation"))?;
         if campaign_id != binding.campaign_id
@@ -3710,9 +3999,9 @@ impl<'db> ResearchRepository<'db> {
                 .and_then(serde_json::Value::as_str)
                 == Some(confirmed_session_id);
         if already_confirmed {
-            return transaction
-                .commit()
-                .map_err(database_error("commit idempotent research session confirmation"));
+            return transaction.commit().map_err(database_error(
+                "commit idempotent research session confirmation",
+            ));
         }
         if current_session.as_deref() != Some(binding.session_id.as_str()) {
             return Err(validation_error(
@@ -4102,10 +4391,7 @@ impl<'db> ResearchRepository<'db> {
         Ok(!matches!(ownership, ResearchOwnership::None))
     }
 
-    pub(crate) fn ready_reviews(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<ResearchReview>, AppError> {
+    pub(crate) fn ready_reviews(&self, limit: usize) -> Result<Vec<ResearchReview>, AppError> {
         let connection = self.db.connect()?;
         let mut statement = connection
             .prepare(&format!(
@@ -4116,7 +4402,10 @@ impl<'db> ResearchRepository<'db> {
             ))
             .map_err(database_error("prepare ready research action query"))?;
         let rows = statement
-            .query_map([limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64], review_from_row)
+            .query_map(
+                [limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64],
+                review_from_row,
+            )
             .map_err(database_error("query ready research actions"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read ready research actions"))
@@ -4159,7 +4448,10 @@ impl<'db> ResearchRepository<'db> {
             ))
             .map_err(database_error("prepare open research action query"))?;
         let rows = statement
-            .query_map([limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64], review_from_row)
+            .query_map(
+                [limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64],
+                review_from_row,
+            )
             .map_err(database_error("query open research actions"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read open research actions"))
@@ -4355,9 +4647,9 @@ impl<'db> ResearchRepository<'db> {
                     "inconsistent checkpoint review changed before blocking",
                 ));
             }
-            transaction
-                .commit()
-                .map_err(database_error("commit inconsistent checkpoint dispatch block"))?;
+            transaction.commit().map_err(database_error(
+                "commit inconsistent checkpoint dispatch block",
+            ))?;
             return Ok(CheckpointDispatchSelection::Blocked);
         }
         if prepared_checkpoint_source_authority_in_connection(&transaction, &checkpoint).is_err() {
@@ -4376,17 +4668,15 @@ impl<'db> ResearchRepository<'db> {
                     "checkpoint authority changed before blocking",
                 ));
             }
-            transaction
-                .commit()
-                .map_err(database_error("commit unsupported checkpoint dispatch block"))?;
+            transaction.commit().map_err(database_error(
+                "commit unsupported checkpoint dispatch block",
+            ))?;
             return Ok(CheckpointDispatchSelection::Blocked);
         }
         let proposal_id = checkpoint.successor_ids.proposal_id.clone();
         let submission_id = checkpoint.successor_ids.submission_id.clone();
-        let successor_witness = super::research::checkpoint_successor_witness(
-            &transaction,
-            successor_experiment_id,
-        )?;
+        let successor_witness =
+            super::research::checkpoint_successor_witness(&transaction, successor_experiment_id)?;
         let termination_request_id: Option<i64> = transaction
             .query_row(
                 "SELECT termination_request_id FROM research_reviews WHERE review_id = ?1",
@@ -4446,6 +4736,288 @@ impl<'db> ResearchRepository<'db> {
         Ok(CheckpointDispatchSelection::Ready(authority))
     }
 
+    pub(crate) fn checkpoint_cleanup_review_ids(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, AppError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.db.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT review.review_id
+                 FROM research_reviews AS review
+                 JOIN campaigns AS campaign ON campaign.campaign_id = review.campaign_id
+                 WHERE campaign.project_id = ?1
+                   AND (
+                       (review.state = 'ready'
+                        AND review.operation_stage = 'intent'
+                        AND review.checkpoint_json IS NOT NULL)
+                       OR (review.state IN ('ready','blocked')
+                           AND review.operation_stage = 'successor_reserved'
+                           AND review.successor_experiment_id IS NOT NULL)
+                   )
+                 ORDER BY review.updated_at, review.review_id
+                 LIMIT ?2",
+            )
+            .map_err(database_error("prepare checkpoint cleanup candidates"))?;
+        let ids = statement
+            .query_map(
+                params![
+                    project_id,
+                    limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(database_error("query checkpoint cleanup candidates"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read checkpoint cleanup candidates"));
+        ids
+    }
+
+    pub(crate) fn checkpoint_cleanup_authority(
+        &self,
+        project_id: &str,
+        review_id: &str,
+        now: i64,
+    ) -> Result<Option<CheckpointCleanupAuthority>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(database_error("begin checkpoint cleanup authority"))?;
+        let review = transaction
+            .query_row(
+                &format!("{} WHERE review_id = ?1", checkpoint_cleanup_review_select()),
+                [review_id],
+                checkpoint_cleanup_review_from_row,
+            )
+            .optional()
+            .map_err(database_error("read checkpoint cleanup review"))?;
+        let Some(projection) = review else {
+            transaction
+                .commit()
+                .map_err(database_error("commit absent checkpoint cleanup review"))?;
+            return Ok(None);
+        };
+        if !projection.has_bounded_authority_text() {
+            transaction.commit().map_err(database_error(
+                "commit unbounded checkpoint cleanup review",
+            ))?;
+            return Ok(None);
+        }
+        let CheckpointCleanupReviewProjection {
+            review,
+            notes_json,
+            failure_code,
+            decision_cycle_present,
+            ..
+        } = projection;
+        let review_project = transaction
+            .query_row(
+                "SELECT project_id FROM campaigns WHERE campaign_id = ?1",
+                [&review.campaign_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(database_error("read checkpoint cleanup project"))?;
+        if review_project.as_deref() != Some(project_id) {
+            transaction
+                .commit()
+                .map_err(database_error("commit foreign checkpoint cleanup review"))?;
+            return Ok(None);
+        }
+        let Some(raw_checkpoint) = review.checkpoint_json.clone() else {
+            if !matches!(review.checkpoint_json_state, CheckpointJsonState::Missing)
+                || (review.operation_stage.as_deref() == Some("successor_reserved")
+                    && review.successor_experiment_id.is_some())
+            {
+                drop(transaction);
+                return self.block_invalid_checkpoint_cleanup_review(&review, now);
+            }
+            transaction
+                .commit()
+                .map_err(database_error("commit absent checkpoint cleanup authority"))?;
+            return Ok(None);
+        };
+        let checkpoint = match parse_prepared_checkpoint(&raw_checkpoint) {
+            Ok(checkpoint) => checkpoint,
+            Err(_) => {
+                drop(transaction);
+                return self.block_invalid_checkpoint_cleanup_review(&review, now);
+            }
+        };
+        if !matches!(
+            review.checkpoint_json_state,
+            CheckpointJsonState::BoundedText
+        ) {
+            drop(transaction);
+            return self.block_invalid_checkpoint_cleanup_review(&review, now);
+        }
+        let authority = checkpoint_cleanup_authority_in_connection(
+            &transaction,
+            project_id,
+            &review,
+            checkpoint,
+            raw_checkpoint,
+            notes_json,
+            failure_code,
+            decision_cycle_present,
+        )?;
+        transaction
+            .commit()
+            .map_err(database_error("commit checkpoint cleanup authority"))?;
+        Ok(authority)
+    }
+
+    pub(crate) fn settle_checkpoint_cleanup(
+        &self,
+        expected: &CheckpointCleanupAuthority,
+        now: i64,
+    ) -> Result<bool, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin checkpoint cleanup settlement"))?;
+        let review = transaction
+            .query_row(
+                &format!("{} WHERE review_id = ?1", checkpoint_cleanup_review_select()),
+                [&expected.dispatch.review_id],
+                checkpoint_cleanup_review_from_row,
+            )
+            .optional()
+            .map_err(database_error("read checkpoint cleanup settlement review"))?;
+        let current = match review {
+            Some(projection) if !projection.has_bounded_authority_text() => None,
+            Some(projection) => checkpoint_cleanup_authority_in_connection(
+                &transaction,
+                &expected.dispatch.project_id,
+                &projection.review,
+                expected.dispatch.checkpoint.clone(),
+                expected.dispatch.raw_checkpoint.clone(),
+                projection.notes_json,
+                projection.failure_code,
+                projection.decision_cycle_present,
+            )?,
+            None => None,
+        };
+        let Some(current) = current else {
+            transaction
+                .commit()
+                .map_err(database_error("commit unchanged checkpoint cleanup"))?;
+            return Ok(false);
+        };
+        if !checkpoint_cleanup_authority_matches(&current, expected) {
+            transaction
+                .commit()
+                .map_err(database_error("commit raced checkpoint cleanup"))?;
+            return Ok(false);
+        }
+        let (next_state, expected_state, expected_stage, successor_id) = match expected.shape {
+            CheckpointCleanupShape::TerminalSuccessor => (
+                "completed",
+                "ready",
+                "successor_reserved",
+                Some(expected.dispatch.successor_experiment_id.as_str()),
+            ),
+            CheckpointCleanupShape::PreAddFailure => (
+                "completed",
+                "blocked",
+                "successor_reserved",
+                Some(expected.dispatch.successor_experiment_id.as_str()),
+            ),
+            CheckpointCleanupShape::Undispatched => (
+                "discarded",
+                "ready",
+                "intent",
+                None,
+            ),
+        };
+        let changed = match expected.shape {
+            CheckpointCleanupShape::Undispatched => transaction.execute(
+                "UPDATE research_reviews
+                 SET state = ?1, operation_stage = NULL,
+                     failure_code = 'research_natural_finish_before_dispatch',
+                     finished_at = ?2, updated_at = ?2
+                 WHERE review_id = ?3 AND campaign_id = ?4
+                   AND experiment_id = ?5 AND task_signature = ?6
+                   AND attempt = ?7 AND session_generation = ?8
+                   AND checkpoint_json = ?9
+                   AND termination_request_id IS ?10
+                   AND successor_experiment_id IS NULL
+                   AND state = ?11 AND operation_stage = ?12
+                   AND decision_cycle_id IS NULL",
+                params![
+                    next_state,
+                    now,
+                    expected.dispatch.review_id,
+                    expected.dispatch.campaign_id,
+                    expected.dispatch.source_experiment_id,
+                    expected.dispatch.checkpoint.source_managed_task_signature,
+                    expected.dispatch.checkpoint.review_attempt,
+                    expected.dispatch.checkpoint.review_session_generation,
+                    expected.dispatch.raw_checkpoint,
+                    expected.dispatch.termination_request_id,
+                    expected_state,
+                    expected_stage,
+                ],
+            ),
+            CheckpointCleanupShape::TerminalSuccessor | CheckpointCleanupShape::PreAddFailure => {
+                transaction.execute(
+                    "UPDATE research_reviews
+                     SET state = ?1, operation_stage = NULL,
+                         finished_at = ?2, updated_at = ?2
+                     WHERE review_id = ?3 AND campaign_id = ?4
+                       AND experiment_id = ?5 AND task_signature = ?6
+                       AND attempt = ?7 AND session_generation = ?8
+                       AND checkpoint_json = ?9
+                       AND termination_request_id IS ?10
+                       AND successor_experiment_id IS ?11
+                       AND state = ?12 AND operation_stage = ?13
+                       AND decision_cycle_id IS NULL",
+                    params![
+                        next_state,
+                        now,
+                        expected.dispatch.review_id,
+                        expected.dispatch.campaign_id,
+                        expected.dispatch.source_experiment_id,
+                        expected.dispatch.checkpoint.source_managed_task_signature,
+                        expected.dispatch.checkpoint.review_attempt,
+                        expected.dispatch.checkpoint.review_session_generation,
+                        expected.dispatch.raw_checkpoint,
+                        expected.dispatch.termination_request_id,
+                        successor_id,
+                        expected_state,
+                        expected_stage,
+                    ],
+                )
+            }
+        }
+        .map_err(database_error("settle checkpoint cleanup review"))?;
+        transaction
+            .commit()
+            .map_err(database_error("commit checkpoint cleanup settlement"))?;
+        Ok(changed == 1)
+    }
+
+    fn block_invalid_checkpoint_cleanup_review(
+        &self,
+        expected: &ResearchReview,
+        now: i64,
+    ) -> Result<Option<CheckpointCleanupAuthority>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin invalid checkpoint cleanup block"))?;
+        let changed = block_invalid_checkpoint_review_in_transaction(&transaction, expected, now)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit invalid checkpoint cleanup block"))?;
+        let _ = changed;
+        Ok(None)
+    }
+
     pub(crate) fn rotate_open_action_review(
         &self,
         review_id: &str,
@@ -4469,6 +5041,364 @@ impl<'db> ResearchRepository<'db> {
             .commit()
             .map_err(database_error("commit open research action rotation"))
     }
+}
+
+fn checkpoint_cleanup_authority_in_connection(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    review: &ResearchReview,
+    checkpoint: PreparedCheckpoint,
+    raw_checkpoint: String,
+    review_notes_json: Option<String>,
+    review_failure_code: Option<String>,
+    decision_cycle_present: bool,
+) -> Result<Option<CheckpointCleanupAuthority>, AppError> {
+    if review.checkpoint_json.as_deref() != Some(raw_checkpoint.as_str())
+        || !matches!(
+            review.checkpoint_json_state,
+            CheckpointJsonState::BoundedText
+        )
+        || checkpoint.project_id != project_id
+        || checkpoint.campaign_id != review.campaign_id
+        || checkpoint.review_id != review.review_id
+        || checkpoint.source_experiment_id != review.experiment_id
+        || checkpoint.review_attempt != review.attempt
+        || checkpoint.review_session_generation != review.session_generation
+        || review.agent_run_id != Some(checkpoint.review_agent_run_id)
+    {
+        return Ok(None);
+    }
+    let Some(parsed) = parse_prepared_checkpoint(&raw_checkpoint).ok() else {
+        return Ok(None);
+    };
+    if parsed != checkpoint {
+        return Ok(None);
+    }
+    if decision_cycle_present
+        || review.operation_stage.as_deref() == Some("stop_confirmed")
+        || review.operation_stage.as_deref() == Some("stop_requested")
+    {
+        return Ok(None);
+    }
+    let Some(termination_request_id) = review.termination_request_id else {
+        return Ok(None);
+    };
+    let termination = transaction
+        .query_row(
+            &format!(
+                "SELECT incident_id,
+                        CASE
+                          WHEN typeof(project_id) = 'text'
+                           AND length(CAST(project_id AS BLOB)) BETWEEN 1 AND {}
+                          THEN project_id
+                        END,
+                        CASE
+                          WHEN typeof(task_signature) = 'text'
+                           AND length(CAST(task_signature AS BLOB)) BETWEEN 1 AND {}
+                          THEN task_signature
+                        END,
+                        CASE
+                          WHEN typeof(reason) = 'text'
+                           AND length(CAST(reason AS BLOB)) BETWEEN 1 AND {}
+                          THEN reason
+                        END,
+                        CASE
+                          WHEN typeof(status) = 'text'
+                           AND length(CAST(status AS BLOB)) BETWEEN 1 AND {}
+                          THEN status
+                        END,
+                        requested_at, dispatch_lease_until, grace_until,
+                        confirmed_at,
+                        CASE
+                          WHEN typeof(last_error) = 'text'
+                           AND length(CAST(last_error AS BLOB)) BETWEEN 1 AND {}
+                          THEN last_error
+                        END,
+                        typeof(last_error), length(CAST(last_error AS BLOB))
+                 FROM termination_requests WHERE request_id = ?1",
+                MAX_CHECKPOINT_CLEANUP_TERMINATION_TEXT_BYTES,
+                MAX_CHECKPOINT_CLEANUP_TERMINATION_TEXT_BYTES,
+                MAX_CHECKPOINT_CLEANUP_TERMINATION_TEXT_BYTES,
+                MAX_CHECKPOINT_CLEANUP_TERMINATION_STATUS_BYTES,
+                MAX_CHECKPOINT_CLEANUP_TERMINATION_TEXT_BYTES,
+            ),
+            [termination_request_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read checkpoint cleanup termination"))?;
+    let Some((
+        termination_incident_id,
+        termination_project,
+        termination_signature,
+        termination_reason,
+        termination_status,
+        termination_requested_at,
+        termination_dispatch_lease_until,
+        grace_until,
+        confirmed_at,
+        last_error,
+        last_error_storage,
+        last_error_byte_len,
+    )) = termination
+    else {
+        return Ok(None);
+    };
+    let (Some(termination_project), Some(termination_signature), Some(termination_reason), Some(termination_status)) = (
+        termination_project,
+        termination_signature,
+        termination_reason,
+        termination_status,
+    ) else {
+        return Ok(None);
+    };
+    if termination_project != project_id
+        || termination_signature != checkpoint.source_raw_task_signature
+        || termination_status != "confirmed"
+        || confirmed_at.is_none()
+    {
+        return Ok(None);
+    }
+    if last_error_storage != "null"
+        && !(last_error_storage == "text"
+            && last_error_byte_len.is_some_and(|len| {
+                (1..=MAX_CHECKPOINT_CLEANUP_TERMINATION_TEXT_BYTES as i64).contains(&len)
+            })
+            && last_error.is_some())
+    {
+        return Ok(None);
+    }
+    let (
+        review_event_id,
+        review_not_before,
+        review_created_at,
+        review_started_at,
+        review_finished_at,
+        review_updated_at,
+    ) = transaction
+        .query_row(
+            "SELECT event_id, not_before,
+                    created_at, started_at, finished_at, updated_at
+             FROM research_reviews WHERE review_id = ?1",
+            [&review.review_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .map_err(database_error("read checkpoint cleanup review witness"))?;
+    let witness = CheckpointCleanupWitness {
+        review_state: review.state.clone(),
+        review_operation_stage: review.operation_stage.clone(),
+        review_task_signature: review.task_signature.clone(),
+        review_attempt: review.attempt,
+        review_session_generation: review.session_generation,
+        review_agent_run_id: review.agent_run_id,
+        review_event_id,
+        review_context_json: review.context_json.clone(),
+        review_context_digest: review.context_digest.clone(),
+        review_response_json: review.response_json.clone(),
+        review_notes_json: review_notes_json.clone(),
+        review_failure_code,
+        review_not_before,
+        review_created_at,
+        review_started_at,
+        review_finished_at,
+        review_updated_at,
+        review_termination_request_id: review.termination_request_id,
+        review_successor_experiment_id: review.successor_experiment_id.clone(),
+        termination_incident_id,
+        termination_project_id: termination_project,
+        termination_task_signature: termination_signature,
+        termination_reason,
+        termination_status,
+        termination_requested_at,
+        termination_dispatch_lease_until,
+        termination_grace_until: grace_until,
+        termination_confirmed_at: confirmed_at,
+        termination_last_error: last_error.clone(),
+    };
+
+    let successor_id = checkpoint.successor_ids.experiment_id.clone();
+    let proposal_id = checkpoint.successor_ids.proposal_id.clone();
+    let submission_id = checkpoint.successor_ids.submission_id.clone();
+    let successor_witness = if review.successor_experiment_id.is_some() {
+        checkpoint_successor_witness(transaction, &successor_id)?
+    } else {
+        None
+    };
+    let mut authority = CheckpointDispatchAuthority {
+        checkpoint,
+        raw_checkpoint,
+        project_id: project_id.to_owned(),
+        campaign_id: review.campaign_id.clone(),
+        review_id: review.review_id.clone(),
+        source_experiment_id: review.experiment_id.clone(),
+        proposal_id,
+        submission_id,
+        successor_experiment_id: successor_id.clone(),
+        successor_status: None,
+        successor_attempt: successor_witness.map(|(attempt, _)| attempt),
+        reservation_window_ends_at: successor_witness.map(|(_, window_end)| window_end),
+        termination_request_id: Some(termination_request_id),
+    };
+    if prepared_checkpoint_source_authority_in_connection(transaction, &authority.checkpoint)
+        .is_err()
+        || !checkpoint_cleanup_native_research_owner_complete(
+            transaction,
+            &authority,
+            review_notes_json.as_deref(),
+        )?
+    {
+        return Ok(None);
+    }
+
+    if review.successor_experiment_id.as_deref() == Some(successor_id.as_str()) {
+        if !matches!(review.state.as_str(), "ready" | "blocked")
+            || review.operation_stage.as_deref() != Some("successor_reserved")
+            || !super::campaigns::checkpoint_successor_graph_matches_authority(
+                transaction,
+                &authority,
+                None,
+                None,
+            )?
+        {
+            return Ok(None);
+        }
+        let intent = match super::campaigns::read_intent_by_experiment(transaction, &successor_id) {
+            Ok(intent) => intent,
+            Err(_) => return Ok(None),
+        };
+        authority.successor_status = Some(intent.experiment.status);
+        let shape = if review.state == "ready"
+            && matches!(
+                intent.experiment.status,
+                ExperimentStatus::Succeeded | ExperimentStatus::Cancelled
+            )
+            && intent.submission.status == SubmissionStatus::Accepted
+            && intent.experiment.pueue_task_id.is_some()
+            && intent.experiment.task_signature.is_some()
+            && intent.submission.pueue_task_id == intent.experiment.pueue_task_id
+            && intent.submission.task_signature == intent.experiment.task_signature
+            && intent.experiment.failure_code.is_none()
+            && intent.experiment.failure_fingerprint.is_none()
+            && intent.experiment.finished_at.is_some()
+        {
+            CheckpointCleanupShape::TerminalSuccessor
+        } else if review.state == "ready"
+            && intent.experiment.status == ExperimentStatus::Failed
+            && intent.submission.status == SubmissionStatus::Accepted
+            && intent.experiment.pueue_task_id.is_some()
+            && intent.experiment.task_signature.is_some()
+            && intent.submission.pueue_task_id == intent.experiment.pueue_task_id
+            && intent.submission.task_signature == intent.experiment.task_signature
+            && intent.experiment.failure_code.is_some()
+            && intent.experiment.failure_fingerprint.is_some()
+            && intent.experiment.finished_at.is_some()
+        {
+            CheckpointCleanupShape::TerminalSuccessor
+        } else if review.state == "blocked"
+            && intent.experiment.status == ExperimentStatus::Failed
+            && intent.submission.status == SubmissionStatus::Failed
+            && intent.experiment.pueue_task_id.is_none()
+            && intent.experiment.task_signature.is_none()
+            && intent.submission.pueue_task_id.is_none()
+            && intent.submission.task_signature.is_none()
+            && intent.experiment.failure_code.as_deref() == Some(CHECKPOINT_PRE_ADD_FAILURE_CODE)
+            && intent.experiment.failure_fingerprint.is_some()
+            && intent.experiment.finished_at.is_some()
+        {
+            CheckpointCleanupShape::PreAddFailure
+        } else {
+            return Ok(None);
+        };
+        return Ok(Some(CheckpointCleanupAuthority {
+            dispatch: authority,
+            shape,
+            witness,
+        }));
+    }
+
+    if review.successor_experiment_id.is_some()
+        || review.state != "ready"
+        || review.operation_stage.as_deref() != Some("intent")
+        || grace_until.is_some()
+        || !last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with(UNDISPATCHED_CONFIRMATION_PREFIX))
+    {
+        return Ok(None);
+    }
+    let resources_exist: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                     SELECT 1 FROM proposals WHERE proposal_id = ?1
+                     UNION ALL SELECT 1 FROM experiments WHERE experiment_id = ?2
+                     UNION ALL SELECT 1 FROM submissions WHERE submission_id = ?3
+                 )
+                 OR EXISTS(
+                     SELECT 1 FROM budget_reservations
+                     WHERE experiment_id = ?2 AND dimension = 'experiment'
+                 )",
+            params![
+                authority.checkpoint.successor_ids.proposal_id,
+                authority.checkpoint.successor_ids.experiment_id,
+                authority.checkpoint.successor_ids.submission_id,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check undispatched checkpoint resources"))?;
+    if resources_exist {
+        return Ok(None);
+    }
+    Ok(Some(CheckpointCleanupAuthority {
+        dispatch: authority,
+        shape: CheckpointCleanupShape::Undispatched,
+        witness,
+    }))
+}
+
+fn checkpoint_cleanup_authority_matches(
+    current: &CheckpointCleanupAuthority,
+    expected: &CheckpointCleanupAuthority,
+) -> bool {
+    current.shape == expected.shape
+        && current.witness == expected.witness
+        && current.dispatch.checkpoint == expected.dispatch.checkpoint
+        && current.dispatch.raw_checkpoint == expected.dispatch.raw_checkpoint
+        && current.dispatch.project_id == expected.dispatch.project_id
+        && current.dispatch.campaign_id == expected.dispatch.campaign_id
+        && current.dispatch.review_id == expected.dispatch.review_id
+        && current.dispatch.source_experiment_id == expected.dispatch.source_experiment_id
+        && current.dispatch.proposal_id == expected.dispatch.proposal_id
+        && current.dispatch.submission_id == expected.dispatch.submission_id
+        && current.dispatch.successor_experiment_id == expected.dispatch.successor_experiment_id
+        && current.dispatch.successor_status == expected.dispatch.successor_status
+        && current.dispatch.successor_attempt == expected.dispatch.successor_attempt
+        && current.dispatch.reservation_window_ends_at
+            == expected.dispatch.reservation_window_ends_at
+        && current.dispatch.termination_request_id == expected.dispatch.termination_request_id
 }
 
 #[derive(Debug)]
@@ -4831,7 +5761,10 @@ pub(crate) fn research_ownership_in_transaction(
         )
         .map_err(database_error("prepare research ownership query"))?;
     let candidates = statement
-        .query_map([source_experiment_id], research_ownership_candidate_from_row)
+        .query_map(
+            [source_experiment_id],
+            research_ownership_candidate_from_row,
+        )
         .map_err(database_error("query research ownership candidates"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(database_error("read research ownership candidates"))?;
@@ -4996,10 +5929,8 @@ pub(crate) fn research_ownership_in_transaction(
         }
     }
 
-    let expected_cycle = super::decisions::DecisionRepository::terminal_cycle_id(
-        campaign_id,
-        source_experiment_id,
-    );
+    let expected_cycle =
+        super::decisions::DecisionRepository::terminal_cycle_id(campaign_id, source_experiment_id);
     if let Some(cycle_id) = candidate.decision_cycle_id.as_deref() {
         recovery_required |= cycle_id != expected_cycle
             || candidate.cycle_campaign_id.as_deref() != Some(campaign_id)
@@ -5258,12 +6189,7 @@ pub(crate) fn completed_research_handoff_in_transaction(
             "linked research response does not match its owner",
         ));
     }
-    if !research_answer_evidence_refs_are_bound(
-        &context,
-        &context_json,
-        &context_digest,
-        &answer,
-    )
+    if !research_answer_evidence_refs_are_bound(&context, &context_json, &context_digest, &answer)
     .map_err(|_| {
         validation_error(
             "research.handoff",
@@ -5295,12 +6221,12 @@ pub(crate) fn completed_research_handoff_in_transaction(
 /// holding the caller's transaction.  A stale task, answer, cleanup proof, or
 /// campaign gate simply produces no consumable action; it never authorizes a
 /// kill from historical rows alone.
-pub(crate) fn ready_research_action_in_transaction(
+pub(crate) fn ready_research_action_selection_in_transaction(
     transaction: &Transaction<'_>,
     project_id: &str,
     review_id: &str,
     live_task: &PueueTask,
-) -> Result<Option<ReadyResearchAction>, AppError> {
+) -> Result<ReadyResearchActionSelection, AppError> {
     let current = transaction
         .query_row(
             "SELECT review.campaign_id, review.experiment_id,
@@ -5422,7 +6348,7 @@ pub(crate) fn ready_research_action_in_transaction(
         event_status,
     )) = current
     else {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     };
     let static_ok = state == "ready"
         && operation_stage.is_none()
@@ -5451,36 +6377,36 @@ pub(crate) fn ready_research_action_in_transaction(
         && matches!(run_gate_state.as_deref(), Some("released" | "failed"))
         && campaign_generation == Some(session_generation);
     if !static_ok {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     }
     let managed_live = managed_task_run_signature(live_task);
     if managed_live.as_deref() != Some(managed_task_signature.as_str()) {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     }
     let raw_task_signature = task_signature(live_task);
     let Some(context_json) = context_json else {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     };
     let Some(context_digest) = context_digest else {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     };
     if format!("{:x}", Sha256::digest(context_json.as_bytes())) != context_digest {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     }
     let Some(response_json) = response_json else {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     };
     let Ok(answer) = parse_research_answer(response_json.as_bytes()) else {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     };
     if answer.review_id != review_id
         || answer.experiment_id != experiment_id
         || answer.context_digest != context_digest
     {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     }
     let Ok(context) = serde_json::from_str::<Value>(&context_json) else {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     };
     if !research_context_identity_matches(
         &context,
@@ -5492,17 +6418,12 @@ pub(crate) fn ready_research_action_in_transaction(
         source_task_id,
         &campaign_objective_digest,
     ) {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     }
-    if !research_answer_evidence_refs_are_bound(
-        &context,
-        &context_json,
-        &context_digest,
-        &answer,
-    )
+    if !research_answer_evidence_refs_are_bound(&context, &context_json, &context_digest, &answer)
     .unwrap_or(false)
     {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     }
     let agent_run_id = agent_run_id.expect("validated ready agent run");
     if !native_recovery_cleanup_complete(
@@ -5519,13 +6440,13 @@ pub(crate) fn ready_research_action_in_transaction(
             campaign_session: campaign_session.as_deref(),
         },
     ) {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     }
     let strict_owner = native_research_owner_rows(transaction, None)?
         .into_iter()
         .find(|row| row.review_id == review_id && row.agent_run_id == agent_run_id);
     if !strict_owner.is_some_and(|row| native_research_owner_is_complete(&row)) {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     }
     let health_owned: bool = transaction
         .query_row(
@@ -5538,10 +6459,10 @@ pub(crate) fn ready_research_action_in_transaction(
         )
         .map_err(database_error("check research health ownership"))?;
     if health_owned {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     }
     let Some(source_submission_id) = source_submission_id else {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     };
     let submission_matches = transaction
         .query_row(
@@ -5564,9 +6485,10 @@ pub(crate) fn ready_research_action_in_transaction(
                 && submission_task_id == source_task_id
                 && submission_signature.as_deref() == Some(managed_task_signature.as_str())
                 && status == "accepted"
-        });
+            },
+        );
     if !submission_matches {
-        return Ok(None);
+        return Ok(ReadyResearchActionSelection::NotReady);
     }
     let owner = ResearchOwnershipSnapshot {
         review_id: review_id.to_owned(),
@@ -5585,7 +6507,7 @@ pub(crate) fn ready_research_action_in_transaction(
         successor_experiment_id: None,
         recovery_required: false,
     };
-    Ok(Some(ReadyResearchAction {
+    let action = ReadyResearchAction {
         owner,
         context_json,
         context_digest,
@@ -5594,7 +6516,62 @@ pub(crate) fn ready_research_action_in_transaction(
         notes_json: notes_json.unwrap_or_else(|| "{}".to_owned()),
         campaign_objective_digest,
         raw_task_signature,
-    }))
+    };
+    if action.answer.action != "resume_from_checkpoint" {
+        return Ok(ReadyResearchActionSelection::Authorized(action));
+    }
+    let Some(request) = action.answer.checkpoint.as_ref() else {
+        return Ok(ReadyResearchActionSelection::NotReady);
+    };
+    match checkpoint_source_authority_for_ready_in_connection(transaction, &action, request)? {
+        CheckpointSourceAuthorityRead::Supported(_) => {
+            Ok(ReadyResearchActionSelection::Authorized(action))
+        }
+        CheckpointSourceAuthorityRead::Unsupported { reason } => {
+            let event_id = action.owner.event_id.ok_or_else(|| {
+                validation_error("research.event_id", "is missing from the ready owner")
+            })?;
+            Ok(ReadyResearchActionSelection::CheckpointUnsupported(
+                CheckpointUnsupportedReview {
+                    review_id: action.owner.review_id.clone(),
+                    project_id: action.owner.project_id.clone(),
+                    campaign_id: action.owner.campaign_id.clone(),
+                    source_experiment_id: action.owner.source_experiment_id.clone(),
+                    managed_task_signature: action.owner.managed_task_signature.clone(),
+                    attempt: action.owner.attempt,
+                    session_generation: action.owner.session_generation,
+                    agent_run_id: action.owner.agent_run_id.ok_or_else(|| {
+                        validation_error("research.agent_run_id", "is missing from the ready owner")
+                    })?,
+                    event_id,
+                    context_json: action.context_json.clone(),
+                    context_digest: action.context_digest.clone(),
+                    response_json: action.response_json.clone(),
+                    notes_json: action.notes_json.clone(),
+                    failure_code,
+                    reason,
+                },
+            ))
+        }
+    }
+}
+
+pub(crate) fn ready_research_action_in_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    review_id: &str,
+    live_task: &PueueTask,
+) -> Result<Option<ReadyResearchAction>, AppError> {
+    match ready_research_action_selection_in_transaction(
+        transaction,
+        project_id,
+        review_id,
+        live_task,
+    )? {
+        ReadyResearchActionSelection::Authorized(action) => Ok(Some(action)),
+        ReadyResearchActionSelection::CheckpointUnsupported(_)
+        | ReadyResearchActionSelection::NotReady => Ok(None),
+    }
 }
 
 pub(crate) fn checkpoint_source_authority_for_preparation(
@@ -5920,10 +6897,8 @@ fn checkpoint_source_authority_in_connection(
     } else {
         None
     };
-    let source_layout = match checkpoint_source_layout(
-        &source.proposal.argv,
-        &source.proposal.working_directory,
-    ) {
+    let source_layout =
+        match checkpoint_source_layout(&source.proposal.argv, &source.proposal.working_directory) {
         Ok(layout) => Some(layout),
         Err(_) => {
             if unsupported_reason.is_none() {
@@ -6038,11 +7013,10 @@ fn checkpoint_source_authority_in_connection(
         }
     }
     let support = checkpoint_support_from_persisted_context(&context_json, &context_digest)?;
-    let context: Value = serde_json::from_str(&context_json).map_err(|source| {
-        AppError::Serialization {
+    let context: Value =
+        serde_json::from_str(&context_json).map_err(|source| AppError::Serialization {
             operation: "parse source authority context",
             source,
-        }
     })?;
     if !research_context_identity_matches(
         &context,
@@ -6280,7 +7254,10 @@ fn checkpoint_matches_fresh_authority(
     request: &CheckpointRequest,
 ) -> Result<(), AppError> {
     let source_task_id = expected.owner.source_task_id.ok_or_else(|| {
-        validation_error("checkpoint.source_task_id", "is missing from the ready owner")
+        validation_error(
+            "checkpoint.source_task_id",
+            "is missing from the ready owner",
+        )
     })?;
     let agent_run_id = expected.owner.agent_run_id.ok_or_else(|| {
         validation_error("checkpoint.agent_run_id", "is missing from the ready owner")
@@ -6474,18 +7451,19 @@ pub(crate) fn checkpoint_same_spec_count(
             let storage: String = row.get(3)?;
             let byte_len: Option<i64> = row.get(4)?;
             let raw = if storage == "text"
-                && byte_len.is_some_and(|len| (1..=MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES as i64).contains(&len))
-            {
+                && byte_len.is_some_and(|len| {
+                    (1..=MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES as i64).contains(&len)
+                }) {
                 match row.get_ref(2)? {
-                    ValueRef::Text(bytes) => Some(
-                        String::from_utf8(bytes.to_vec()).map_err(|error| {
+                    ValueRef::Text(bytes) => {
+                        Some(String::from_utf8(bytes.to_vec()).map_err(|error| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 1,
                                 Type::Text,
                                 Box::new(error),
                             )
-                        })?,
-                    ),
+                        })?)
+                    }
                     _ => None,
                 }
             } else {
@@ -6513,7 +7491,10 @@ pub(crate) fn checkpoint_same_spec_count(
             ));
         }
         let raw = raw.ok_or_else(|| {
-            validation_error("research.checkpoint", "historical checkpoint is not valid UTF-8")
+            validation_error(
+                "research.checkpoint",
+                "historical checkpoint is not valid UTF-8",
+            )
         })?;
         let historical_checkpoint = parse_prepared_checkpoint(&raw)?;
         if historical_checkpoint.review_id != review_id
@@ -6577,7 +7558,10 @@ pub(crate) fn checkpoint_successor_preflight_in_transaction(
     now: i64,
 ) -> Result<CheckpointSuccessorPreflight, AppError> {
     let request = expected.answer.checkpoint.as_ref().ok_or_else(|| {
-        validation_error("research.checkpoint", "ready answer has no checkpoint request")
+        validation_error(
+            "research.checkpoint",
+            "ready answer has no checkpoint request",
+        )
     })?;
     let authority = match checkpoint_source_authority_for_ready_in_connection(
         transaction,
@@ -6656,9 +7640,10 @@ pub(crate) fn bind_checkpoint_termination_intent_in_transaction(
         }
     };
     checkpoint_matches_fresh_authority(&checkpoint, expected, &authority, request_checkpoint)?;
-    let event_id = expected.owner.event_id.ok_or_else(|| {
-        validation_error("research.event_id", "is missing from the ready owner")
-    })?;
+    let event_id = expected
+        .owner
+        .event_id
+        .ok_or_else(|| validation_error("research.event_id", "is missing from the ready owner"))?;
     let changed = transaction
         .execute(
             "UPDATE research_reviews
@@ -6687,7 +7672,9 @@ pub(crate) fn bind_checkpoint_termination_intent_in_transaction(
                 event_id,
             ],
         )
-        .map_err(database_error("bind checkpoint research termination intent"))?;
+        .map_err(database_error(
+            "bind checkpoint research termination intent",
+        ))?;
     Ok(changed == 1)
 }
 
@@ -6696,9 +7683,10 @@ pub(crate) fn block_checkpoint_orphan_in_transaction(
     expected: &ReadyResearchAction,
     now: i64,
 ) -> Result<bool, AppError> {
-    let event_id = expected.owner.event_id.ok_or_else(|| {
-        validation_error("research.event_id", "is missing from the ready owner")
-    })?;
+    let event_id = expected
+        .owner
+        .event_id
+        .ok_or_else(|| validation_error("research.event_id", "is missing from the ready owner"))?;
     let current = transaction
         .query_row(
             "SELECT campaign.project_id, campaign.objective_digest,
@@ -6892,7 +7880,9 @@ pub(crate) fn block_invalid_checkpoint_review_in_transaction(
         .map_err(database_error("classify invalid checkpoint storage"))?;
     let observed_state = match storage_class {
         CheckpointSqliteStorageClass::Text
-            if byte_len.is_some_and(|len| (1..=MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES as i64).contains(&len)) =>
+            if byte_len.is_some_and(|len| {
+                (1..=MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES as i64).contains(&len)
+            }) =>
         {
             if raw.as_deref() != expected.checkpoint_json.as_deref() {
                 return Ok(false);
@@ -6905,23 +7895,42 @@ pub(crate) fn block_invalid_checkpoint_review_in_transaction(
             byte_len,
         },
     };
+    let successor_shape = state == "ready"
+        && matches!(
+            operation_stage.as_deref(),
+            Some("stop_confirmed" | "successor_reserved")
+        )
+        && successor_experiment_id.is_some();
+    let undispatched_shape = state == "ready"
+        && operation_stage.as_deref() == Some("intent")
+        && successor_experiment_id.is_none();
+    let stop_confirmed_without_successor = state == "ready"
+        && operation_stage.as_deref() == Some("stop_confirmed")
+        && successor_experiment_id.is_none();
     if campaign_id != expected.campaign_id
         || experiment_id != expected.experiment_id
         || task_signature != expected.task_signature
         || attempt != expected.attempt
         || state != "ready"
-        || operation_stage.as_deref() != Some("successor_reserved")
         || agent_run_id != expected.agent_run_id
         || context_digest != expected.context_digest
         || termination_request_id != expected.termination_request_id
         || successor_experiment_id != expected.successor_experiment_id
         || session_generation != expected.session_generation
         || observed_state != expected.checkpoint_json_state
+        || (!successor_shape && !undispatched_shape && !stop_confirmed_without_successor)
     {
         return Ok(false);
     }
-    let changed = transaction
-        .execute(
+    let shape_predicate = if successor_shape {
+        "operation_stage IN ('stop_confirmed','successor_reserved')
+             AND successor_experiment_id IS ?11"
+    } else if stop_confirmed_without_successor {
+        "operation_stage = 'stop_confirmed' AND successor_experiment_id IS NULL"
+    } else {
+        "operation_stage = 'intent' AND successor_experiment_id IS NULL"
+    };
+    let sql = format!(
             "UPDATE research_reviews
              SET state = 'blocked', failure_code = 'research_checkpoint_authority_corrupt',
                  finished_at = ?1, not_before = ?1, updated_at = ?1
@@ -6929,9 +7938,12 @@ pub(crate) fn block_invalid_checkpoint_review_in_transaction(
                AND task_signature = ?5 AND attempt = ?6
                AND session_generation = ?7 AND agent_run_id IS ?8
                AND context_digest IS ?9 AND termination_request_id IS ?10
-               AND successor_experiment_id IS ?11
-               AND state = 'ready' AND operation_stage = 'successor_reserved'
-               AND decision_cycle_id IS NULL",
+           AND {shape_predicate}
+           AND state = 'ready' AND decision_cycle_id IS NULL"
+    );
+    let changed = if successor_shape {
+        transaction.execute(
+            &sql,
             params![
                 now,
                 expected.review_id,
@@ -6946,8 +7958,93 @@ pub(crate) fn block_invalid_checkpoint_review_in_transaction(
                 expected.successor_experiment_id,
             ],
         )
+    } else {
+        transaction.execute(
+            &sql,
+            params![
+                now,
+                expected.review_id,
+                expected.campaign_id,
+                expected.experiment_id,
+                expected.task_signature,
+                expected.attempt,
+                expected.session_generation,
+                expected.agent_run_id,
+                expected.context_digest,
+                expected.termination_request_id,
+            ],
+        )
+    }
         .map_err(database_error("block invalid checkpoint review"))?;
     Ok(changed == 1)
+}
+
+pub(crate) fn checkpoint_review_claim_in_transaction(
+    transaction: &Transaction<'_>,
+    review_id: &str,
+) -> Result<CheckpointReviewClaim, AppError> {
+    let query = format!(
+        "SELECT operation_stage,
+                typeof(checkpoint_json),
+                CASE
+                  WHEN typeof(response_json) = 'text'
+                   AND length(CAST(response_json AS BLOB)) BETWEEN 1 AND {}
+                  THEN response_json
+                END
+         FROM research_reviews WHERE review_id = ?1",
+        crate::research_protocol::MAX_RESEARCH_ANSWER_BYTES
+    );
+    transaction
+        .query_row(&query, [review_id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .optional()
+        .map_err(database_error("classify checkpoint review claim"))?
+        .map(|(operation_stage, storage, response_json)| {
+            let durable_stage = matches!(
+                operation_stage.as_deref(),
+                Some("stop_confirmed" | "successor_reserved")
+            );
+            if durable_stage
+                && (operation_stage.as_deref() == Some("successor_reserved")
+                    || storage != "null")
+            {
+                return CheckpointReviewClaim::Checkpoint;
+            }
+            if operation_stage.as_deref() != Some("stop_confirmed") {
+                return CheckpointReviewClaim::Invalid;
+            }
+            let Some(response_json) = response_json else {
+                return CheckpointReviewClaim::Invalid;
+            };
+            let Ok(answer) = parse_research_answer(response_json.as_bytes()) else {
+                return CheckpointReviewClaim::Invalid;
+            };
+            match (answer.action.as_str(), answer.checkpoint.is_some()) {
+                ("resume_from_checkpoint", true) => CheckpointReviewClaim::Checkpoint,
+                ("stop_and_next", false) => CheckpointReviewClaim::Ordinary,
+                _ => CheckpointReviewClaim::Invalid,
+            }
+        })
+        .ok_or_else(|| validation_error("review_id", "does not identify a persisted research review"))
+}
+
+pub(crate) fn checkpoint_review_in_transaction(
+    transaction: &Transaction<'_>,
+    review_id: &str,
+) -> Result<Option<ResearchReview>, AppError> {
+    transaction
+        .query_row(
+            &format!("{REVIEW_SELECT} WHERE review_id = ?1"),
+            [review_id],
+            review_from_row,
+        )
+        .optional()
+        .map_err(database_error("read checkpoint review in transaction"))
 }
 
 fn source_authority_require_submission_metadata(
@@ -6956,7 +8053,10 @@ fn source_authority_require_submission_metadata(
     expected: &str,
 ) -> Result<(), AppError> {
     let object = metadata.as_object().ok_or_else(|| {
-        validation_error("submission.metadata", "must be an object with campaign lineage")
+        validation_error(
+            "submission.metadata",
+            "must be an object with campaign lineage",
+        )
     })?;
     if object.get(key).and_then(Value::as_str) != Some(expected) {
         return Err(validation_error(
@@ -7042,6 +8142,7 @@ pub(crate) fn discard_undispatched_research_action_in_transaction(
              WHERE review_id = ?3 AND state = 'ready'
                AND operation_stage = 'intent'
                AND termination_request_id = ?4
+               AND checkpoint_json IS NULL
                AND decision_cycle_id IS NULL
                AND successor_experiment_id IS NULL",
             params![reason, now, review_id, request_id],
@@ -7066,6 +8167,7 @@ pub(crate) fn discard_missing_undispatched_research_action_in_transaction(
              WHERE review_id = ?2 AND state = 'ready'
                AND operation_stage = 'intent'
                AND termination_request_id = ?3
+               AND checkpoint_json IS NULL
                AND decision_cycle_id IS NULL
                AND successor_experiment_id IS NULL
                AND EXISTS (
@@ -7201,7 +8303,19 @@ pub(super) fn research_answer_evidence_refs_are_bound(
         ..
     } = &support
     else {
-        return Ok(false);
+        return Ok(answer
+            .evidence_refs
+            .iter()
+            .all(|reference| legacy_refs.contains(reference))
+            && answer
+                .checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| {
+                    checkpoint
+                        .support_evidence_refs
+                        .iter()
+                        .all(|reference| legacy_refs.contains(reference))
+                }));
     };
     let mut allowed = legacy_refs;
     allowed.extend(loader_support.iter().map(|loader| loader.reference.clone()));
@@ -7347,6 +8461,206 @@ pub(crate) fn complete_research_continue_in_transaction(
         });
     }
     Ok(true)
+}
+
+pub(crate) fn checkpoint_unsupported_after_preparation_in_transaction(
+    transaction: &Transaction<'_>,
+    expected: &ReadyResearchAction,
+    request: &CheckpointRequest,
+    reason: &str,
+) -> Result<Option<CheckpointUnsupportedReview>, AppError> {
+    validate_checkpoint_unsupported_reason(reason)?;
+    let source = match checkpoint_source_authority_for_ready_in_connection(
+        transaction,
+        expected,
+        request,
+    )? {
+        CheckpointSourceAuthorityRead::Supported(_) => return Ok(None),
+        CheckpointSourceAuthorityRead::Unsupported { reason: current } => {
+            if current != reason {
+                return Ok(None);
+            }
+            current
+        }
+    };
+    let event_id = expected
+        .owner
+        .event_id
+        .ok_or_else(|| validation_error("research.event_id", "is missing from the ready owner"))?;
+    let failure_code = transaction
+        .query_row(
+            "SELECT failure_code FROM research_reviews
+             WHERE review_id = ?1 AND campaign_id = ?2
+               AND experiment_id = ?3 AND state = 'ready'
+               AND operation_stage IS NULL AND termination_request_id IS NULL
+               AND checkpoint_json IS NULL AND decision_cycle_id IS NULL
+               AND successor_experiment_id IS NULL",
+            params![
+                expected.owner.review_id,
+                expected.owner.campaign_id,
+                expected.owner.source_experiment_id,
+            ],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(database_error("read unsupported checkpoint review"))?
+        .flatten();
+    let Some(failure_code) = failure_code else {
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM research_reviews
+                     WHERE review_id = ?1 AND campaign_id = ?2
+                       AND experiment_id = ?3 AND state = 'ready'
+                       AND operation_stage IS NULL AND termination_request_id IS NULL
+                       AND checkpoint_json IS NULL AND decision_cycle_id IS NULL
+                       AND successor_experiment_id IS NULL
+                 )",
+                params![
+                expected.owner.review_id,
+                expected.owner.campaign_id,
+                expected.owner.source_experiment_id,
+            ],
+                |row| row.get(0),
+        )
+            .map_err(database_error("check unsupported checkpoint review"))?;
+        if !exists {
+            return Ok(None);
+        }
+        return Ok(Some(CheckpointUnsupportedReview {
+            review_id: expected.owner.review_id.clone(),
+            project_id: expected.owner.project_id.clone(),
+            campaign_id: expected.owner.campaign_id.clone(),
+            source_experiment_id: expected.owner.source_experiment_id.clone(),
+            managed_task_signature: expected.owner.managed_task_signature.clone(),
+            attempt: expected.owner.attempt,
+            session_generation: expected.owner.session_generation,
+            agent_run_id: expected.owner.agent_run_id.ok_or_else(|| {
+                validation_error("research.agent_run_id", "is missing from the ready owner")
+            })?,
+            event_id,
+            context_json: expected.context_json.clone(),
+            context_digest: expected.context_digest.clone(),
+            response_json: expected.response_json.clone(),
+            notes_json: expected.notes_json.clone(),
+            failure_code: None,
+            reason: source,
+        }));
+    };
+    Ok(Some(CheckpointUnsupportedReview {
+        review_id: expected.owner.review_id.clone(),
+        project_id: expected.owner.project_id.clone(),
+        campaign_id: expected.owner.campaign_id.clone(),
+        source_experiment_id: expected.owner.source_experiment_id.clone(),
+        managed_task_signature: expected.owner.managed_task_signature.clone(),
+        attempt: expected.owner.attempt,
+        session_generation: expected.owner.session_generation,
+        agent_run_id: expected.owner.agent_run_id.ok_or_else(|| {
+            validation_error("research.agent_run_id", "is missing from the ready owner")
+        })?,
+        event_id,
+        context_json: expected.context_json.clone(),
+        context_digest: expected.context_digest.clone(),
+        response_json: expected.response_json.clone(),
+        notes_json: expected.notes_json.clone(),
+        failure_code: Some(failure_code),
+        reason: source,
+    }))
+}
+
+pub(crate) fn complete_checkpoint_unsupported_in_transaction(
+    transaction: &Transaction<'_>,
+    expected: &CheckpointUnsupportedReview,
+    next_due_at: Option<i64>,
+    now: i64,
+) -> Result<bool, AppError> {
+    validate_checkpoint_unsupported_reason(&expected.reason)?;
+    let mut notes = serde_json::from_str::<Value>(&expected.notes_json).map_err(|source| {
+        AppError::Serialization {
+            operation: "parse unsupported checkpoint notes",
+            source,
+        }
+    })?;
+    if !notes.is_object() {
+        return Err(validation_error(
+            "research.notes",
+            "must be an object for unsupported checkpoint settlement",
+        ));
+    }
+    notes["checkpoint_unsupported"] = Value::String(expected.reason.clone());
+    let notes_json = serde_json::to_string(&notes).map_err(|source| AppError::Serialization {
+        operation: "serialize unsupported checkpoint notes",
+        source,
+    })?;
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'completed', operation_stage = NULL,
+                 notes_json = ?1, finished_at = ?2, updated_at = ?2
+             WHERE review_id = ?3 AND campaign_id = ?4
+               AND experiment_id = ?5 AND task_signature = ?6
+               AND attempt = ?7 AND session_generation = ?8
+               AND agent_run_id = ?9 AND event_id = ?10
+               AND context_json = ?11 AND context_digest = ?12
+               AND response_json = ?13 AND COALESCE(notes_json, '{}') = ?14
+               AND failure_code IS ?15 AND state = 'ready'
+               AND operation_stage IS NULL AND termination_request_id IS NULL
+               AND checkpoint_json IS NULL AND decision_cycle_id IS NULL
+               AND successor_experiment_id IS NULL",
+            params![
+                notes_json,
+                now,
+                expected.review_id,
+                expected.campaign_id,
+                expected.source_experiment_id,
+                expected.managed_task_signature,
+                expected.attempt,
+                expected.session_generation,
+                expected.agent_run_id,
+                expected.event_id,
+                expected.context_json,
+                expected.context_digest,
+                expected.response_json,
+                expected.notes_json,
+                expected.failure_code,
+            ],
+        )
+        .map_err(database_error("complete unsupported checkpoint review"))?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    let campaign_changed = transaction
+        .execute(
+            "UPDATE campaign_research
+             SET next_due_at = ?1, updated_at = ?2
+             WHERE campaign_id = ?3 AND session_generation = ?4",
+            params![
+                next_due_at,
+                now,
+                expected.campaign_id,
+                expected.session_generation
+            ],
+        )
+        .map_err(database_error("schedule unsupported checkpoint campaign"))?;
+    if campaign_changed != 1 {
+        return Err(AppError::Runtime {
+            operation: "schedule unsupported checkpoint campaign",
+        });
+    }
+    Ok(true)
+}
+
+fn validate_checkpoint_unsupported_reason(reason: &str) -> Result<(), AppError> {
+    if reason.is_empty()
+        || reason.len() > MAX_CHECKPOINT_UNSUPPORTED_REASON_BYTES
+        || reason.chars().any(char::is_control)
+    {
+        return Err(validation_error(
+            "checkpoint_support.reason",
+            "must be non-empty, bounded, and contain no control characters",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn mark_research_stop_requested_if_sent(
@@ -7887,9 +9201,9 @@ fn native_research_owner_rows(
            )
          ORDER BY owner.project_id, owner.run_id"
     );
-    let mut statement = connection
-        .prepare(&unknown_query)
-        .map_err(database_error("prepare unbound native research owner query"))?;
+    let mut statement = connection.prepare(&unknown_query).map_err(database_error(
+        "prepare unbound native research owner query",
+    ))?;
     let mut unknown_rows = Vec::new();
     match project_id {
         Some(project_id) => {
@@ -7996,9 +9310,7 @@ fn native_research_owner_rows(
     Ok(owners)
 }
 
-fn native_research_owner_row_from_sql(
-    row: &Row<'_>,
-) -> rusqlite::Result<NativeResearchOwnerRow> {
+fn native_research_owner_row_from_sql(row: &Row<'_>) -> rusqlite::Result<NativeResearchOwnerRow> {
     Ok(NativeResearchOwnerRow {
         review_id: row.get(0)?,
         campaign_id: row.get(1)?,
@@ -8237,7 +9549,9 @@ fn detached_native_cleanup_evidence(
              FROM research_reviews AS review
              JOIN campaigns AS campaign ON campaign.campaign_id = review.campaign_id",
         )
-        .map_err(database_error("prepare detached native research history query"))?;
+        .map_err(database_error(
+            "prepare detached native research history query",
+        ))?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -8344,6 +9658,93 @@ pub(super) fn checkpoint_native_research_owner_complete(
     Ok(native_research_owner_is_complete(&row))
 }
 
+fn checkpoint_cleanup_native_research_owner_complete(
+    connection: &Connection,
+    authority: &CheckpointDispatchAuthority,
+    notes_json: Option<&str>,
+) -> Result<bool, AppError> {
+    let query = format!(
+        "SELECT review.review_id, review.campaign_id, review.experiment_id,
+                review.attempt, review.session_generation,
+                review.agent_run_id, review.state,
+                CASE
+                  WHEN typeof(review.failure_code) = 'text'
+                   AND length(CAST(review.failure_code AS BLOB)) BETWEEN 1 AND {}
+                  THEN review.failure_code
+                END,
+                research_state.session_id, research_state.session_generation,
+                ?1, review.event_id, campaign.project_id,
+                owner.project_id, owner.execution_kind, owner.status,
+                owner.launch_gate_state, owner.pid, owner.primary_event_id,
+                owner.log_path, owner.policy_code, owner.failure_stage,
+                event.project_id, event.kind, event.campaign_id,
+                event.experiment_id,
+                experiment.campaign_id,
+                (SELECT COUNT(*) FROM agent_run_events AS link
+                   WHERE link.project_id = owner.project_id
+                     AND link.run_id = owner.run_id
+                     AND link.event_id = review.event_id),
+                (SELECT COUNT(*) FROM agent_run_events AS link
+                   WHERE link.project_id = owner.project_id
+                     AND link.run_id = owner.run_id),
+                (SELECT COUNT(*) FROM research_reviews AS bound_review
+                   WHERE bound_review.agent_run_id = owner.run_id),
+                typeof(review.failure_code),
+                length(CAST(review.failure_code AS BLOB))
+         FROM research_reviews AS review
+         JOIN campaigns AS campaign ON campaign.campaign_id = review.campaign_id
+         JOIN campaign_research AS research_state
+           ON research_state.campaign_id = review.campaign_id
+         LEFT JOIN experiments AS experiment
+           ON experiment.experiment_id = review.experiment_id
+         LEFT JOIN agent_runs AS owner ON owner.run_id = review.agent_run_id
+         LEFT JOIN events AS event ON event.event_id = review.event_id
+         WHERE review.review_id = ?2
+           AND review.campaign_id = ?3
+           AND review.experiment_id = ?4
+           AND review.agent_run_id = ?5
+           AND campaign.project_id = ?6
+           AND owner.project_id = ?6",
+        MAX_CHECKPOINT_CLEANUP_FAILURE_CODE_BYTES,
+    );
+    let row = connection
+        .query_row(
+            &query,
+            params![
+                notes_json,
+                authority.review_id,
+                authority.campaign_id,
+                authority.source_experiment_id,
+                authority.checkpoint.review_agent_run_id,
+                authority.project_id,
+            ],
+            |row| {
+                Ok((
+                    native_research_owner_row_from_sql(row)?,
+                    row.get::<_, String>(30)?,
+                    row.get::<_, Option<i64>>(31)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read checkpoint native research owner"))?;
+    let Some((row, failure_code_storage, failure_code_byte_len)) = row else {
+        return Ok(false);
+    };
+    if (failure_code_storage == "null" && row.failure_code.is_some())
+        || (failure_code_storage != "null"
+            && !(failure_code_storage == "text"
+                && failure_code_byte_len.is_some_and(|len| {
+                    (1..=MAX_CHECKPOINT_CLEANUP_FAILURE_CODE_BYTES as i64).contains(&len)
+                })
+                && row.failure_code.is_some()))
+    {
+        return Ok(false);
+    }
+    let complete = native_research_owner_is_complete(&row);
+    Ok(complete)
+}
+
 fn native_research_historical_authority_complete(row: &NativeResearchOwnerRow) -> bool {
     let Some(notes_json) = row.notes_json.as_deref() else {
         return false;
@@ -8359,9 +9760,8 @@ fn native_research_historical_authority_complete(row: &NativeResearchOwnerRow) -
         failure_code: row.failure_code.as_deref(),
         campaign_session: None,
     };
-    native_research_historical_authority(Some(notes_json), &expected).is_some_and(|authority| {
-        authority.cleanup_complete
-    })
+    native_research_historical_authority(Some(notes_json), &expected)
+        .is_some_and(|authority| authority.cleanup_complete)
 }
 
 fn startup_research_owner_from_row(
@@ -8420,10 +9820,9 @@ pub(crate) fn startup_research_owner_snapshot(
     let repository = ResearchRepository::new(db);
     let mut owners = std::collections::BTreeMap::new();
     for run_id in preserved_run_ids {
-        if let Some(owner) = repository.startup_native_owner(
-            *run_id,
-            absent_pending_marker_ids.contains(run_id),
-        )? {
+        if let Some(owner) =
+            repository.startup_native_owner(*run_id, absent_pending_marker_ids.contains(run_id))?
+        {
             owners.insert(*run_id, owner);
         }
     }
@@ -8513,7 +9912,10 @@ fn block_review_in_transaction(
     now: i64,
 ) -> Result<(), AppError> {
     if reason.is_empty() || reason.len() > 128 || reason.chars().any(char::is_control) {
-        return Err(validation_error("research.blocked_reason", "must be bounded"));
+        return Err(validation_error(
+            "research.blocked_reason",
+            "must be bounded",
+        ));
     }
     let changed = transaction
         .execute(
@@ -8879,8 +10281,9 @@ mod tests {
         },
         execution_policy::CampaignLimits,
         models::{
-            AgentContextMode, AgentRunStatus, ExecutionProjection, NewAgentRun, NewProject,
-            NewTaskObservation, ProposalKind, IncidentStatus, TerminationRequestStatus,
+            AgentContextMode, AgentRunStatus, EventKind, ExecutionProjection, IncidentStatus,
+            NewAgentRun, NewEvent, NewProject, NewTaskObservation, ProposalKind,
+            TerminationRequestStatus,
         },
         proposals::{self, ProposalInput},
         pueue::PueueTask,
@@ -10141,7 +11544,14 @@ mod tests {
         };
 
         let missing = rusqlite::types::Null;
-        assert_routes(&missing, CheckpointJsonState::Missing, None, "null", None, None);
+        assert_routes(
+            &missing,
+            CheckpointJsonState::Missing,
+            None,
+            "null",
+            None,
+            None,
+        );
         let blob = vec![0xff_u8];
         assert_routes(
             &blob,
@@ -10191,106 +11601,8 @@ mod tests {
 
     #[test]
     fn ready_action_accepts_available_support_then_rejects_non_null_checkpoint_column() {
-        let (_temp, db, run_id, project_id) = detached_history_fixture();
-        let review_id: String = db
-            .connect()
-            .unwrap()
-            .query_row(
-                "SELECT review_id FROM research_reviews
-                 WHERE campaign_id = 'detached-history-campaign'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let managed_task_signature: String = db
-            .connect()
-            .unwrap()
-            .query_row(
-                "SELECT task_signature FROM research_reviews WHERE review_id = ?1",
-                [&review_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let (context_json, context_digest, response_json) =
-            available_checkpoint_context_response(
-                &project_id,
-                "detached-history-campaign",
-                "detached-history-experiment",
-                &review_id,
-                &managed_task_signature,
-                "detached-history-objective",
-                "detached-history-proposal",
-                "detached-history-submission",
-                "resume_from_checkpoint",
-            );
-        let authority = db
-            .connect()
-            .unwrap()
-            .query_row(
-                "SELECT json_extract(notes_json, '$.retry_history[0].native_recovery')
-                 FROM research_reviews WHERE review_id = ?1",
-                [&review_id],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap();
-        let session_id = "11111111-1111-4111-8111-111111111111";
-        let notes_json = json!({
-            "native_recovery": serde_json::from_str::<Value>(&authority).unwrap(),
-            "planned_session_id": session_id,
-            "confirmed_session_id": session_id,
-            "session_binding": "confirmed",
-        })
-        .to_string();
-        let connection = db.connect().unwrap();
-        connection
-            .execute(
-                "UPDATE campaign_research
-                 SET session_id = ?1, session_generation = 0
-                 WHERE campaign_id = 'detached-history-campaign'",
-                [session_id],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE events
-                 SET status = 'completed', lease_until = NULL,
-                     completed_at = 3_002
-                 WHERE event_id = (SELECT event_id FROM research_reviews WHERE review_id = ?1)",
-                [&review_id],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE research_reviews
-                 SET state = 'ready', attempt = 1, operation_stage = NULL,
-                     agent_run_id = ?1, context_json = ?2, context_digest = ?3,
-                     response_json = ?4, termination_request_id = NULL,
-                     failure_code = NULL, notes_json = ?5, checkpoint_json = NULL,
-                     not_before = 3_003, finished_at = NULL, updated_at = 3_003
-                 WHERE review_id = ?6",
-                rusqlite::params![
-                    run_id,
-                    context_json,
-                    context_digest,
-                    response_json,
-                    notes_json,
-                    review_id,
-                ],
-            )
-            .unwrap();
-        drop(connection);
-
-        let live_task = PueueTask {
-            id: 41,
-            group: "detached-history-group".to_owned(),
-            command: "python train.py".to_owned(),
-            state: "Running".to_owned(),
-            enqueued_at: Some("900".to_owned()),
-            started_at: Some("1000".to_owned()),
-            ended_at: None,
-            result: None,
-        };
-        let mut connection = db.connect().unwrap();
+        let fixture = source_authority_fixture();
+        let mut connection = fixture.db.connect().unwrap();
         let transaction = connection.transaction().unwrap();
         let read_mutation_snapshot = |transaction: &Transaction<'_>| {
             transaction
@@ -10298,15 +11610,15 @@ mod tests {
                     "SELECT
                          (SELECT COUNT(*) FROM incidents WHERE project_id = ?1),
                          (SELECT COUNT(*) FROM termination_requests WHERE project_id = ?1),
-                         (SELECT COUNT(*) FROM proposals WHERE campaign_id = 'detached-history-campaign'),
+                         (SELECT COUNT(*) FROM proposals WHERE campaign_id = ?2),
                          (SELECT COUNT(*) FROM submissions WHERE project_id = ?1),
-                         (SELECT COUNT(*) FROM experiments WHERE campaign_id = 'detached-history-campaign'),
-                         (SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = 'detached-history-campaign'),
+                         (SELECT COUNT(*) FROM experiments WHERE campaign_id = ?2),
+                         (SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?2),
                          state, operation_stage, agent_run_id, termination_request_id,
                          successor_experiment_id, checkpoint_json, context_digest,
                          response_json, notes_json, failure_code, attempt
-                     FROM research_reviews WHERE review_id = ?2",
-                    rusqlite::params![project_id, review_id],
+                     FROM research_reviews WHERE review_id = ?3",
+                    rusqlite::params![fixture.project_id, fixture.campaign_id, fixture.review_id],
                     |row| {
                         Ok((
                             (
@@ -10338,9 +11650,9 @@ mod tests {
         let before = read_mutation_snapshot(&transaction);
         let first = ready_research_action_in_transaction(
             &transaction,
-            &project_id,
-            &review_id,
-            &live_task,
+            &fixture.project_id,
+            &fixture.review_id,
+            &fixture.live_task,
         )
         .unwrap();
         assert!(first.is_some(), "verified Available support must be consumable");
@@ -10348,15 +11660,15 @@ mod tests {
         transaction
             .execute(
                 "UPDATE research_reviews SET checkpoint_json = '{}' WHERE review_id = ?1",
-                [&review_id],
+                [&fixture.review_id],
             )
             .unwrap();
         let with_non_null_checkpoint = read_mutation_snapshot(&transaction);
         let second = ready_research_action_in_transaction(
             &transaction,
-            &project_id,
-            &review_id,
-            &live_task,
+            &fixture.project_id,
+            &fixture.review_id,
+            &fixture.live_task,
         )
         .unwrap();
         assert!(second.is_none(), "non-NULL checkpoint column must be rejected");
@@ -10366,13 +11678,14 @@ mod tests {
         );
         transaction.commit().unwrap();
 
-        let persisted: (String, Option<String>, Option<String>) = db
+        let persisted: (String, Option<String>, Option<String>) = fixture
+            .db
             .connect()
             .unwrap()
             .query_row(
                 "SELECT state, operation_stage, termination_request_id
                  FROM research_reviews WHERE review_id = ?1",
-                [&review_id],
+                [&fixture.review_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
@@ -10447,12 +11760,8 @@ mod tests {
         let submission_id = "source-authority-submission".to_owned();
         let group = "source-authority-group";
         let argv = vec!["python".to_owned(), loader_path.to_owned()];
-        let runtime_argv = campaign_experiment_runtime_argv(
-            &root,
-            &campaign_id,
-            &experiment_id,
-            &argv,
-        );
+        let runtime_argv =
+            campaign_experiment_runtime_argv(&root, &campaign_id, &experiment_id, &argv);
         let wrapped_command = try_canonical_command_display_os(&runtime_argv)
             .expect("source authority wrapped command");
         let live_task = PueueTask {
@@ -10681,10 +11990,11 @@ mod tests {
         let loader_digest = loader_file.sha256.clone();
         let loader_reference = format!("loader-source:{loader_digest}");
         let mut candidates = Vec::new();
-        for (ordinal, bytes) in [(0_usize, b"checkpoint-zero".as_slice()), (1, b"checkpoint-one")] {
-            let path = format!(
-                ".pueue-agent/artifacts/{experiment_id}/checkpoint-{ordinal}.json"
-            );
+        for (ordinal, bytes) in [
+            (0_usize, b"checkpoint-zero".as_slice()),
+            (1, b"checkpoint-one"),
+        ] {
+            let path = format!(".pueue-agent/artifacts/{experiment_id}/checkpoint-{ordinal}.json");
             let argv_path = if working_directory == "." {
                 path.clone()
             } else {
@@ -10692,7 +12002,14 @@ mod tests {
                     .expect("source authority nested candidate path")
                     .to_owned()
             };
-            let file = source_authority_file(&path, bytes, &root_record, &root_record, 8 + ordinal as u64, 9 + ordinal as u64);
+            let file = source_authority_file(
+                &path,
+                bytes,
+                &root_record,
+                &root_record,
+                8 + ordinal as u64,
+                9 + ordinal as u64,
+            );
             candidates.push(crate::research_checkpoint::CheckpointCandidateEvidenceV1 {
                 reference: format!("checkpoint:{experiment_id}:{ordinal}:{}", file.sha256),
                 source_experiment_id: experiment_id.clone(),
@@ -10841,11 +12158,8 @@ mod tests {
         .expect("source authority ready action");
         transaction.commit().expect("source authority action commit");
 
-        let source_authority = match checkpoint_source_authority_for_preparation(
-            &db,
-            &expected,
-            &request,
-        )
+        let source_authority =
+            match checkpoint_source_authority_for_preparation(&db, &expected, &request)
         .expect("source authority preparation read")
         {
             CheckpointSourceAuthorityRead::Supported(authority) => authority,
@@ -11015,21 +12329,14 @@ mod tests {
         authority: CheckpointDispatchAuthority,
     }
 
-    fn checkpoint_confirmed_fixture() -> (
-        SourceAuthorityFixture,
-        String,
-        ResearchOwnershipSnapshot,
-    ) {
+    fn checkpoint_confirmed_fixture() -> (SourceAuthorityFixture, String, ResearchOwnershipSnapshot)
+    {
         confirm_checkpoint_fixture(source_authority_fixture())
     }
 
     fn confirm_checkpoint_fixture(
         fixture: SourceAuthorityFixture,
-    ) -> (
-        SourceAuthorityFixture,
-        String,
-        ResearchOwnershipSnapshot,
-    ) {
+    ) -> (SourceAuthorityFixture, String, ResearchOwnershipSnapshot) {
         let incident = Incident {
             incident_id: 81,
             project_id: fixture.project_id.clone(),
@@ -11258,14 +12565,1036 @@ mod tests {
         }
     }
 
+    fn cleanup_terminal_fixture(
+        status: &str,
+        review_failure_code: Option<&str>,
+        not_before: i64,
+    ) -> CheckpointDispatchFixture {
+        let prepared = checkpoint_dispatch_fixture();
+        let connection = prepared
+            .fixture
+            .db
+            .connect()
+            .expect("cleanup terminal connection");
+        mutate_checkpoint_terminal(&prepared, &connection, status);
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'ready', operation_stage = 'successor_reserved',
+                     failure_code = ?1, finished_at = NULL,
+                     not_before = ?2, updated_at = ?2
+                 WHERE review_id = ?3",
+                rusqlite::params![review_failure_code, not_before, prepared.fixture.review_id],
+            )
+            .expect("cleanup terminal review");
+        prepared
+    }
+
+    fn cleanup_pre_add_fixture() -> CheckpointDispatchFixture {
+        let prepared = checkpoint_dispatch_fixture();
+        ExperimentRepository::new(&prepared.fixture.db)
+            .fail_checkpoint_before_add(
+                &prepared.authority,
+                CHECKPOINT_PRE_ADD_FAILURE_CODE,
+                3_205,
+            )
+            .expect("cleanup pre-add failure");
+        prepared
+    }
+
+    fn cleanup_undispatched_fixture() -> CheckpointDispatchFixture {
+        let prepared = checkpoint_dispatch_fixture();
+        let connection = prepared
+            .fixture
+            .db
+            .connect()
+            .expect("cleanup undispatched connection");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'ready', operation_stage = 'intent',
+                     successor_experiment_id = NULL, failure_code = NULL,
+                     finished_at = NULL, not_before = 3_200, updated_at = 3_200
+                 WHERE review_id = ?1",
+                [&prepared.fixture.review_id],
+            )
+            .expect("cleanup undispatched review");
+        connection
+            .execute(
+                "UPDATE termination_requests
+                 SET status = 'confirmed', grace_until = NULL,
+                     confirmed_at = 3_101,
+                     last_error = 'termination_undispatched: source task absent'
+                 WHERE request_id = (
+                     SELECT termination_request_id FROM research_reviews
+                     WHERE review_id = ?1
+                 )",
+                [&prepared.fixture.review_id],
+            )
+            .expect("cleanup undispatched request");
+        connection
+            .execute(
+                "DELETE FROM budget_reservations
+                 WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                [&prepared.authority.successor_experiment_id],
+            )
+            .expect("cleanup undispatched reservation");
+        connection
+            .execute(
+                "DELETE FROM experiments WHERE experiment_id = ?1",
+                [&prepared.authority.successor_experiment_id],
+            )
+            .expect("cleanup undispatched experiment");
+        connection
+            .execute(
+                "DELETE FROM submissions WHERE submission_id = ?1",
+                [&prepared.authority.submission_id],
+            )
+            .expect("cleanup undispatched submission");
+        connection
+            .execute(
+                "DELETE FROM proposals WHERE proposal_id = ?1",
+                [&prepared.authority.proposal_id],
+            )
+            .expect("cleanup undispatched proposal");
+        prepared
+    }
+
+    #[test]
+    fn checkpoint_cleanup_settles_undispatched_with_null_successor() {
+        let fixture = cleanup_undispatched_fixture();
+        let repository = ResearchRepository::new(&fixture.fixture.db);
+        let authority = repository
+            .checkpoint_cleanup_authority(&fixture.fixture.project_id, &fixture.fixture.review_id, 3_300)
+            .expect("cleanup undispatched authority")
+            .expect("cleanup undispatched candidate");
+        let before = checkpoint_graph_snapshot(&fixture);
+        assert!(repository
+            .settle_checkpoint_cleanup(&authority, 3_301)
+            .expect("cleanup undispatched settlement"));
+        let after = checkpoint_graph_snapshot(&fixture);
+        assert_eq!(after.proposal, before.proposal, "undispatched proposal changed");
+        assert_eq!(after.submission, before.submission, "undispatched submission changed");
+        assert_eq!(after.experiment, before.experiment, "undispatched experiment changed");
+        assert_eq!(after.reservation, before.reservation, "undispatched reservation changed");
+        assert_eq!(after.termination, before.termination, "undispatched termination changed");
+        assert_eq!(after.resource_counts, before.resource_counts, "undispatched resource counts changed");
+        for index in 0..before.review.len() {
+            if matches!(index, 5 | 6 | 16 | 18 | 23 | 24) {
+                continue;
+            }
+            assert_eq!(after.review[index], before.review[index], "undispatched review field {index} changed");
+        }
+        let persisted: (String, Option<String>, Option<String>, Option<String>) = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("cleanup undispatched persisted connection")
+            .query_row(
+                "SELECT state, operation_stage, successor_experiment_id, failure_code
+                 FROM research_reviews WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("cleanup undispatched persisted row");
+        assert_eq!(persisted.0, "discarded");
+        assert_eq!(persisted.1, None);
+        assert_eq!(persisted.2, None);
+        assert_eq!(persisted.3.as_deref(), Some("research_natural_finish_before_dispatch"));
+    }
+
+    fn assert_cleanup_settlement_preserves_history(
+        label: &str,
+        fixture: CheckpointDispatchFixture,
+    ) {
+        let repository = ResearchRepository::new(&fixture.fixture.db);
+        let authority = repository
+            .checkpoint_cleanup_authority(
+                &fixture.fixture.project_id,
+                &fixture.fixture.review_id,
+                3_300,
+            )
+            .expect("cleanup authority")
+            .unwrap_or_else(|| panic!("{label}: cleanup authority missing"));
+        let before = checkpoint_graph_snapshot(&fixture);
+        assert!(repository
+            .settle_checkpoint_cleanup(&authority, 3_301)
+            .unwrap_or_else(|error| panic!("{label}: cleanup settlement: {error}")));
+        let after = checkpoint_graph_snapshot(&fixture);
+        assert_eq!(after.proposal, before.proposal, "{label}: proposal changed");
+        assert_eq!(after.submission, before.submission, "{label}: submission changed");
+        assert_eq!(after.experiment, before.experiment, "{label}: experiment changed");
+        assert_eq!(after.reservation, before.reservation, "{label}: reservation changed");
+        assert_eq!(after.termination, before.termination, "{label}: termination changed");
+        assert_eq!(after.resource_counts, before.resource_counts, "{label}: resource counts changed");
+        assert_eq!(after.review[5], rusqlite::types::Value::Text("completed".to_owned()), "{label}: state");
+        assert_eq!(after.review[6], rusqlite::types::Value::Null, "{label}: operation stage");
+        assert_eq!(after.review[23], rusqlite::types::Value::Integer(3_301), "{label}: finished_at");
+        assert_eq!(after.review[24], rusqlite::types::Value::Integer(3_301), "{label}: updated_at");
+        for index in 0..before.review.len() {
+            if matches!(index, 5 | 6 | 23 | 24) {
+                continue;
+            }
+            assert_eq!(after.review[index], before.review[index], "{label}: review field {index} changed");
+        }
+    }
+
+    #[test]
+    fn checkpoint_cleanup_terminal_settlement_preserves_history() {
+        assert_cleanup_settlement_preserves_history(
+            "terminal",
+            cleanup_terminal_fixture("succeeded", None, 3_250),
+        );
+    }
+
+    #[test]
+    fn checkpoint_cleanup_pre_add_settlement_preserves_history() {
+        assert_cleanup_settlement_preserves_history("pre-add", cleanup_pre_add_fixture());
+    }
+
+    #[test]
+    fn checkpoint_cleanup_accepts_producer_bounded_retry_history_over_four_kib() {
+        let fixture = cleanup_terminal_fixture("succeeded", None, 3_250);
+        let connection = fixture.fixture.db.connect().expect("large retry notes connection");
+        let (current_notes, agent_run_id, session_id): (String, i64, String) = connection
+            .query_row(
+                "SELECT review.notes_json, review.agent_run_id,
+                        campaign_research.session_id
+                 FROM research_reviews AS review
+                 JOIN campaign_research
+                   ON campaign_research.campaign_id = review.campaign_id
+                 WHERE review.review_id = ?1",
+                [&fixture.fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("large retry notes current row");
+        let mut notes: Value = serde_json::from_str(&current_notes).expect("large retry notes JSON");
+        let native_recovery = notes
+            .get("native_recovery")
+            .cloned()
+            .expect("large retry native authority");
+        let context_json = json!({"facts": {"bounded_retry_context": "x".repeat(5_000)}})
+            .to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        notes["retry_history"] = json!([{
+            "attempt": 0,
+            "agent_run_id": agent_run_id,
+            "failure_code": "research_output_invalid",
+            "context_json": context_json,
+            "context_digest": context_digest,
+            "planned_session_id": session_id,
+            "confirmed_session_id": session_id,
+            "session_binding": "confirmed",
+            "native_recovery": native_recovery,
+        }]);
+        let notes_json = notes.to_string();
+        assert!(notes_json.len() > crate::research_protocol::MAX_RESEARCH_NOTES_BYTES);
+        connection
+            .execute(
+                "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
+                rusqlite::params![notes_json, fixture.fixture.review_id],
+            )
+            .expect("large retry notes update");
+        drop(connection);
+
+        let repository = ResearchRepository::new(&fixture.fixture.db);
+        let authority = repository
+            .checkpoint_cleanup_authority(
+                &fixture.fixture.project_id,
+                &fixture.fixture.review_id,
+                3_300,
+            )
+            .expect("large retry cleanup authority query")
+            .expect("producer-bounded retry history remains cleanup-authoritative");
+        assert!(repository
+            .settle_checkpoint_cleanup(&authority, 3_301)
+            .expect("large retry cleanup settlement"));
+    }
+
+    fn insert_cleanup_history_experiment(
+        fixture: &SourceAuthorityFixture,
+        experiment_id: &str,
+        proposal_id: &str,
+        submission_id: &str,
+        proposal: &proposals::ValidatedProposal,
+        parent_experiment_id: Option<&str>,
+        attempt: i64,
+        resume_of_experiment_id: Option<&str>,
+        checkpoint_note: Option<&str>,
+        now: i64,
+    ) {
+        let argv_json = serde_json::to_string(proposal.argv()).expect("history argv");
+        let evidence_json = serde_json::to_string(proposal.expected_evidence())
+            .expect("history evidence");
+        let metadata_json = json!({
+            "campaign_id": fixture.campaign_id,
+            "proposal_id": proposal_id,
+            "experiment_id": experiment_id,
+        })
+        .to_string();
+        let mut connection = fixture.db.connect().expect("history experiment connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("history experiment transaction");
+        super::super::campaigns::insert_proposal(
+            &transaction,
+            proposal_id,
+            &fixture.campaign_id,
+            proposal,
+            ProposalStatus::Accepted,
+            &argv_json,
+            &evidence_json,
+            now,
+        )
+        .expect("history proposal insert");
+        super::super::campaigns::insert_submission(
+            &transaction,
+            submission_id,
+            &fixture.project_id,
+            &argv_json,
+            &metadata_json,
+            None,
+            now,
+        )
+        .expect("history submission insert");
+        super::super::campaigns::insert_experiment(
+            &transaction,
+            experiment_id,
+            &fixture.campaign_id,
+            proposal_id,
+            submission_id,
+            parent_experiment_id,
+            attempt,
+            resume_of_experiment_id,
+            checkpoint_note,
+            None,
+            None,
+            now,
+        )
+        .expect("history experiment insert");
+        super::super::campaigns::insert_experiment_reservation(
+            &transaction,
+            &fixture.campaign_id,
+            experiment_id,
+            now,
+            now + 3_600,
+        )
+        .expect("history reservation insert");
+        transaction.commit().expect("history experiment commit");
+    }
+
+    fn insert_coherent_cleanup_history(
+        fixture: &CheckpointDispatchFixture,
+        index: usize,
+    ) -> String {
+        let review_id = format!("research-review:cleanup-history:{index:02}");
+        let source_experiment_id = format!("cleanup-history-source-{index:02}");
+        let source_proposal_id = format!("cleanup-history-source-proposal-{index:02}");
+        let source_submission_id = format!("cleanup-history-source-submission-{index:02}");
+        let successor_ids = crate::research_checkpoint::checkpoint_successor_ids(&review_id, 1)
+            .expect("cleanup history successor IDs");
+        let now = 1_000 + index as i64;
+        let task_id = 6_000 + index as i64;
+        let source_argv = fixture.fixture.checkpoint.source_argv.clone();
+        let source_working_directory = fixture.fixture.checkpoint.source_working_directory.clone();
+        let root_path: PathBuf = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history project connection")
+            .query_row(
+                "SELECT root_path FROM projects WHERE project_id = ?1",
+                [&fixture.fixture.project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("history project root")
+            .into();
+        let runtime_argv = campaign_experiment_runtime_argv(
+            &root_path,
+            &fixture.fixture.campaign_id,
+            &source_experiment_id,
+            &source_argv,
+        );
+        let wrapped_command = try_canonical_command_display_os(&runtime_argv)
+            .expect("history wrapped command");
+        let source_task = PueueTask {
+            id: task_id,
+            group: fixture.fixture.live_task.group.clone(),
+            command: wrapped_command.clone(),
+            state: "Running".to_owned(),
+            enqueued_at: Some("900".to_owned()),
+            started_at: Some("1000".to_owned()),
+            ended_at: None,
+            result: None,
+        };
+        let source_raw_signature = task_signature(&source_task);
+        let source_managed_signature = managed_task_run_signature(&source_task)
+            .expect("history managed source signature");
+        let objective_digest = fixture.fixture.expected.campaign_objective_digest.clone();
+        let source_proposal = proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: format!("cleanup history source {index:02}"),
+                source_experiment_id: None,
+                argv: source_argv.clone(),
+                working_directory: source_working_directory.clone(),
+                expected_evidence: vec!["loss".to_owned()],
+            },
+            &objective_digest,
+        )
+        .expect("history source proposal");
+        insert_cleanup_history_experiment(
+            &fixture.fixture,
+            &source_experiment_id,
+            &source_proposal_id,
+            &source_submission_id,
+            &source_proposal,
+            None,
+            0,
+            None,
+            None,
+            now,
+        );
+        TaskObservationRepository::new(&fixture.fixture.db)
+            .upsert(&NewTaskObservation::new(
+                &fixture.fixture.project_id,
+                source_raw_signature.clone(),
+                task_id,
+                fixture.fixture.live_task.group.clone(),
+                vec![wrapped_command],
+                "Running",
+                Some(900),
+                Some(1_000),
+                None,
+                None,
+                now,
+            ))
+            .expect("history source observation");
+        let source_connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history source terminal connection");
+        source_connection
+            .execute(
+                "UPDATE submissions
+                 SET status = 'accepted', pueue_task_id = ?1, task_signature = ?2
+                 WHERE submission_id = ?3",
+                rusqlite::params![task_id, source_managed_signature, source_submission_id],
+            )
+            .expect("history source submission terminal");
+        source_connection
+            .execute(
+                "UPDATE experiments
+                 SET status = 'succeeded', pueue_task_id = ?1,
+                     task_signature = ?2, finished_at = ?3, updated_at = ?3
+                 WHERE experiment_id = ?4",
+                rusqlite::params![task_id, source_managed_signature, now, source_experiment_id],
+            )
+            .expect("history source experiment terminal");
+        source_connection
+            .execute(
+                "UPDATE budget_reservations SET status = 'consumed', updated_at = ?1
+                 WHERE experiment_id = ?2 AND dimension = 'experiment'",
+                rusqlite::params![now, source_experiment_id],
+            )
+            .expect("history source reservation terminal");
+        drop(source_connection);
+
+        let event = EventRepository::new(&fixture.fixture.db)
+            .insert_idempotent(
+                &NewEvent::new(
+                    &fixture.fixture.project_id,
+                    EventKind::CampaignResearch,
+                    format!("cleanup-history-event:{index:02}"),
+                    json!({"review_id": review_id, "experiment_id": source_experiment_id}),
+                    now,
+                    now,
+                )
+                .with_campaign_lineage(
+                    &fixture.fixture.campaign_id,
+                    Some(source_experiment_id.clone()),
+                ),
+            )
+            .expect("history event insert");
+        EventRepository::new(&fixture.fixture.db)
+            .claim_by_id(&fixture.fixture.project_id, event.event_id, now + 1)
+            .expect("history event claim")
+            .expect("history event claimed");
+        let run = AgentRunRepository::new(&fixture.fixture.db)
+            .insert_with_events(
+                &NewAgentRun::with_context(
+                    &fixture.fixture.project_id,
+                    event.event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    now + 2,
+                    fixture
+                        .fixture
+                        ._temp
+                        .path()
+                        .join(format!("cleanup-history-agent-{index:02}.log")),
+                    AgentContextMode::Fresh,
+                    None,
+                    Vec::new(),
+                )
+                .with_execution(
+                    ExecutionProjection::new("campaign_research", "/bin/sh", "fixture")
+                        .expect("history execution"),
+                ),
+                &[event.event_id],
+            )
+            .expect("history run insert");
+        let run_connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history run terminal connection");
+        run_connection
+            .execute(
+                "UPDATE agent_runs
+                 SET status = 'completed', finished_at = ?1,
+                     launch_gate_state = 'released'
+                 WHERE run_id = ?2",
+                rusqlite::params![now + 3, run.run_id],
+            )
+            .expect("history run terminal");
+        run_connection
+            .execute(
+                "UPDATE events
+                 SET status = 'completed', lease_until = NULL,
+                     completed_at = ?1
+                 WHERE event_id = ?2",
+                rusqlite::params![now + 3, event.event_id],
+            )
+            .expect("history event terminal");
+
+        let session_id = format!("11111111-1111-4111-8111-{index:012}");
+        let native_recovery = json!({
+            "version": 1,
+            "run_id": run.run_id,
+            "review_id": review_id,
+            "campaign_id": fixture.fixture.campaign_id,
+            "experiment_id": source_experiment_id,
+            "attempt": 1,
+            "session_generation": 0,
+            "fresh_launch": true,
+            "session_id": session_id,
+            "service_root_identity": {
+                "device": 100 + index as u64, "inode": 200 + index as u64,
+                "owner": 3, "mode": 448, "resolution": "fixture-root"
+            },
+            "temp_identity": {
+                "device": 100 + index as u64, "inode": 300 + index as u64,
+                "owner": 3, "mode": 448, "mount": [1, 2],
+                "service_identity": {"device": 100 + index as u64, "inode": 400 + index as u64, "owner": 3, "mode": 448},
+                "parent_identity": {"device": 100 + index as u64, "inode": 500 + index as u64, "owner": 3, "mode": 448}
+            },
+            "cleanup": {"phase": "complete", "completed_at": now + 3}
+        });
+        let notes_json = json!({
+            "native_recovery": native_recovery,
+            "planned_session_id": session_id,
+            "confirmed_session_id": session_id,
+            "session_binding": "confirmed",
+        })
+        .to_string();
+
+        let mut support = serde_json::from_str::<Value>(&fixture.fixture.expected.context_json)
+            .expect("history base context")["operations"]["checkpoint_support"]
+            .clone();
+        let support_value = support.as_object_mut().expect("history support object");
+        assert_eq!(support_value.get("status").and_then(Value::as_str), Some("available"));
+        support_value.insert(
+            "source_experiment_id".to_owned(),
+            Value::String(source_experiment_id.clone()),
+        );
+        support_value.insert(
+            "source_proposal_id".to_owned(),
+            Value::String(source_proposal_id.clone()),
+        );
+        support_value.insert(
+            "source_submission_id".to_owned(),
+            Value::String(source_submission_id.clone()),
+        );
+        let candidates = support_value
+            .get_mut("checkpoint_candidates")
+            .and_then(Value::as_array_mut)
+            .expect("history checkpoint candidates");
+        for (ordinal, candidate) in candidates.iter_mut().enumerate() {
+            let path = format!(
+                ".pueue-agent/artifacts/{source_experiment_id}/checkpoint-{ordinal}.json"
+            );
+            let candidate_object = candidate.as_object_mut().expect("history candidate object");
+            candidate_object.insert(
+                "reference".to_owned(),
+                Value::String(format!(
+                    "checkpoint:{source_experiment_id}:{ordinal}:{}",
+                    candidate_object
+                        .get("sha256")
+                        .and_then(Value::as_str)
+                        .expect("history candidate digest")
+                )),
+            );
+            candidate_object.insert(
+                "source_experiment_id".to_owned(),
+                Value::String(source_experiment_id.clone()),
+            );
+            candidate_object.insert("argv_path".to_owned(), Value::String(path.clone()));
+            candidate_object.insert("root_relative_path".to_owned(), Value::String(path.clone()));
+            let file = candidate_object
+                .get_mut("file")
+                .and_then(Value::as_object_mut)
+                .expect("history candidate file");
+            file.insert("relative_path".to_owned(), Value::String(path));
+        }
+        let source_checkpoint: crate::research_checkpoint::CheckpointCandidateEvidenceV1 =
+            serde_json::from_value(candidates[1].clone()).expect("history source checkpoint");
+        let mut request = fixture.fixture.checkpoint.request.clone();
+        request.path = source_checkpoint.argv_path.clone();
+        request.argv[3] = source_checkpoint.argv_path.clone();
+        request.support_evidence_refs[1] = source_checkpoint.reference.clone();
+        let support: CheckpointSupportEvidenceV1 =
+            serde_json::from_value(support).expect("history support evidence");
+        let context = json!({
+            "schema_version": crate::research_evidence::RESEARCH_CONTEXT_SCHEMA_VERSION,
+            "facts": {
+                "review": {
+                    "review_id": review_id,
+                    "experiment_id": source_experiment_id,
+                    "task_signature": source_managed_signature,
+                },
+                "campaign": {"campaign_id": fixture.fixture.campaign_id},
+                "project": {"project_id": fixture.fixture.project_id},
+                "objective": {"digest": objective_digest},
+                "target": {
+                    "experiment_id": source_experiment_id,
+                    "pueue_task_id": task_id,
+                    "task_signature": source_managed_signature,
+                    "proposal_id": source_proposal_id,
+                    "submission_id": source_submission_id,
+                }
+            },
+            "operations": {"checkpoint_support": support}
+        });
+        let context_json = context.to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let response_json = json!({
+            "schema_version": 1,
+            "review_id": review_id,
+            "experiment_id": source_experiment_id,
+            "context_digest": context_digest,
+            "action": "resume_from_checkpoint",
+            "reason": "use the verified checkpoint evidence",
+            "evidence_refs": request.support_evidence_refs.clone(),
+            "notes": "verified support",
+            "checkpoint": request,
+        })
+        .to_string();
+        let source_proposal_canonical_digest: String = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history source digest connection")
+            .query_row(
+                "SELECT canonical_digest FROM proposals WHERE proposal_id = ?1",
+                [&source_proposal_id],
+                |row| row.get(0),
+            )
+            .expect("history source digest");
+        let mut checkpoint = fixture.fixture.checkpoint.clone();
+        checkpoint.review_id = review_id.clone();
+        checkpoint.review_agent_run_id = run.run_id;
+        checkpoint.review_event_id = event.event_id;
+        checkpoint.source_experiment_id = source_experiment_id.clone();
+        checkpoint.source_proposal_id = source_proposal_id.clone();
+        checkpoint.source_submission_id = source_submission_id.clone();
+        checkpoint.source_task_id = task_id;
+        checkpoint.source_managed_task_signature = source_managed_signature.clone();
+        checkpoint.source_raw_task_signature = source_raw_signature.clone();
+        checkpoint.context_digest = context_digest.clone();
+        checkpoint.response_digest = format!("{:x}", Sha256::digest(response_json.as_bytes()));
+        checkpoint.source_proposal_canonical_digest = source_proposal_canonical_digest;
+        checkpoint.source_checkpoint = source_checkpoint;
+        checkpoint.request = request.clone();
+        checkpoint.retained_checkpoint.relative_path = format!(
+            "research-checkpoints/{}/{}/checkpoint",
+            fixture.fixture.campaign_id, review_id
+        );
+        checkpoint.retained_argv = request.argv.clone();
+        checkpoint.retained_argv[3] = format!(
+            "/private/state/research-checkpoints/{}/{}/checkpoint",
+            fixture.fixture.campaign_id, review_id
+        );
+        checkpoint.successor_ids = successor_ids.clone();
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(&checkpoint)
+            .expect("history checkpoint encoding");
+
+        let successor_argv = checkpoint.retained_argv.clone();
+        let successor_proposal = proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: format!(
+                    "Resume {} from its verified checkpoint",
+                    source_experiment_id
+                ),
+                source_experiment_id: Some(source_experiment_id.clone()),
+                argv: successor_argv,
+                working_directory: source_working_directory,
+                expected_evidence: source_proposal.expected_evidence().to_vec(),
+            },
+            &objective_digest,
+        )
+        .expect("history successor proposal");
+        insert_cleanup_history_experiment(
+            &fixture.fixture,
+            &successor_ids.experiment_id,
+            &successor_ids.proposal_id,
+            &successor_ids.submission_id,
+            &successor_proposal,
+            Some(&source_experiment_id),
+            1,
+            Some(&source_experiment_id),
+            Some(&format!("research-checkpoint:{:x}", Sha256::digest(encoded.as_bytes()))),
+            now + 4,
+        );
+        let successor_task_id = 7_000 + index as i64;
+        let successor_task_signature = format!("history-successor-task-{index:02}");
+        let graph_connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history successor terminal connection");
+        graph_connection
+            .execute(
+                "UPDATE submissions
+                 SET status = 'accepted', pueue_task_id = ?1, task_signature = ?2
+                 WHERE submission_id = ?3",
+                rusqlite::params![successor_task_id, successor_task_signature, successor_ids.submission_id],
+            )
+            .expect("history successor submission terminal");
+        graph_connection
+            .execute(
+                "UPDATE experiments
+                 SET status = 'succeeded', pueue_task_id = ?1,
+                     task_signature = ?2, finished_at = ?3, updated_at = ?3
+                 WHERE experiment_id = ?4",
+                rusqlite::params![successor_task_id, successor_task_signature, now + 5, successor_ids.experiment_id],
+            )
+            .expect("history successor experiment terminal");
+        graph_connection
+            .execute(
+                "UPDATE budget_reservations SET status = 'consumed', updated_at = ?1
+                 WHERE experiment_id = ?2 AND dimension = 'experiment'",
+                rusqlite::params![now + 5, successor_ids.experiment_id],
+            )
+            .expect("history successor reservation terminal");
+        let incident_id = 10_000 + index as i64;
+        let request_id = 10_000 + index as i64;
+        graph_connection
+            .execute(
+                "INSERT INTO incidents (
+                    incident_id, project_id, kind, task_key, fingerprint, status,
+                    first_seen_at, last_seen_at, acknowledged_at, resolved_at
+                 ) VALUES (?1, ?2, 'research_checkpoint', ?3, ?4, 'open', ?5, ?5, NULL, NULL)",
+                rusqlite::params![
+                    incident_id,
+                    fixture.fixture.project_id,
+                    source_experiment_id,
+                    format!("cleanup-history-fingerprint:{index:02}"),
+                    now,
+                ],
+            )
+            .expect("history incident");
+        graph_connection
+            .execute(
+                "INSERT INTO termination_requests (
+                    request_id, incident_id, project_id, task_signature, reason,
+                    status, requested_at, dispatch_lease_until, grace_until,
+                    confirmed_at, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'confirmed', ?6, NULL, NULL, ?7, NULL)",
+                rusqlite::params![
+                    request_id,
+                    incident_id,
+                    fixture.fixture.project_id,
+                    source_raw_signature,
+                    format!("research_action:{review_id}:checkpoint"),
+                    now,
+                    now + 1,
+                ],
+            )
+            .expect("history termination request");
+        graph_connection
+            .execute(
+                "INSERT INTO research_reviews (
+                    review_id, campaign_id, experiment_id, task_signature, attempt,
+                    state, operation_stage, agent_run_id, context_json, context_digest,
+                    response_json, termination_request_id, successor_experiment_id,
+                    evidence_schema_version, session_generation, event_id, not_before,
+                    notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                    created_at, started_at, finished_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, 1, 'completed', NULL, ?5, ?6, ?7,
+                           ?8, ?9, ?10, 1, 0, ?11, ?12, ?13, NULL, NULL,
+                           ?14, ?12, ?12, ?15, ?15)",
+                rusqlite::params![
+                    review_id,
+                    fixture.fixture.campaign_id,
+                    source_experiment_id,
+                    source_managed_signature,
+                    run.run_id,
+                    context_json,
+                    context_digest,
+                    response_json,
+                    request_id,
+                    successor_ids.experiment_id,
+                    event.event_id,
+                    now,
+                    notes_json,
+                    encoded,
+                    now + 2,
+                ],
+            )
+            .expect("history review");
+        drop(graph_connection);
+
+        let authority = CheckpointDispatchAuthority {
+            checkpoint: checkpoint.clone(),
+            raw_checkpoint: encoded,
+            project_id: fixture.fixture.project_id.clone(),
+            campaign_id: fixture.fixture.campaign_id.clone(),
+            review_id: review_id.clone(),
+            source_experiment_id: source_experiment_id.clone(),
+            proposal_id: successor_ids.proposal_id.clone(),
+            submission_id: successor_ids.submission_id.clone(),
+            successor_experiment_id: successor_ids.experiment_id.clone(),
+            successor_status: None,
+            successor_attempt: Some(1),
+            reservation_window_ends_at: None,
+            termination_request_id: Some(request_id),
+        };
+        let proof_connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history proof connection");
+        prepared_checkpoint_source_authority_in_connection(&proof_connection, &checkpoint)
+            .expect("history source authority");
+        let owner = native_research_owner_rows(&proof_connection, Some(&fixture.fixture.project_id))
+            .expect("history owner rows")
+            .into_iter()
+            .find(|row| row.review_id == review_id)
+            .expect("history owner row");
+        assert!(native_research_owner_is_complete(&owner), "history owner is incomplete");
+        let mut graph_connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history graph proof connection");
+        let transaction = graph_connection
+            .transaction()
+            .expect("history graph proof transaction");
+        let successor_witness = checkpoint_successor_witness(
+            &transaction,
+            &successor_ids.experiment_id,
+        )
+        .expect("history successor witness");
+        let mut authority = authority;
+        authority.successor_attempt = successor_witness.map(|(attempt, _)| attempt);
+        authority.reservation_window_ends_at = successor_witness.map(|(_, window_end)| window_end);
+        assert!(
+            super::super::campaigns::checkpoint_successor_graph_matches_authority(
+                &transaction,
+                &authority,
+                None,
+                None,
+            )
+            .expect("history graph authority"),
+            "history successor graph is not coherent"
+        );
+        transaction.commit().expect("history graph proof commit");
+        review_id
+    }
+
+    #[test]
+    fn checkpoint_cleanup_discovery_does_not_starve_new_candidate_after_history_window() {
+        let fixture = cleanup_terminal_fixture("succeeded", None, 3_250);
+        let history_ids = (0..32)
+            .map(|index| insert_coherent_cleanup_history(&fixture, index))
+            .collect::<Vec<_>>();
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("cleanup history count connection");
+        let valid_history_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM research_reviews
+                 WHERE review_id IN (SELECT value FROM json_each(?1))
+                   AND state = 'completed'",
+                [serde_json::to_string(&history_ids).expect("history IDs JSON")],
+                |row| row.get(0),
+            )
+            .expect("cleanup history count");
+        assert_eq!(valid_history_count, 32, "all completed histories must be present");
+        drop(connection);
+
+        let repository = ResearchRepository::new(&fixture.fixture.db);
+        let ids = repository
+            .checkpoint_cleanup_review_ids(&fixture.fixture.project_id, 32)
+            .expect("cleanup history candidates");
+        assert!(ids.len() <= 32, "cleanup candidates exceeded the bounded cap");
+        assert!(
+            ids.iter().any(|review_id| review_id == &fixture.fixture.review_id),
+            "new cleanup candidate was starved by completed history"
+        );
+        assert_eq!(ids, vec![fixture.fixture.review_id.clone()]);
+        let authority = repository
+            .checkpoint_cleanup_authority(&fixture.fixture.project_id, &fixture.fixture.review_id, 3_300)
+            .expect("cleanup history authority")
+            .expect("new cleanup candidate authority");
+        assert!(repository
+            .settle_checkpoint_cleanup(&authority, 3_301)
+            .expect("cleanup history settlement"));
+    }
+
+    #[test]
+    fn checkpoint_cleanup_settlement_defers_after_review_mutation() {
+        let fixture = cleanup_terminal_fixture("succeeded", None, 3_250);
+        let repository = ResearchRepository::new(&fixture.fixture.db);
+        let authority = repository
+            .checkpoint_cleanup_authority(&fixture.fixture.project_id, &fixture.fixture.review_id, 3_300)
+            .expect("cleanup race authority")
+            .expect("cleanup race candidate");
+        let mut connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("cleanup race mutation connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("cleanup race mutation transaction");
+        let current_notes: String = transaction
+            .query_row(
+                "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+                |row| row.get(0),
+            )
+            .expect("cleanup race current notes");
+        let mut changed_notes: Value =
+            serde_json::from_str(&current_notes).expect("cleanup race notes JSON");
+        changed_notes["cleanup_observation"] = json!("new");
+        let changed_notes = changed_notes.to_string();
+        transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET notes_json = ?1
+                 WHERE review_id = ?2",
+                rusqlite::params![changed_notes, fixture.fixture.review_id],
+            )
+            .expect("cleanup race review mutation");
+        transaction.commit().expect("cleanup race mutation commit");
+        let after_mutation = checkpoint_graph_snapshot(&fixture);
+        let reselected = repository
+            .checkpoint_cleanup_authority(
+                &fixture.fixture.project_id,
+                &fixture.fixture.review_id,
+                3_300,
+            )
+            .expect("cleanup race reselect")
+            .expect("cleanup race candidate after review mutation");
+        assert_eq!(reselected.shape, authority.shape, "cleanup race shape changed after review mutation");
+
+        assert!(!repository
+            .settle_checkpoint_cleanup(&authority, 3_301)
+            .expect("cleanup race settlement"));
+        assert_eq!(
+            checkpoint_graph_snapshot(&fixture),
+            after_mutation,
+            "cleanup race changed review/request/resource graph"
+        );
+        let persisted: (String, Option<String>) = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("cleanup race state connection")
+            .query_row(
+                "SELECT state, operation_stage FROM research_reviews WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("cleanup race state");
+        assert_eq!(persisted, ("ready".to_owned(), Some("successor_reserved".to_owned())));
+    }
+
+    #[test]
+    fn checkpoint_cleanup_settlement_defers_after_request_mutation() {
+        let fixture = cleanup_terminal_fixture("succeeded", None, 3_250);
+        let repository = ResearchRepository::new(&fixture.fixture.db);
+        let authority = repository
+            .checkpoint_cleanup_authority(&fixture.fixture.project_id, &fixture.fixture.review_id, 3_300)
+            .expect("cleanup request race authority")
+            .expect("cleanup request race candidate");
+        let mut connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("cleanup request race mutation connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("cleanup request race mutation transaction");
+        transaction
+            .execute(
+                "UPDATE termination_requests
+                 SET last_error = 'confirmed: bounded cleanup refresh'
+                 WHERE request_id = (
+                     SELECT termination_request_id FROM research_reviews
+                     WHERE review_id = ?1
+                 )",
+                [&fixture.fixture.review_id],
+            )
+            .expect("cleanup request race mutation");
+        transaction.commit().expect("cleanup request race mutation commit");
+        let after_mutation = checkpoint_graph_snapshot(&fixture);
+        let reselected = repository
+            .checkpoint_cleanup_authority(
+                &fixture.fixture.project_id,
+                &fixture.fixture.review_id,
+                3_300,
+            )
+            .expect("cleanup request race reselect")
+            .expect("cleanup request race candidate after mutation");
+        assert_eq!(reselected.shape, authority.shape, "cleanup request race shape changed after mutation");
+
+        assert!(!repository
+            .settle_checkpoint_cleanup(&authority, 3_301)
+            .expect("cleanup request race settlement"));
+        assert_eq!(
+            checkpoint_graph_snapshot(&fixture),
+            after_mutation,
+            "cleanup request race changed review/request/resource graph"
+        );
+        let persisted: (String, Option<String>) = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("cleanup request race state connection")
+            .query_row(
+                "SELECT state, operation_stage FROM research_reviews WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("cleanup request race state");
+        assert_eq!(persisted, ("ready".to_owned(), Some("successor_reserved".to_owned())));
+    }
+
     #[derive(Debug, PartialEq)]
     struct CheckpointGraphSnapshot {
         review: Vec<rusqlite::types::Value>,
-        proposal: Vec<rusqlite::types::Value>,
-        submission: Vec<rusqlite::types::Value>,
-        experiment: Vec<rusqlite::types::Value>,
-        reservation: Vec<rusqlite::types::Value>,
-        termination: Vec<rusqlite::types::Value>,
+        proposal: Option<Vec<rusqlite::types::Value>>,
+        submission: Option<Vec<rusqlite::types::Value>>,
+        experiment: Option<Vec<rusqlite::types::Value>>,
+        reservation: Option<Vec<rusqlite::types::Value>>,
+        termination: Option<Vec<rusqlite::types::Value>>,
         resource_counts: Vec<rusqlite::types::Value>,
     }
 
@@ -11281,6 +13610,21 @@ mod tests {
                     .collect::<rusqlite::Result<Vec<_>>>()
             })
             .expect("checkpoint graph snapshot row")
+    }
+
+    fn snapshot_sql_row_optional<P: rusqlite::Params>(
+        connection: &Connection,
+        sql: &str,
+        params: P,
+    ) -> Option<Vec<rusqlite::types::Value>> {
+        connection
+            .query_row(sql, params, |row| {
+                (0..row.as_ref().column_count())
+                    .map(|index| row.get(index))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .optional()
+            .expect("checkpoint graph optional snapshot row")
     }
 
     fn checkpoint_limit_snapshot(fixture: &SourceAuthorityFixture) -> Vec<rusqlite::types::Value> {
@@ -11325,6 +13669,30 @@ mod tests {
         let proposal_id = format!("limits-proposal-{suffix}");
         let submission_id = format!("limits-submission-{suffix}");
         let experiment_id = format!("limits-experiment-{suffix}");
+        insert_limit_experiment_with_ids(
+            fixture,
+            suffix,
+            &proposal_id,
+            &submission_id,
+            &experiment_id,
+            argv,
+            working_directory,
+            resume_of_experiment_id,
+            now,
+        );
+    }
+
+    fn insert_limit_experiment_with_ids(
+        fixture: &SourceAuthorityFixture,
+        suffix: &str,
+        proposal_id: &str,
+        submission_id: &str,
+        experiment_id: &str,
+        argv: Vec<String>,
+        working_directory: &str,
+        resume_of_experiment_id: Option<&str>,
+        now: i64,
+    ) {
         let proposal = proposals::validate(
             ProposalInput {
                 kind: ProposalKind::Experiment,
@@ -11391,12 +13759,11 @@ mod tests {
         transaction.commit().expect("limits fixture commit");
     }
 
-    fn insert_limit_agent_reservation(
-        fixture: &SourceAuthorityFixture,
-        suffix: &str,
-        now: i64,
-    ) {
-        let connection = fixture.db.connect().expect("agent budget fixture connection");
+    fn insert_limit_agent_reservation(fixture: &SourceAuthorityFixture, suffix: &str, now: i64) {
+        let connection = fixture
+            .db
+            .connect()
+            .expect("agent budget fixture connection");
         connection
             .execute(
                 "INSERT INTO budget_reservations (
@@ -11479,10 +13846,7 @@ mod tests {
         );
     }
 
-    fn rewrite_checkpoint_retained_path(
-        fixture: &CheckpointDispatchFixture,
-        retained_path: &str,
-    ) {
+    fn rewrite_checkpoint_retained_path(fixture: &CheckpointDispatchFixture, retained_path: &str) {
         let mut checkpoint = fixture.fixture.checkpoint.clone();
         let path_index = checkpoint
             .request
@@ -11634,13 +13998,17 @@ mod tests {
             .expect("checkpoint graph snapshot connection");
         let review = snapshot_sql_row(
             &connection,
-            "SELECT state, attempt, operation_stage, checkpoint_json,
-                    termination_request_id, successor_experiment_id, failure_code,
-                    finished_at, updated_at, notes_json
+            "SELECT review_id, campaign_id, experiment_id, task_signature,
+                    attempt, state, operation_stage, agent_run_id,
+                    context_json, context_digest, response_json,
+                    termination_request_id, successor_experiment_id,
+                    evidence_schema_version, session_generation, event_id,
+                    not_before, notes_json, failure_code, decision_cycle_id,
+                    checkpoint_json, created_at, started_at, finished_at, updated_at
              FROM research_reviews WHERE review_id = ?1",
             [&fixture.fixture.review_id],
         );
-        let proposal = snapshot_sql_row(
+        let proposal = snapshot_sql_row_optional(
             &connection,
             "SELECT proposal_id, campaign_id, kind, status, hypothesis,
                     source_experiment_id, argv_json, working_directory,
@@ -11649,7 +14017,7 @@ mod tests {
              FROM proposals WHERE proposal_id = ?1",
             [&fixture.authority.proposal_id],
         );
-        let submission = snapshot_sql_row(
+        let submission = snapshot_sql_row_optional(
             &connection,
             "SELECT submission_id, project_id, argv_json, created_at,
                     pueue_task_id, task_signature, status, kind, metadata_json,
@@ -11657,7 +14025,7 @@ mod tests {
              FROM submissions WHERE submission_id = ?1",
             [&fixture.authority.submission_id],
         );
-        let experiment = snapshot_sql_row(
+        let experiment = snapshot_sql_row_optional(
             &connection,
             "SELECT experiment_id, campaign_id, proposal_id, submission_id,
                     parent_experiment_id, attempt, status, pueue_task_id,
@@ -11667,7 +14035,7 @@ mod tests {
              FROM experiments WHERE experiment_id = ?1",
             [&fixture.authority.successor_experiment_id],
         );
-        let reservation = snapshot_sql_row(
+        let reservation = snapshot_sql_row_optional(
             &connection,
             "SELECT reservation_id, campaign_id, experiment_id, dimension,
                     subject_key, status, window_started_at, window_ends_at,
@@ -11676,7 +14044,7 @@ mod tests {
              WHERE experiment_id = ?1 AND dimension = 'experiment'",
             [&fixture.authority.successor_experiment_id],
         );
-        let termination = snapshot_sql_row(
+        let termination = snapshot_sql_row_optional(
             &connection,
             "SELECT request_id, incident_id, project_id, task_signature, reason,
                     status, requested_at, dispatch_lease_until, grace_until,
@@ -11747,10 +14115,7 @@ mod tests {
         Ok(())
     }
 
-    fn insert_foreign_campaign(
-        fixture: &CheckpointDispatchFixture,
-        connection: &Connection,
-    ) {
+    fn insert_foreign_campaign(fixture: &CheckpointDispatchFixture, connection: &Connection) {
         let project_id = "checkpoint-foreign-project";
         let campaign_id = "checkpoint-foreign-campaign";
         connection
@@ -11868,12 +14233,12 @@ mod tests {
         let selected = select_checkpoint_support(&support, &fixture.request)
             .expect("fixture candidate selection");
         assert_eq!(selected.candidate.reference, fixture.candidate_reference);
-        assert!(selected.candidate.reference.starts_with(
-            "checkpoint:source-authority-experiment:1:"
-        ));
-        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
-            &fixture.checkpoint,
-        )
+        assert!(selected
+            .candidate
+            .reference
+            .starts_with("checkpoint:source-authority-experiment:1:"));
+        let encoded =
+            crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint)
         .expect("fixture prepared checkpoint serialization");
         assert_eq!(
             crate::research_checkpoint::parse_prepared_checkpoint(&encoded)
@@ -13161,9 +15526,9 @@ mod tests {
         assert_eq!(after.reservation, before.reservation);
         assert_eq!(after.termination, before.termination);
         assert_eq!(after.resource_counts, before.resource_counts);
-        assert_eq!(after.review[0], rusqlite::types::Value::Text("blocked".to_owned()));
-        assert_eq!(after.review[3], before.review[3]);
-        assert_eq!(after.review[5], before.review[5]);
+        assert_eq!(after.review[5], rusqlite::types::Value::Text("blocked".to_owned()));
+        assert_eq!(after.review[20], before.review[20]);
+        assert_eq!(after.review[12], before.review[12]);
 
         let fixture = checkpoint_dispatch_fixture();
         let authority = match ResearchRepository::new(&fixture.fixture.db)
@@ -13659,7 +16024,15 @@ mod tests {
                   AND reservation.dimension = 'experiment'
                  WHERE review.review_id = ?1",
                 [&fixture.review_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .expect("checkpoint successor final graph");
         assert_eq!(final_state.0, "blocked");
@@ -13688,8 +16061,15 @@ mod tests {
             )
             .expect("checkpoint pre-add failure");
         let settled = checkpoint_graph_snapshot(&prepared);
-        let final_state: (String, String, String, String, String, Option<i64>, Option<String>) =
-            fixture
+        let final_state: (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+        ) = fixture
                 .db
                 .connect()
                 .expect("checkpoint pre-add settled connection")
@@ -14045,10 +16425,7 @@ mod tests {
         assert!(failures.is_empty(), "stale authority matrix failures: {failures:?}");
     }
 
-    fn checkpoint_ownership_case<F>(
-        label: &str,
-        mutate: F,
-    ) -> Result<(), String>
+    fn checkpoint_ownership_case<F>(label: &str, mutate: F) -> Result<(), String>
     where
         F: FnOnce(&CheckpointDispatchFixture, &Connection),
     {
@@ -14166,10 +16543,7 @@ mod tests {
         let mut owner = fixture.expected.owner.clone();
         owner.operation_stage = Some("stop_confirmed".to_owned());
         owner.termination_request_id = Some(request.request_id);
-        CheckpointAdmissionFixture {
-            fixture,
-            owner,
-        }
+        CheckpointAdmissionFixture { fixture, owner }
     }
 
     fn call_checkpoint_admission(
@@ -14337,10 +16711,7 @@ mod tests {
         )
     }
 
-    fn insert_successor_id_collision(
-        prepared: &CheckpointAdmissionFixture,
-        kind: &str,
-    ) {
+    fn insert_successor_id_collision(prepared: &CheckpointAdmissionFixture, kind: &str) {
         let ids = &prepared.fixture.checkpoint.successor_ids;
         let connection = prepared
             .fixture
@@ -14738,11 +17109,8 @@ mod tests {
                             [&prepared.fixture.review_id],
                         )
                         .unwrap();
-                },
-            ),
-            (
-                "missing experiment failure code",
-                |prepared, connection| {
+            }),
+            ("missing experiment failure code", |prepared, connection| {
                     connection
                         .execute(
                             "UPDATE experiments SET failure_code = NULL
@@ -14750,11 +17118,8 @@ mod tests {
                             [&prepared.authority.successor_experiment_id],
                         )
                         .unwrap();
-                },
-            ),
-            (
-                "task identity",
-                |prepared, connection| {
+            }),
+            ("task identity", |prepared, connection| {
                     connection
                         .execute(
                             "UPDATE experiments
@@ -14763,11 +17128,8 @@ mod tests {
                             [&prepared.authority.successor_experiment_id],
                         )
                         .unwrap();
-                },
-            ),
-            (
-                "submission phase",
-                |prepared, connection| {
+            }),
+            ("submission phase", |prepared, connection| {
                     connection
                         .execute(
                             "UPDATE submissions
@@ -14777,11 +17139,8 @@ mod tests {
                             [&prepared.authority.submission_id],
                         )
                         .unwrap();
-                },
-            ),
-            (
-                "reservation phase",
-                |prepared, connection| {
+            }),
+            ("reservation phase", |prepared, connection| {
                     connection
                         .execute(
                             "UPDATE budget_reservations SET status = 'reserved'
@@ -14789,11 +17148,8 @@ mod tests {
                             [&prepared.authority.successor_experiment_id],
                         )
                         .unwrap();
-                },
-            ),
-            (
-                "review stage",
-                |prepared, connection| {
+            }),
+            ("review stage", |prepared, connection| {
                     connection
                         .execute(
                             "UPDATE research_reviews SET operation_stage = 'successor_reserved'
@@ -14801,12 +17157,17 @@ mod tests {
                             [&prepared.fixture.review_id],
                         )
                         .unwrap();
-                },
-            ),
+            }),
         ];
         let bases: Vec<(&str, fn() -> CheckpointDispatchFixture)> = vec![
-            ("completed task-backed failed", completed_task_failed_checkpoint_fixture),
-            ("completed known pre-add failed", completed_pre_add_checkpoint_fixture),
+            (
+                "completed task-backed failed",
+                completed_task_failed_checkpoint_fixture,
+            ),
+            (
+                "completed known pre-add failed",
+                completed_pre_add_checkpoint_fixture,
+            ),
         ];
         let mut failures: Vec<(String, String)> = Vec::new();
         for (base_label, make_fixture) in bases {
@@ -14830,10 +17191,7 @@ mod tests {
                         format!("{base_label}/{mutation_label}"),
                         format!("expected recovery Open: {other:?}"),
                     )),
-                    Err(error) => failures.push((
-                        format!("{base_label}/{mutation_label}"),
-                        error,
-                    )),
+                    Err(error) => failures.push((format!("{base_label}/{mutation_label}"), error)),
                 }
             }
         }
@@ -14949,10 +17307,7 @@ mod tests {
             .unwrap();
     }
 
-    fn mutate_pre_add_tasks_added(
-        prepared: &CheckpointDispatchFixture,
-        connection: &Connection,
-    ) {
+    fn mutate_pre_add_tasks_added(prepared: &CheckpointDispatchFixture, connection: &Connection) {
         connection
             .execute(
                 "UPDATE submissions
@@ -15212,10 +17567,7 @@ mod tests {
 
     #[test]
     fn checkpoint_ownership_phase_mutations_require_recovery_open() {
-        let cases: Vec<(
-            &str,
-            fn(&CheckpointDispatchFixture, &Connection),
-        )> = vec![
+        let cases: Vec<(&str, fn(&CheckpointDispatchFixture, &Connection))> = vec![
             (
                 "accepted without task",
                 |prepared: &CheckpointDispatchFixture, connection: &Connection| {
@@ -15296,13 +17648,8 @@ mod tests {
 
     #[test]
     fn checkpoint_pre_add_failure_rejects_post_add_and_unreconciled_without_writes() {
-        let cases: Vec<(
-            &str,
-            fn(&CheckpointDispatchFixture, &Connection),
-        )> = vec![
-            (
-                "post-add accepted",
-                |prepared, connection| {
+        let cases: Vec<(&str, fn(&CheckpointDispatchFixture, &Connection))> = vec![
+            ("post-add accepted", |prepared, connection| {
                     connection
                         .execute(
                             "UPDATE submissions SET status = 'accepted', pueue_task_id = 99,
@@ -15327,11 +17674,8 @@ mod tests {
                             [&prepared.authority.successor_experiment_id],
                         )
                         .unwrap();
-                },
-            ),
-            (
-                "unreconciled",
-                |prepared, connection| {
+            }),
+            ("unreconciled", |prepared, connection| {
                     connection
                         .execute(
                             "UPDATE submissions SET status = 'unreconciled'
@@ -15354,8 +17698,7 @@ mod tests {
                             [&prepared.authority.successor_experiment_id],
                         )
                         .unwrap();
-                },
-            ),
+            }),
         ];
         let failures: Vec<_> = cases
             .into_iter()
@@ -15538,7 +17881,7 @@ mod tests {
         assert_eq!(after.reservation, mutated.reservation);
         assert_eq!(after.termination, mutated.termination);
         assert_eq!(after.resource_counts, mutated.resource_counts);
-        assert_eq!(after.review[0], rusqlite::types::Value::Text("blocked".to_owned()));
+        assert_eq!(after.review[5], rusqlite::types::Value::Text("blocked".to_owned()));
     }
 
     #[test]
@@ -15878,8 +18221,7 @@ mod tests {
                 candidates_complete: false,
                 candidates_omitted_at_least: 0,
                 candidate_limit: crate::research_checkpoint::MAX_CHECKPOINT_CANDIDATES,
-            },
-        )
+            })
         .expect("unavailable source support JSON");
         let context_json = context.to_string();
         let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
@@ -15924,6 +18266,55 @@ mod tests {
                 panic!("unavailable source was treated as supported")
             }
         }
+    }
+
+    #[test]
+    fn preparation_unsupported_constructor_rechecks_reason_and_request() {
+        let fixture = source_authority_fixture();
+        let connection = fixture
+            .db
+            .connect()
+            .expect("preparation unsupported race connection");
+        connection
+            .execute(
+                "UPDATE experiments SET resume_of_experiment_id = ?1
+                 WHERE experiment_id = ?1",
+                [&fixture.experiment_id],
+            )
+            .expect("preparation unsupported source mutation");
+        let mut connection = connection;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("preparation unsupported race transaction");
+
+        let changed_reason = checkpoint_unsupported_after_preparation_in_transaction(
+            &transaction,
+            &fixture.expected,
+            &fixture.request,
+            "preparation reported a different bounded reason",
+        )
+        .expect("different unsupported reason check");
+        assert!(changed_reason.is_none());
+
+        let unchanged_reason = checkpoint_unsupported_after_preparation_in_transaction(
+            &transaction,
+            &fixture.expected,
+            &fixture.request,
+            "prior checkpoint sources require a durable checkpoint authority",
+        )
+        .expect("unchanged unsupported reason check");
+        assert!(unchanged_reason.is_some());
+
+        let mut changed_request = fixture.request.clone();
+        changed_request.path.push_str(".changed");
+        let changed_request_result = checkpoint_unsupported_after_preparation_in_transaction(
+            &transaction,
+            &fixture.expected,
+            &changed_request,
+            "prior checkpoint sources require a durable checkpoint authority",
+        );
+        assert!(changed_request_result.is_err());
+        transaction.rollback().expect("preparation unsupported rollback");
     }
 
     #[test]
@@ -16115,10 +18506,8 @@ mod tests {
     #[test]
     fn source_authority_historical_reader_uses_stored_strict_checkpoint_and_ordinal_one() {
         let fixture = source_authority_fixture();
-        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
-            &fixture.checkpoint,
-        )
-        .unwrap();
+        let encoded =
+            crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint).unwrap();
         store_historical_checkpoint(&fixture, &encoded);
 
         assert_eq!(stored_checkpoint_json(&fixture), encoded);
@@ -16142,10 +18531,8 @@ mod tests {
     #[test]
     fn source_authority_historical_reader_keeps_captured_running_source_after_closed_gates() {
         let fixture = source_authority_fixture();
-        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
-            &fixture.checkpoint,
-        )
-        .unwrap();
+        let encoded =
+            crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint).unwrap();
         store_historical_checkpoint(&fixture, &encoded);
 
         let terminal_task = PueueTask {
@@ -16223,10 +18610,8 @@ mod tests {
     #[test]
     fn source_authority_historical_reader_rejects_immutable_mutations_and_invalid_stored_checkpoint() {
         let fixture = source_authority_fixture();
-        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
-            &fixture.checkpoint,
-        )
-        .unwrap();
+        let encoded =
+            crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint).unwrap();
         store_historical_checkpoint(&fixture, &encoded);
         let connection = fixture.db.connect().unwrap();
         let changed_argv = serde_json::to_string(&vec!["python", "changed.py"]).unwrap();
@@ -16240,10 +18625,8 @@ mod tests {
         assert!(read_historical_checkpoint(&fixture, &fixture.checkpoint).is_err());
 
         let fixture = source_authority_fixture();
-        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
-            &fixture.checkpoint,
-        )
-        .unwrap();
+        let encoded =
+            crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint).unwrap();
         store_historical_checkpoint(&fixture, &encoded);
         let connection = fixture.db.connect().unwrap();
         connection
@@ -16298,10 +18681,8 @@ mod tests {
         assert!(read_historical_checkpoint(&fixture, &fixture.checkpoint).is_err());
 
         let fixture = source_authority_fixture();
-        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
-            &fixture.checkpoint,
-        )
-        .unwrap();
+        let encoded =
+            crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint).unwrap();
         store_historical_checkpoint(&fixture, &encoded);
         let mut supplied = fixture.checkpoint.clone();
         supplied.response_digest = "b".repeat(64);
@@ -16318,10 +18699,8 @@ mod tests {
     #[test]
     fn source_authority_historical_reader_accepts_whitespace_checkpoint_without_rewriting_bytes() {
         let fixture = source_authority_fixture();
-        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
-            &fixture.checkpoint,
-        )
-        .unwrap();
+        let encoded =
+            crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint).unwrap();
         let whitespace_encoded = format!(" \n\t{encoded}\n");
         store_historical_checkpoint(&fixture, &whitespace_encoded);
         assert_eq!(stored_checkpoint_json(&fixture), whitespace_encoded);
@@ -16334,10 +18713,8 @@ mod tests {
     #[test]
     fn source_authority_historical_reader_rejects_nested_cwd_record_mutation_after_codec_roundtrip() {
         let fixture = source_authority_nested_fixture();
-        let baseline_encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
-            &fixture.checkpoint,
-        )
-        .unwrap();
+        let baseline_encoded =
+            crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint).unwrap();
         assert_eq!(
             crate::research_checkpoint::parse_prepared_checkpoint(&baseline_encoded).unwrap(),
             fixture.checkpoint

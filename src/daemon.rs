@@ -30,7 +30,7 @@ use crate::{
     periodic::PeriodicDeepCheckScheduler,
     process::{startup_process_quiescence, StartupProcessQuiescence},
     reconcile::{ReconcileReport, Reconciler},
-    research_actions::advance_research_actions,
+    research_actions::{advance_research_actions, cleanup_research_checkpoints},
     research::{recover_research, run_due_research_with_cleanup_blocked_projects},
     retry::RetryPolicy,
     scheduler::{Scheduler, SchedulerConfig, SchedulerReport},
@@ -298,6 +298,13 @@ where
             .run_health_diagnoses(now, &health_blocked_projects)
             .await?;
         report.termination_outcomes = self.run_termination().await?;
+        let _research_checkpoint_cleanups = cleanup_research_checkpoints(
+            &self.db,
+            &self.pueue,
+            self.policy.as_ref(),
+            now,
+            self.config.claim_limit,
+        )?;
         report.scheduled_deep_checks = PeriodicDeepCheckScheduler::new(&self.db, now)
             .schedule(&reconciliation.observed_tasks)?;
 

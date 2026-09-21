@@ -30,6 +30,8 @@ pub(crate) use research::{
     bind_research_termination_intent_in_transaction, complete_research_continue_in_transaction,
     bind_checkpoint_termination_intent_in_transaction,
     block_checkpoint_orphan_in_transaction, block_invalid_checkpoint_review_in_transaction,
+    checkpoint_review_claim_in_transaction, CheckpointReviewClaim,
+    checkpoint_review_in_transaction,
     checkpoint_source_authority_for_preparation, CheckpointSourceAuthority,
     CheckpointSourceAuthorityRead,
     prepared_checkpoint_source_authority_in_connection,
@@ -37,6 +39,8 @@ pub(crate) use research::{
     CheckpointSuccessorPreflight, checkpoint_successor_preflight_in_transaction,
     checkpoint_retry_admission_available_for_campaign,
     checkpoint_retry_admission_count,
+    checkpoint_unsupported_after_preparation_in_transaction,
+    complete_checkpoint_unsupported_in_transaction,
     completed_research_handoff_in_transaction,
     CheckpointJsonState, CheckpointSqliteStorageClass,
     discard_ready_research_action_in_transaction,
@@ -44,7 +48,9 @@ pub(crate) use research::{
     discard_undispatched_research_action_in_transaction,
     mark_research_stop_requested_if_sent,
     native_research_authority_immutable_matches, ready_research_action_in_transaction,
+    ready_research_action_selection_in_transaction,
     research_ownership_in_transaction, startup_research_owner_snapshot, ReadyResearchAction,
+    CheckpointCleanupAuthority, CheckpointUnsupportedReview, ReadyResearchActionSelection,
     CompletedResearchHandoff, ResearchOwnership, ResearchOwnershipSnapshot, StartupResearchOwner,
 };
 pub(crate) use campaigns::{

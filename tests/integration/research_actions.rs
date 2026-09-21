@@ -42,7 +42,6 @@ use pueue_agent::{
     AppError,
 };
 use serde_json::json;
-#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -558,6 +557,124 @@ fn main() {
             .execute(
                 "UPDATE research_reviews SET response_json = ?1 WHERE review_id = ?2",
                 rusqlite::params![answer.to_string(), review.review_id],
+            )
+            .unwrap();
+    }
+
+    fn set_invalid_checkpoint_action(&self, storage_expression: &str) {
+        let review = ResearchRepository::new(&self.db)
+            .recent(&self.campaign_id, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut answer: serde_json::Value =
+            serde_json::from_str(review.response_json.as_deref().unwrap()).unwrap();
+        answer["action"] = json!("resume_from_checkpoint");
+        answer["next_direction"] = serde_json::Value::Null;
+        answer["checkpoint"] = json!({
+            "path": "checkpoints/latest.pt",
+            "argv": ["python", "train.py", "--name", "experiment", "--checkpoint", "checkpoints/latest.pt"],
+            "working_directory": ".",
+            "support_evidence_refs": [format!("research:{}", review.review_id)],
+        });
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                &format!(
+                    "UPDATE research_reviews
+                     SET response_json = ?1, checkpoint_json = {storage_expression}
+                     WHERE review_id = ?2"
+                ),
+                rusqlite::params![answer.to_string(), review.review_id],
+            )
+            .unwrap();
+    }
+
+    fn set_unavailable_checkpoint_answer(&self) {
+        let review = ResearchRepository::new(&self.db)
+            .recent(&self.campaign_id, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let project_root = fs::canonicalize(self._temp.path().join("project-a")).unwrap();
+        let service_root = project_root.join(".pueue-agent");
+        let runtime_command = format!(
+            "/usr/bin/env PUEUE_AGENT_EXPERIMENT_ID={} PUEUE_AGENT_CAMPAIGN_ID={} PUEUE_AGENT_RESULT_PATH={} PUEUE_AGENT_ARTIFACT_DIR={} python train.py --name experiment",
+            self.experiment_id,
+            self.campaign_id,
+            service_root
+                .join("results")
+                .join(format!("{}.json", self.experiment_id))
+                .display(),
+            service_root
+                .join("artifacts")
+                .join(&self.experiment_id)
+                .display(),
+        );
+        let mut task = self.pueue.task(self.task_id);
+        task.command = runtime_command.clone();
+        let raw_signature = task_signature(&task);
+        let managed_signature = managed_task_run_signature(&task).unwrap();
+        self.set_task(task);
+        let mut context: serde_json::Value =
+            serde_json::from_str(review.context_json.as_deref().unwrap()).unwrap();
+        context["facts"]["review"]["task_signature"] = json!(managed_signature);
+        context["facts"]["target"]["task_signature"] = json!(managed_signature);
+        let context_json = context.to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let mut answer: serde_json::Value =
+            serde_json::from_str(review.response_json.as_deref().unwrap()).unwrap();
+        answer["context_digest"] = json!(context_digest);
+        answer["action"] = json!("resume_from_checkpoint");
+        answer["next_direction"] = serde_json::Value::Null;
+        answer["checkpoint"] = json!({
+            "path": "checkpoints/latest.pt",
+            "argv": ["python", "train.py", "--name", "experiment", "--checkpoint", "checkpoints/latest.pt"],
+            "working_directory": ".",
+            "support_evidence_refs": [format!("research:{}", review.review_id)],
+        });
+        let connection = self.db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE task_observations
+                 SET task_signature = ?1, command_json = ?2
+                 WHERE pueue_task_id = ?3",
+                rusqlite::params![
+                    raw_signature,
+                    serde_json::to_string(&vec![runtime_command]).unwrap(),
+                    self.task_id,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE experiments SET task_signature = ?1 WHERE experiment_id = ?2",
+                rusqlite::params![managed_signature, self.experiment_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE submissions SET task_signature = ?1
+                 WHERE pueue_task_id = ?2",
+                rusqlite::params![managed_signature, self.task_id],
+            )
+            .unwrap();
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews
+                 SET task_signature = ?1, context_json = ?2, context_digest = ?3,
+                     response_json = ?4
+                 WHERE review_id = ?5",
+                rusqlite::params![
+                    managed_signature,
+                    context_json,
+                    context_digest,
+                    answer.to_string(),
+                    review.review_id,
+                ],
             )
             .unwrap();
     }
@@ -1080,7 +1197,292 @@ async fn delayed_kill_exit_zero_does_not_create_successor_or_cycle() {
 }
 
 #[tokio::test]
-async fn owned_kill_timeout_keeps_research_owner_open_without_progression() {
+async fn unavailable_checkpoint_action_settles_as_review_only_completion() {
+    let harness = Harness::new().await;
+    harness.set_unavailable_checkpoint_answer();
+
+    let advanced = advance_research_actions(&harness.db, &harness.pueue, &harness.policy, 400, 1)
+        .await
+        .unwrap();
+    assert_eq!(advanced, 1);
+
+    let review = ResearchRepository::new(&harness.db)
+        .recent(&harness.campaign_id, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(review.state, "completed");
+    assert_eq!(review.operation_stage, None);
+    assert_eq!(review.termination_request_id, None);
+    assert_eq!(review.successor_experiment_id, None);
+    assert_eq!(harness.pueue.kill_calls(), Vec::<i64>::new());
+    assert!(harness.pueue.add_calls().is_empty());
+    let notes_json: String = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+            [&review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let notes: serde_json::Value = serde_json::from_str(&notes_json).unwrap();
+    assert_eq!(
+        notes["checkpoint_unsupported"],
+        "checkpoint support requires startup-pinned execution authority"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_action_reaches_confirmation_before_invalid_storage_block() {
+    let harness = Harness::new().await;
+    harness.set_answer_action("stop_and_next");
+    assert_eq!(
+        advance_research_actions(&harness.db, &harness.pueue, &harness.policy, 400, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let review = ResearchRepository::new(&harness.db)
+        .recent(&harness.campaign_id, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let request_id = review.termination_request_id.unwrap();
+    assert_eq!(review.operation_stage.as_deref(), Some("intent"));
+
+    harness.set_invalid_checkpoint_action("zeroblob(1)");
+    TerminationManager::new(&harness.db, harness.pueue.clone())
+        .execute(request_id)
+        .await
+        .unwrap();
+    let requested = ResearchRepository::new(&harness.db)
+        .find(&review.review_id)
+        .unwrap();
+    assert_eq!(requested.operation_stage.as_deref(), Some("stop_requested"));
+    assert_eq!(
+        TerminationRequestRepository::new(&harness.db)
+            .find_by_id(request_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        TerminationRequestStatus::Sent
+    );
+
+    let mut task = harness.pueue.task(harness.task_id);
+    task.state = "Killed".to_owned();
+    task.ended_at = Some("500".to_owned());
+    task.result = Some(json!({"Success": 0}));
+    harness.set_task(task);
+    Reconciler::new(&harness.db, harness.pueue.clone())
+        .with_campaign_limits(CampaignLimits::default())
+        .run_once_at(500)
+        .await
+        .unwrap();
+    assert_eq!(
+        TerminationRequestRepository::new(&harness.db)
+            .find_by_id(request_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        TerminationRequestStatus::Confirmed
+    );
+    let cycles_before = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM decision_cycles WHERE source_experiment_id = ?1",
+            [&harness.experiment_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        advance_research_actions(&harness.db, &harness.pueue, &harness.policy, 600, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let blocked = ResearchRepository::new(&harness.db)
+        .find(&review.review_id)
+        .unwrap();
+    assert_eq!(blocked.state, "blocked");
+    assert_eq!(blocked.operation_stage, Some("stop_confirmed".to_owned()));
+    let failure_code: Option<String> = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT failure_code FROM research_reviews WHERE review_id = ?1",
+            [&review.review_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        failure_code.as_deref(),
+        Some("research_checkpoint_authority_corrupt")
+    );
+    let connection = harness.db.connect().unwrap();
+    let cycles: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM decision_cycles WHERE source_experiment_id = ?1",
+            [&harness.experiment_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cycles, cycles_before);
+}
+
+#[tokio::test]
+    async fn null_checkpoint_resume_action_is_not_generic_stop_cycle() {
+        let harness = Harness::new().await;
+        harness.set_answer_action("stop_and_next");
+    assert_eq!(
+        advance_research_actions(&harness.db, &harness.pueue, &harness.policy, 400, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let review = ResearchRepository::new(&harness.db)
+        .recent(&harness.campaign_id, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let request_id = review.termination_request_id.unwrap();
+    assert_eq!(review.operation_stage.as_deref(), Some("intent"));
+    harness.set_invalid_checkpoint_action("NULL");
+    TerminationManager::new(&harness.db, harness.pueue.clone())
+        .execute(request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .find(&review.review_id)
+            .unwrap()
+            .operation_stage
+            .as_deref(),
+        Some("stop_requested")
+    );
+    let mut task = harness.pueue.task(harness.task_id);
+    task.state = "Killed".to_owned();
+    task.ended_at = Some("500".to_owned());
+    task.result = Some(json!({"Success": 0}));
+    harness.set_task(task);
+    Reconciler::new(&harness.db, harness.pueue.clone())
+        .with_campaign_limits(CampaignLimits::default())
+        .run_once_at(500)
+        .await
+        .unwrap();
+    let cycles_before = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM decision_cycles WHERE source_experiment_id = ?1",
+            [&harness.experiment_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(
+        advance_research_actions(&harness.db, &harness.pueue, &harness.policy, 600, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let blocked = ResearchRepository::new(&harness.db)
+        .find(&review.review_id)
+        .unwrap();
+    assert_eq!(blocked.state, "blocked");
+    let cycles_after = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM decision_cycles WHERE source_experiment_id = ?1",
+            [&harness.experiment_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+        assert_eq!(cycles_after, cycles_before);
+    }
+
+    #[tokio::test]
+    async fn null_checkpoint_malformed_answer_fails_closed_without_generic_cycle() {
+        let harness = Harness::new().await;
+        assert_eq!(
+            advance_research_actions(&harness.db, &harness.pueue, &harness.policy, 400, 1)
+                .await
+                .unwrap(),
+            1
+        );
+        let review = ResearchRepository::new(&harness.db)
+            .recent(&harness.campaign_id, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let request_id = review.termination_request_id.unwrap();
+        TerminationManager::new(&harness.db, harness.pueue.clone())
+            .execute(request_id)
+            .await
+            .unwrap();
+        let mut task = harness.pueue.task(harness.task_id);
+        task.state = "Killed".to_owned();
+        task.ended_at = Some("500".to_owned());
+        task.result = Some(json!({"Success": 0}));
+        harness.set_task(task);
+        Reconciler::new(&harness.db, harness.pueue.clone())
+            .with_campaign_limits(CampaignLimits::default())
+            .run_once_at(500)
+            .await
+            .unwrap();
+        harness
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE research_reviews SET response_json = ?1 WHERE review_id = ?2",
+                rusqlite::params!["{malformed", review.review_id],
+            )
+            .unwrap();
+        let cycles_before = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM decision_cycles WHERE source_experiment_id = ?1",
+                [&harness.experiment_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            advance_research_actions(&harness.db, &harness.pueue, &harness.policy, 600, 1)
+                .await
+                .unwrap(),
+            0
+        );
+        let current = ResearchRepository::new(&harness.db)
+            .find(&review.review_id)
+            .unwrap();
+        assert_eq!(current.state, "ready");
+        assert_eq!(current.operation_stage.as_deref(), Some("stop_confirmed"));
+        let cycles_after = harness
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM decision_cycles WHERE source_experiment_id = ?1",
+                [&harness.experiment_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(cycles_after, cycles_before);
+    }
+
+    #[tokio::test]
+    async fn owned_kill_timeout_keeps_research_owner_open_without_progression() {
     let harness = Harness::new().await;
     assert_eq!(
         advance_research_actions(&harness.db, &harness.pueue, &harness.policy, 400, 1)
