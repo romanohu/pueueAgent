@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    path::Path,
+};
 
 use rusqlite::{params, types::Type, Row, Transaction};
 use serde_json::{json, Value};
@@ -11,15 +14,33 @@ use crate::{
         TaskObservationRepository,
     },
     decision_evidence::{MAX_ARTIFACT_HINT_DEPTH, MAX_ARTIFACT_HINT_FIELD_BYTES},
-    environment::collect_decision_artifact_hints,
-    execution_policy::ProjectRootAnchor,
+    environment::{
+        campaign_experiment_runtime_argv, collect_decision_artifact_hints,
+        discover_research_checkpoint_files,
+        open_verified_research_file, read_verified_research_file,
+        record_verified_research_directory, validate_research_id,
+    },
+    execution_policy::{
+        PolicyViolation, PolicyViolationCode, PolicyViolationDetail, ProjectRootAnchor,
+        ResolvedExecutionPolicy, ResolvedProjectExecutionPolicy, TempUnsafeReason,
+    },
     health::read_task_tail,
     models::{
-        Experiment, ExperimentMetricsRow, ExperimentStatus, SubmissionStatus, TaskObservation,
+        Campaign, Experiment, ExperimentMetricsRow, ExperimentStatus, Proposal, ProposalKind,
+        ProposalStatus, Project, Submission, SubmissionKind, SubmissionStatus, TaskObservation,
     },
-    output::{bounded_redacted_text, redact_sensitive_text},
+    output::{bounded_redacted_text, permits_lossless_evidence_text, redact_sensitive_text},
+    proposals::{self, ProposalInput},
     project_logs::{inspect_agent_log_dir, ProjectRootLogReader},
-    reconcile::managed_task_run_signature_for_observation,
+    reconcile::{
+        managed_task_run_signature_for_observation, try_canonical_command_display_os,
+    },
+    research_checkpoint::{
+        checkpoint_candidate_argv_path, checkpoint_source_layout,
+        CheckpointCandidateEvidenceV1, CheckpointLoaderEvidenceV1, CheckpointLoaderRole,
+        CheckpointSupportEvidenceV1, CHECKPOINT_SUPPORT_VERSION, MAX_CHECKPOINT_CANDIDATES,
+        MAX_CHECKPOINT_SOURCE_BYTES,
+    },
     AppError,
 };
 
@@ -40,10 +61,42 @@ pub struct ResearchEvidence {
     pub digest: String,
 }
 
+struct CheckpointAuthority<'a> {
+    policy: &'a ResolvedExecutionPolicy,
+    project_policy: &'a ResolvedProjectExecutionPolicy,
+}
+
 pub fn build_research_evidence(
     db: &Db,
     review: &crate::db::ResearchReview,
     now: i64,
+) -> Result<ResearchEvidence, AppError> {
+    build_research_evidence_inner(db, review, now, None)
+}
+
+pub(crate) fn build_research_evidence_with_policy(
+    db: &Db,
+    review: &crate::db::ResearchReview,
+    now: i64,
+    policy: &ResolvedExecutionPolicy,
+    project_policy: &ResolvedProjectExecutionPolicy,
+) -> Result<ResearchEvidence, AppError> {
+    build_research_evidence_inner(
+        db,
+        review,
+        now,
+        Some(CheckpointAuthority {
+            policy,
+            project_policy,
+        }),
+    )
+}
+
+fn build_research_evidence_inner(
+    db: &Db,
+    review: &crate::db::ResearchReview,
+    now: i64,
+    checkpoint_authority: Option<CheckpointAuthority<'_>>,
 ) -> Result<ResearchEvidence, AppError> {
     let persisted_review = ResearchRepository::new(db).find(&review.review_id)?;
     if persisted_review != *review {
@@ -101,6 +154,9 @@ pub fn build_research_evidence(
         ));
     }
 
+    let target_proposal = ProposalRepository::new(db)
+        .find_for_campaign(&campaign.campaign_id, &target.proposal_id)?
+        .ok_or_else(|| validation_error("proposal_id", "does not identify the target proposal"))?;
     let observation = current_managed_running_observation(
         db,
         &project.project_id,
@@ -109,7 +165,26 @@ pub fn build_research_evidence(
         &review.task_signature,
     )?;
 
-    let root_anchor = ProjectRootAnchor::resolve(&project.root_path)?;
+    let checkpoint_support = match checkpoint_authority.as_ref() {
+        Some(authority) => build_checkpoint_support(
+            db,
+            &campaign,
+            &project,
+            &target,
+            &target_proposal,
+            &submission,
+            &observation,
+            authority,
+        )?,
+        None => unavailable_checkpoint_support(
+            "checkpoint support requires startup-pinned execution authority",
+        ),
+    };
+
+    let root_anchor = match checkpoint_authority.as_ref() {
+        Some(authority) => authority.project_policy.root_anchor.clone(),
+        None => ProjectRootAnchor::resolve(&project.root_path)?,
+    };
     if root_anchor.canonical_path != project.root_path {
         return Err(validation_error(
             "project.root_path",
@@ -131,9 +206,6 @@ pub fn build_research_evidence(
         &project.project_id,
         &project.pueue_group,
     )?;
-    let target_proposal = ProposalRepository::new(db)
-        .find_for_campaign(&campaign.campaign_id, &target.proposal_id)?
-        .ok_or_else(|| validation_error("proposal_id", "does not identify the target proposal"))?;
     let target_metric = MetricsRepository::get(db, &target.experiment_id)?;
     let (recent_experiments, result_total) = ExperimentRepository::new(db)
         .list_terminal_for_campaign_with_total(&campaign.campaign_id, MAX_RESEARCH_RESULTS)?;
@@ -214,6 +286,12 @@ pub fn build_research_evidence(
             })
         })
         .collect::<Vec<_>>();
+    let checkpoint_support_value = serde_json::to_value(&checkpoint_support).map_err(|source| {
+        AppError::Serialization {
+            operation: "serialize checkpoint support evidence",
+            source,
+        }
+    })?;
     let mut omissions = BTreeMap::from([
         ("log_tail".to_owned(), 0),
         ("recent_results".to_owned(), results_omitted),
@@ -245,6 +323,7 @@ pub fn build_research_evidence(
                 "max_depth": MAX_ARTIFACT_HINT_DEPTH,
                 "max_field_bytes": MAX_ARTIFACT_HINT_FIELD_BYTES,
             },
+            "checkpoint_support": checkpoint_support_value,
             "omissions": omissions,
         }
     });
@@ -273,6 +352,18 @@ pub fn build_research_evidence(
         } else if !context["operations"]["log_tail"].is_null() {
             context["operations"]["log_tail"] = Value::Null;
             increment_omission(&mut omissions, "log_tail");
+        } else if pop_checkpoint_candidate(&mut context) {
+            increment_omission(&mut omissions, "checkpoint_candidates");
+        } else if checkpoint_support_is_available(&context) {
+            context["operations"]["checkpoint_support"] = serde_json::to_value(
+                unavailable_checkpoint_support(
+                    "checkpoint support does not fit the serialized evidence limit",
+                ),
+            )
+            .map_err(|source| AppError::Serialization {
+                operation: "serialize unavailable checkpoint support evidence",
+                source,
+            })?;
         } else {
             return Err(validation_error(
                 "research.context",
@@ -284,6 +375,390 @@ pub fn build_research_evidence(
     let digest = format!("{:x}", Sha256::digest(&bytes));
     let json = String::from_utf8(bytes).expect("serde_json emits UTF-8");
     Ok(ResearchEvidence { json, digest })
+}
+
+fn build_checkpoint_support(
+    db: &Db,
+    campaign: &Campaign,
+    project: &Project,
+    target: &Experiment,
+    proposal: &Proposal,
+    submission: &Submission,
+    observation: &TaskObservation,
+    authority: &CheckpointAuthority<'_>,
+) -> Result<CheckpointSupportEvidenceV1, AppError> {
+    if authority.project_policy.project_id != project.project_id
+        || authority.project_policy.root_anchor.canonical_path != project.root_path
+    {
+        return Err(validation_error(
+            "project_policy",
+            "does not prove the selected project root",
+        ));
+    }
+    let registered_root = authority
+        .policy
+        .project_root_anchor(&project.root_path)
+        .map_err(AppError::from)?;
+    if registered_root != authority.project_policy.root_anchor {
+        return Err(validation_error(
+            "project_policy.root_anchor",
+            "does not match the startup-registered project root",
+        ));
+    }
+
+    if proposal.status != ProposalStatus::Accepted {
+        return Err(validation_error(
+            "proposal_id",
+            "does not identify an accepted proposal",
+        ));
+    }
+    let validated = proposals::validate(
+        ProposalInput {
+            kind: proposal.kind,
+            hypothesis: proposal.hypothesis.clone(),
+            source_experiment_id: proposal.source_experiment_id.clone(),
+            argv: proposal.argv.clone(),
+            working_directory: proposal.working_directory.clone(),
+            expected_evidence: proposal.expected_evidence.clone(),
+        },
+        &campaign.objective_digest,
+    )?;
+    if validated.canonical_digest() != proposal.canonical_digest
+        || validated.kind() != proposal.kind
+        || validated.hypothesis() != proposal.hypothesis
+        || validated.source_experiment_id() != proposal.source_experiment_id.as_deref()
+        || validated.argv() != proposal.argv.as_slice()
+        || validated.working_directory() != proposal.working_directory
+        || validated.expected_evidence() != proposal.expected_evidence.as_slice()
+    {
+        return Err(validation_error(
+            "proposal.canonical_digest",
+            "does not match the durable proposal fields",
+        ));
+    }
+
+    if submission.kind != SubmissionKind::Experiment
+        || submission.project_id != project.project_id
+        || submission.status != SubmissionStatus::Accepted
+        || submission.pueue_task_id != target.pueue_task_id
+        || submission.task_signature != target.task_signature
+        || submission.argv != proposal.argv
+    {
+        return Err(validation_error(
+            "submission_id",
+            "does not prove the selected experiment submission",
+        ));
+    }
+    require_submission_metadata_id(
+        &submission.metadata,
+        "campaign_id",
+        &campaign.campaign_id,
+    )?;
+    require_submission_metadata_id(
+        &submission.metadata,
+        "proposal_id",
+        &proposal.proposal_id,
+    )?;
+    require_submission_metadata_id(
+        &submission.metadata,
+        "experiment_id",
+        &target.experiment_id,
+    )?;
+
+    validate_research_id(&target.experiment_id).map_err(AppError::from)?;
+    validate_research_id(&proposal.proposal_id).map_err(AppError::from)?;
+    validate_research_id(&submission.submission_id).map_err(AppError::from)?;
+
+    if target.code_change_run_id.is_some()
+        || target.code_revision_sha.is_some()
+        || proposal.kind == ProposalKind::CodeChange
+    {
+        return Ok(unavailable_checkpoint_support(
+            "code-change experiments have no ordinary trainer support",
+        ));
+    }
+    if has_prior_checkpoint_source(&proposal.argv)
+        || target_has_prior_checkpoint_lineage(db, target)?
+    {
+        return Ok(unavailable_checkpoint_support(
+            "prior checkpoint sources require a durable checkpoint authority",
+        ));
+    }
+
+    let runtime_argv = campaign_experiment_runtime_argv(
+        &project.root_path,
+        &campaign.campaign_id,
+        &target.experiment_id,
+        &proposal.argv,
+    );
+    let expected_command = try_canonical_command_display_os(&runtime_argv)?;
+    if observation.command.len() != 1 || observation.command[0] != expected_command {
+        return Err(validation_error(
+            "task_observation.command",
+            "does not match the selected experiment runtime command",
+        ));
+    }
+
+    let layout = match checkpoint_source_layout(&proposal.argv, validated.working_directory()) {
+        Ok(layout) => layout,
+        Err(_) => {
+            return Ok(unavailable_checkpoint_support(
+                "trainer source command shape is unsupported",
+            ));
+        }
+    };
+
+    let working_directory_record = match record_verified_research_directory(
+        authority.policy,
+        &authority.project_policy.root_anchor,
+        Path::new(&layout.normalized_working_directory),
+    ) {
+        Ok(record) => record,
+        Err(violation) => {
+            return map_checkpoint_policy_violation(
+                violation,
+                "trainer working directory is unavailable",
+            );
+        }
+    };
+    let source = match open_verified_research_file(
+        authority.policy,
+        &authority.project_policy.root_anchor,
+        Path::new(&layout.entrypoint_root_relative_path),
+        MAX_CHECKPOINT_SOURCE_BYTES as u64,
+    ) {
+        Ok(source) => source,
+        Err(violation) => {
+            return map_checkpoint_policy_violation(
+                violation,
+                "trainer source file is unavailable",
+            );
+        }
+    };
+    let source_record = source.record().clone();
+    if source_record.relative_path != layout.entrypoint_root_relative_path {
+        return Err(validation_error(
+            "checkpoint_support.loader",
+            "source record path does not match the command entrypoint",
+        ));
+    }
+    let source_bytes = match read_verified_research_file(&source, MAX_CHECKPOINT_SOURCE_BYTES as u64)
+    {
+        Ok(bytes) => bytes,
+        Err(violation) => {
+            return map_checkpoint_policy_violation(
+                violation,
+                "trainer source file is unavailable",
+            );
+        }
+    };
+    if source_bytes.len() > MAX_CHECKPOINT_SOURCE_BYTES
+        || source_bytes.len() as u64 != source_record.logical_bytes
+    {
+        return Ok(unavailable_checkpoint_support(
+            "trainer source file exceeds the complete-source bound",
+        ));
+    }
+    let source_content = match String::from_utf8(source_bytes) {
+        Ok(content) if permits_lossless_evidence_text(&content) => content,
+        Ok(_) => {
+            return Ok(unavailable_checkpoint_support(
+                "trainer source contains unsupported control text",
+            ));
+        }
+        Err(_) => {
+            return Ok(unavailable_checkpoint_support(
+                "trainer source is not complete UTF-8",
+            ));
+        }
+    };
+
+    let discovery = match discover_research_checkpoint_files(
+        authority.policy,
+        &authority.project_policy.root_anchor,
+        &target.experiment_id,
+    ) {
+        Ok(discovery) => discovery,
+        Err(violation) => {
+            return map_checkpoint_discovery_policy_violation(
+                violation,
+                "checkpoint candidate discovery is unavailable",
+            );
+        }
+    };
+    let mut records = discovery.records;
+    records.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let mut omitted_at_least = discovery.omitted_at_least;
+    let mut candidates = Vec::with_capacity(records.len());
+    for record in records {
+        let Some(argv_path) = checkpoint_candidate_argv_path(
+            &layout.normalized_working_directory,
+            &record.relative_path,
+        ) else {
+            omitted_at_least = omitted_at_least.saturating_add(1);
+            continue;
+        };
+        candidates.push((record, argv_path));
+    }
+    if candidates.is_empty() {
+        return Ok(unavailable_checkpoint_support(
+            "no checkpoint candidate is representable from the trainer cwd",
+        ));
+    }
+    if candidates.len() > MAX_CHECKPOINT_CANDIDATES {
+        return Err(validation_error(
+            "checkpoint_support.candidates",
+            "filesystem discovery exceeded the fixed candidate limit",
+        ));
+    }
+
+    let checkpoint_candidates = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, (file, argv_path))| CheckpointCandidateEvidenceV1 {
+            reference: format!(
+                "checkpoint:{}:{}:{}",
+                target.experiment_id, ordinal, file.sha256
+            ),
+            source_experiment_id: target.experiment_id.clone(),
+            argv_path,
+            root_relative_path: file.relative_path.clone(),
+            length: file.logical_bytes,
+            sha256: file.sha256.clone(),
+            file,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(CheckpointSupportEvidenceV1::Available {
+        support_version: CHECKPOINT_SUPPORT_VERSION,
+        source_experiment_id: target.experiment_id.clone(),
+        source_proposal_id: proposal.proposal_id.clone(),
+        source_submission_id: submission.submission_id.clone(),
+        normalized_working_directory: layout.normalized_working_directory,
+        working_directory_record,
+        loader_support: vec![CheckpointLoaderEvidenceV1 {
+            reference: format!("loader-source:{}", source_record.sha256),
+            role: CheckpointLoaderRole::Entrypoint,
+            argv_index: layout.entrypoint_index,
+            argv_token: layout.entrypoint_token,
+            root_relative_path: source_record.relative_path.clone(),
+            length: source_record.logical_bytes,
+            sha256: source_record.sha256.clone(),
+            file: source_record,
+            content: source_content,
+        }],
+        checkpoint_candidates,
+        candidates_complete: discovery.complete && omitted_at_least == 0,
+        candidates_omitted_at_least: omitted_at_least,
+        candidate_limit: MAX_CHECKPOINT_CANDIDATES,
+    })
+}
+
+fn require_submission_metadata_id(
+    metadata: &Value,
+    key: &'static str,
+    expected: &str,
+) -> Result<(), AppError> {
+    let object = metadata.as_object().ok_or_else(|| {
+        validation_error("submission.metadata", "must be an object with campaign lineage")
+    })?;
+    if object.get(key).and_then(Value::as_str) != Some(expected) {
+        return Err(validation_error(
+            "submission.metadata",
+            "does not prove the selected campaign lineage",
+        ));
+    }
+    Ok(())
+}
+
+fn has_prior_checkpoint_source(argv: &[String]) -> bool {
+    argv.iter().any(|token| {
+        token == "--resume" || token.starts_with("--resume=")
+    })
+}
+
+fn target_has_prior_checkpoint_lineage(
+    db: &Db,
+    target: &Experiment,
+) -> Result<bool, AppError> {
+    let connection = db.connect()?;
+    let resume_of_experiment_id: Option<String> = connection
+        .query_row(
+            "SELECT resume_of_experiment_id FROM experiments WHERE experiment_id = ?1",
+            [&target.experiment_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read research checkpoint lineage"))?;
+    Ok(resume_of_experiment_id.is_some())
+}
+
+fn map_checkpoint_policy_violation(
+    violation: PolicyViolation,
+    reason: &'static str,
+) -> Result<CheckpointSupportEvidenceV1, AppError> {
+    if matches!(violation.code, PolicyViolationCode::UnsupportedPlatform)
+        || matches!(
+            violation.detail,
+            PolicyViolationDetail::TempUnsafe(
+                TempUnsafeReason::ByteLimit
+                    | TempUnsafeReason::IdentityChanged
+                    | TempUnsafeReason::InvalidEntry
+                    | TempUnsafeReason::IoFailure
+            )
+        )
+    {
+        Ok(unavailable_checkpoint_support(reason))
+    } else {
+        Err(AppError::from(violation))
+    }
+}
+
+fn map_checkpoint_discovery_policy_violation(
+    violation: PolicyViolation,
+    reason: &'static str,
+) -> Result<CheckpointSupportEvidenceV1, AppError> {
+    if violation.code == PolicyViolationCode::UnsupportedPlatform {
+        Ok(unavailable_checkpoint_support(reason))
+    } else {
+        Err(AppError::from(violation))
+    }
+}
+
+fn unavailable_checkpoint_support(reason: &'static str) -> CheckpointSupportEvidenceV1 {
+    CheckpointSupportEvidenceV1::Unavailable {
+        support_version: CHECKPOINT_SUPPORT_VERSION,
+        reason: reason.to_owned(),
+        loader_support: Vec::new(),
+        checkpoint_candidates: Vec::new(),
+        candidates_complete: false,
+        candidates_omitted_at_least: 0,
+        candidate_limit: MAX_CHECKPOINT_CANDIDATES,
+    }
+}
+
+fn checkpoint_support_is_available(context: &Value) -> bool {
+    context["operations"]["checkpoint_support"]["status"] == "available"
+}
+
+fn pop_checkpoint_candidate(context: &mut Value) -> bool {
+    let support = &mut context["operations"]["checkpoint_support"];
+    if support["status"] != "available" {
+        return false;
+    }
+    let Some(candidates) = support["checkpoint_candidates"].as_array_mut() else {
+        return false;
+    };
+    if candidates.len() <= 1 {
+        return false;
+    }
+    candidates.pop();
+    support["candidates_complete"] = Value::Bool(false);
+    let omitted = support["candidates_omitted_at_least"]
+        .as_u64()
+        .unwrap_or(0)
+        .saturating_add(1);
+    support["candidates_omitted_at_least"] = Value::from(omitted);
+    true
 }
 
 fn research_notes(db: &Db, campaign_id: &str) -> Result<(Vec<Value>, usize), AppError> {
@@ -675,4 +1150,111 @@ fn validation_error(field: &'static str, message: &'static str) -> AppError {
 fn bounded_count(field: &'static str, count: i64) -> Result<usize, AppError> {
     usize::try_from(count)
         .map_err(|_| validation_error(field, "scoped count does not fit the platform size"))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        checkpoint_support_is_available, has_prior_checkpoint_source,
+        map_checkpoint_discovery_policy_violation, pop_checkpoint_candidate,
+    };
+    use crate::execution_policy::{PolicyViolation, PolicyViolationCode, PolicyViolationStage};
+
+    #[test]
+    fn checkpoint_candidate_pruning_keeps_sorted_prefix_and_counts_omissions() {
+        let mut context = json!({
+            "operations": {
+                "checkpoint_support": {
+                    "status": "available",
+                    "checkpoint_candidates": [
+                        {"reference": "checkpoint:exp:0:aaa"},
+                        {"reference": "checkpoint:exp:1:bbb"},
+                        {"reference": "checkpoint:exp:2:ccc"}
+                    ],
+                    "candidates_complete": true,
+                    "candidates_omitted_at_least": 0
+                }
+            }
+        });
+
+        assert!(checkpoint_support_is_available(&context));
+        assert!(pop_checkpoint_candidate(&mut context));
+        assert!(pop_checkpoint_candidate(&mut context));
+        assert!(!pop_checkpoint_candidate(&mut context));
+        assert_eq!(
+            context["operations"]["checkpoint_support"]["checkpoint_candidates"][0]
+                ["reference"],
+            "checkpoint:exp:0:aaa"
+        );
+        assert_eq!(
+            context["operations"]["checkpoint_support"]["candidates_omitted_at_least"],
+            2
+        );
+        assert_eq!(
+            context["operations"]["checkpoint_support"]["candidates_complete"],
+            false
+        );
+    }
+
+    #[test]
+    fn unavailable_checkpoint_support_is_not_prunable_or_selectable() {
+        let mut context = json!({
+            "operations": {
+                "checkpoint_support": {
+                    "status": "unavailable",
+                    "checkpoint_candidates": []
+                }
+            }
+        });
+        assert!(!checkpoint_support_is_available(&context));
+        assert!(!pop_checkpoint_candidate(&mut context));
+    }
+
+    #[test]
+    fn discovery_policy_errors_propagate_except_unsupported_platform() {
+        let unavailable = map_checkpoint_discovery_policy_violation(
+            PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::RunBoundPreMarker,
+            ),
+            "discovery unavailable",
+        )
+        .unwrap();
+        assert!(!matches!(
+            unavailable,
+            crate::research_checkpoint::CheckpointSupportEvidenceV1::Available { .. }
+        ));
+
+        assert!(map_checkpoint_discovery_policy_violation(
+            PolicyViolation::new(
+                PolicyViolationCode::TempUnsafe,
+                PolicyViolationStage::RunBoundPreMarker,
+            ),
+            "discovery unavailable",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn prior_checkpoint_sources_are_rejected_before_filesystem_support() {
+        assert!(has_prior_checkpoint_source(&[
+            "python".to_owned(),
+            "train.py".to_owned(),
+            "--resume=checkpoint.json".to_owned(),
+        ]));
+        assert!(has_prior_checkpoint_source(&[
+            "python".to_owned(),
+            "train.py".to_owned(),
+            "--resume".to_owned(),
+            "checkpoint.json".to_owned(),
+        ]));
+        assert!(!has_prior_checkpoint_source(&[
+            "python".to_owned(),
+            "train.py".to_owned(),
+            "--lr".to_owned(),
+            "0.001".to_owned(),
+        ]));
+    }
 }

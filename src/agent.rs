@@ -686,6 +686,10 @@ impl AgentRunner {
         Self { config, policy }
     }
 
+    pub(crate) fn execution_policy(&self) -> &ResolvedExecutionPolicy {
+        &self.policy
+    }
+
     pub fn try_acquire_run_id_admission_guard(
         &self,
         db: &crate::db::Db,

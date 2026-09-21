@@ -16,7 +16,7 @@ use crate::{
     },
     execution_policy::{preflight_decision_runtime, CampaignLimits, PolicyViolationCode},
     models::{CampaignState, EventStatus},
-    research_evidence::build_research_evidence,
+    research_evidence::build_research_evidence_with_policy,
     retry::{retry_backoff_seconds, RetryPolicy},
     AppError,
 };
@@ -343,7 +343,13 @@ async fn launch_review(
         report.deferred += 1;
         return Ok(());
     };
-    let evidence = match build_research_evidence(db, &admitted_review, now) {
+    let evidence = match build_research_evidence_with_policy(
+        db,
+        &admitted_review,
+        now,
+        runner.execution_policy(),
+        &project_policy,
+    ) {
         Ok(evidence) => evidence,
         Err(_) => {
             let blocked = repository.fail_unbound_attempt(

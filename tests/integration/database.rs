@@ -1045,6 +1045,22 @@ fn research_evidence_accepts_a_running_source_and_reports_its_target() {
     assert_eq!(value["facts"]["target"]["task_signature"], review.task_signature);
     assert_eq!(value["facts"]["observed_at"], 1_061);
     assert!(value["facts"]["running"].is_array());
+    assert_eq!(
+        value["operations"]["checkpoint_support"]["status"],
+        "unavailable"
+    );
+    assert_eq!(
+        value["operations"]["checkpoint_support"]["loader_support"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        value["operations"]["checkpoint_support"]["checkpoint_candidates"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        value["operations"]["checkpoint_support"]["candidate_limit"],
+        4
+    );
     assert_eq!(evidence.digest.len(), 64);
 }
 

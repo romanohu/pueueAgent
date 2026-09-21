@@ -17,8 +17,8 @@ use pueue_agent::{
     daemon::{Daemon, DaemonConfig},
     db::{
         AgentDecisionReservation, AgentRunRepository, CampaignRepository, Db, EventRepository,
-        ExperimentRepository, ProjectRepository, ResearchRepository, StartCampaignRequest,
-        TaskObservationRepository,
+        ExperimentRepository, ProjectRepository, ProposalRepository, ResearchRepository,
+        StartCampaignRequest, TaskObservationRepository,
     },
     environment::{
         PrivateRunTempRecoveryIdentityV1, MAX_PRIVATE_TEMP_CLEANUP_ENTRIES,
@@ -232,10 +232,22 @@ impl ResearchHarness {
         let experiment_id = format!("research-{label}-experiment-1");
         let submission_id = format!("research-{label}-submission-1");
         let proposal_id = format!("research-{label}-proposal-1");
+        let initial_argv = vec!["python".to_owned(), "train.py".to_owned()];
+        let initial_runtime_argv = pueue_agent::environment::campaign_experiment_runtime_argv(
+            &project_root,
+            &campaign_id,
+            &experiment_id,
+            &initial_argv,
+        );
+        let initial_runtime_command = initial_runtime_argv
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
         let daemon_task = PueueTask {
             id: 41,
             group: project_id.clone(),
-            command: "python train.py".to_owned(),
+            command: initial_runtime_command,
             state: "Running".to_owned(),
             enqueued_at: Some(NOW.to_string()),
             started_at: Some((NOW + 1).to_string()),
@@ -337,7 +349,6 @@ max_agent_runs = 10
             text: format!("Improve the validation result safely. {USER_TRANSCRIPT_SENTINEL}"),
             digest: objective_digest.clone(),
         };
-        let initial_argv = vec!["python".to_owned(), "train.py".to_owned()];
         let baseline = proposals::validate_initial_baseline(
             ProposalInput {
                 kind: ProposalKind::Experiment,
@@ -499,6 +510,330 @@ max_agent_runs = 10
             evidence,
             claimed_at: NOW + 61,
         }
+    }
+
+    fn write_checkpoint_fixture(
+        &self,
+        source_relative_path: &str,
+        source: &[u8],
+        candidates: &[(&str, &[u8])],
+    ) {
+        let source_path = self.project.root_path.join(source_relative_path);
+        if let Some(parent) = source_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(&source_path, source).unwrap();
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let artifact_root = self
+            .project
+            .root_path
+            .join(".pueue-agent")
+            .join("artifacts")
+            .join(&self.experiment_id);
+        fs::create_dir_all(&artifact_root).unwrap();
+        fs::set_permissions(&artifact_root, fs::Permissions::from_mode(0o700)).unwrap();
+        for (relative_path, bytes) in candidates {
+            let path = artifact_root.join(relative_path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn rewrite_target_command(&self, argv: &[&str], working_directory: &str) {
+        self.rewrite_target_command_inner(argv, working_directory, true);
+    }
+
+    fn rewrite_target_command_without_observation(&self, argv: &[&str], working_directory: &str) {
+        self.rewrite_target_command_inner(argv, working_directory, false);
+    }
+
+    fn rewrite_target_command_inner(
+        &self,
+        argv: &[&str],
+        working_directory: &str,
+        update_observation: bool,
+    ) {
+        let campaign = CampaignRepository::new(&self.db)
+            .find_by_id(&self.campaign_id)
+            .unwrap()
+            .expect("research campaign must exist");
+        let experiment = ExperimentRepository::new(&self.db)
+            .find_by_id(&self.experiment_id)
+            .unwrap()
+            .expect("research experiment must exist");
+        let proposal = ProposalRepository::new(&self.db)
+            .find_for_campaign(&self.campaign_id, &experiment.proposal_id)
+            .unwrap()
+            .expect("research proposal must exist");
+        let argv = argv.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>();
+        let validated = proposals::validate(
+            ProposalInput {
+                kind: proposal.kind,
+                hypothesis: proposal.hypothesis.clone(),
+                source_experiment_id: proposal.source_experiment_id.clone(),
+                argv: argv.clone(),
+                working_directory: working_directory.to_owned(),
+                expected_evidence: proposal.expected_evidence.clone(),
+            },
+            &campaign.objective_digest,
+        )
+        .unwrap();
+        let argv_json = serde_json::to_string(&argv).unwrap();
+        let mut connection = self.db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE proposals
+                 SET argv_json = ?1, working_directory = ?2, canonical_digest = ?3
+                 WHERE proposal_id = ?4 AND campaign_id = ?5",
+                rusqlite::params![
+                    argv_json,
+                    validated.working_directory(),
+                    validated.canonical_digest(),
+                    proposal.proposal_id,
+                    self.campaign_id,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE submissions SET argv_json = ?1 WHERE submission_id = ?2",
+                rusqlite::params![
+                    serde_json::to_string(&argv).unwrap(),
+                    experiment.submission_id,
+                ],
+            )
+            .unwrap();
+
+        if !update_observation {
+            return;
+        }
+
+        let (
+            previous_observation_signature,
+            pueue_group,
+            state,
+            enqueued_at,
+            started_at,
+            ended_at,
+            result,
+        ): (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = connection
+            .query_row(
+                "SELECT task_signature, pueue_group, state, enqueued_at,
+                        started_at, ended_at, result
+                 FROM task_observations
+                 WHERE project_id = ?1 AND pueue_task_id = ?2
+                 ORDER BY observed_at DESC
+                 LIMIT 1",
+                rusqlite::params![self.project.project_id, experiment.pueue_task_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let runtime_argv = pueue_agent::environment::campaign_experiment_runtime_argv(
+            &self.project.root_path,
+            &campaign.campaign_id,
+            &experiment.experiment_id,
+            &argv,
+        );
+        let runtime_command = runtime_argv
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let task = PueueTask {
+            id: experiment.pueue_task_id.unwrap(),
+            group: pueue_group,
+            command: runtime_command.clone(),
+            state,
+            enqueued_at,
+            started_at,
+            ended_at,
+            result: result.and_then(|value| serde_json::from_str(&value).ok()),
+        };
+        let managed_signature =
+            pueue_agent::reconcile::managed_task_run_signature(&task).unwrap();
+        let raw_signature = pueue_agent::reconcile::task_signature(&task);
+        connection
+            .execute(
+                "UPDATE task_observations
+                 SET task_signature = ?1, command_json = ?2
+                 WHERE project_id = ?3 AND task_signature = ?4",
+                rusqlite::params![
+                    raw_signature,
+                    serde_json::to_string(&vec![runtime_command]).unwrap(),
+                    self.project.project_id,
+                    previous_observation_signature,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE experiments SET task_signature = ?1 WHERE experiment_id = ?2",
+                rusqlite::params![managed_signature, experiment.experiment_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE submissions SET task_signature = ?1 WHERE submission_id = ?2",
+                rusqlite::params![managed_signature, experiment.submission_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE research_reviews SET task_signature = ?1 WHERE experiment_id = ?2",
+                rusqlite::params![managed_signature, experiment.experiment_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE events
+                 SET payload_json = json_set(payload_json, '$.task_signature', ?1)
+                 WHERE project_id = ?2 AND campaign_id = ?3 AND experiment_id = ?4
+                   AND kind = 'campaign_research'",
+                rusqlite::params![
+                    managed_signature,
+                    self.project.project_id,
+                    self.campaign_id,
+                    self.experiment_id,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn corrupt_target_proposal_digest(&self) {
+        let experiment = ExperimentRepository::new(&self.db)
+            .find_by_id(&self.experiment_id)
+            .unwrap()
+            .expect("research experiment must exist");
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE proposals SET canonical_digest = 'stale-canonical-digest'
+                 WHERE proposal_id = ?1",
+                [&experiment.proposal_id],
+            )
+            .unwrap();
+    }
+
+    fn replace_target_submission_metadata(&self, metadata: serde_json::Value) {
+        let experiment = ExperimentRepository::new(&self.db)
+            .find_by_id(&self.experiment_id)
+            .unwrap()
+            .expect("research experiment must exist");
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE submissions SET metadata_json = ?1 WHERE submission_id = ?2",
+                rusqlite::params![metadata.to_string(), experiment.submission_id],
+            )
+            .unwrap();
+    }
+
+    fn mark_target_code_change(&self) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE experiments SET code_revision_sha = ?1 WHERE experiment_id = ?2",
+                [
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    self.experiment_id.as_str(),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn mark_target_prior_checkpoint_lineage(&self) {
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE experiments
+                 SET resume_of_experiment_id = experiment_id
+                 WHERE experiment_id = ?1",
+                [&self.experiment_id],
+            )
+            .unwrap();
+    }
+
+    fn context_value(review: &pueue_agent::db::ResearchReview) -> serde_json::Value {
+        let context_json = review
+            .context_json
+            .as_deref()
+            .expect("policy-aware production path must persist context");
+        let context: serde_json::Value = serde_json::from_str(context_json).unwrap();
+        let digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        assert_eq!(review.context_digest.as_deref(), Some(digest.as_str()));
+        context
+    }
+
+    fn review_failure_code(&self, review_id: &str) -> Option<String> {
+        self.db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT failure_code FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    async fn run_policy_evidence_attempt(
+        &self,
+    ) -> (usize, pueue_agent::db::ResearchReview) {
+        let claimed = self.initial_review();
+        self.write_fixture_controls(
+            &claimed.review.review_id,
+            &claimed.review.experiment_id,
+            &claimed.evidence.digest,
+            FIRST_SESSION,
+            true,
+            FIRST_SESSION,
+            false,
+        );
+        let report = run_due_research(
+            &self.db,
+            &self.runner,
+            CampaignLimits::default(),
+            NOW + 80,
+            1,
+        )
+        .await
+        .unwrap();
+        let review = ResearchRepository::new(&self.db)
+            .find(&claimed.review.review_id)
+            .unwrap();
+        let started = report.started.len();
+        for mut handle in report.started {
+            let _ = handle.wait(&self.db, NOW + 91).await;
+        }
+        (started, review)
     }
 
     fn admit_initial_review_attempt(&self, claimed: &ClaimedReview) -> (ClaimedReview, String) {
@@ -4268,6 +4603,263 @@ async fn research_evidence_budget_fits_native_prompt_and_launches() {
         handle.wait(&harness.db, NOW + 91).await.unwrap(),
         AgentRunStatus::Completed
     );
+}
+
+#[tokio::test]
+async fn research_policy_evidence_persists_complete_loader_and_distinct_candidates() {
+    let harness = ResearchHarness::new("checkpoint-assembly", FIRST_SESSION);
+    harness.write_checkpoint_fixture(
+        "train.py",
+        b"# durable trainer source\nprint('ok')\n",
+        &[("first.json", b"first checkpoint"), ("second.json", b"second checkpoint")],
+    );
+
+    let (started, review) = harness.run_policy_evidence_attempt().await;
+    assert_eq!(started, 1, "valid policy evidence must reach the production launch");
+    let context = ResearchHarness::context_value(&review);
+    let support = &context["operations"]["checkpoint_support"];
+    assert_eq!(support["status"], "available");
+    assert_eq!(support["normalized_working_directory"], ".");
+    assert_eq!(support["loader_support"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        support["loader_support"][0]["content"],
+        "# durable trainer source\nprint('ok')\n"
+    );
+    let candidates = support["checkpoint_candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(support["candidate_limit"], 4);
+    assert_eq!(support["candidates_complete"], true);
+    assert_eq!(support["candidates_omitted_at_least"], 0);
+    assert_ne!(candidates[0]["root_relative_path"], candidates[1]["root_relative_path"]);
+    assert_ne!(candidates[0]["reference"], candidates[1]["reference"]);
+    for (ordinal, candidate) in candidates.iter().enumerate() {
+        let ordinal_string = ordinal.to_string();
+        assert_eq!(candidate["source_experiment_id"], harness.experiment_id);
+        assert_eq!(
+            candidate["reference"].as_str().unwrap().split(':').nth(2),
+            Some(ordinal_string.as_str())
+        );
+        assert_eq!(candidate["argv_path"], candidate["root_relative_path"]);
+    }
+}
+
+#[tokio::test]
+async fn research_policy_evidence_rejects_observation_command_mismatch_before_support_reads() {
+    let harness = ResearchHarness::new("checkpoint-command-mismatch", FIRST_SESSION);
+    harness.rewrite_target_command_without_observation(&["python", "different.py"], ".");
+    harness.write_checkpoint_fixture(
+        "different.py",
+        b"# mismatched command source\n",
+        &[("candidate.json", b"checkpoint")],
+    );
+
+    let (started, review) = harness.run_policy_evidence_attempt().await;
+    assert_eq!(started, 0);
+    assert_eq!(review.state, "retry_wait");
+    assert!(review.context_json.is_none());
+    assert_eq!(
+        harness.review_failure_code(&review.review_id).as_deref(),
+        Some("research_output_invalid")
+    );
+}
+
+#[tokio::test]
+async fn research_policy_evidence_rejects_nested_cwd_candidate_scope_without_authority() {
+    let harness = ResearchHarness::new("checkpoint-nested-cwd", FIRST_SESSION);
+    harness.rewrite_target_command(&["python", "train.py"], "runs/a");
+    harness.write_checkpoint_fixture(
+        "runs/a/train.py",
+        b"# nested durable trainer\n",
+        &[("nested.json", b"checkpoint")],
+    );
+
+    let (started, review) = harness.run_policy_evidence_attempt().await;
+    assert_eq!(started, 1);
+    let context = ResearchHarness::context_value(&review);
+    let support = &context["operations"]["checkpoint_support"];
+    assert_eq!(support["status"], "unavailable");
+    assert_eq!(support["loader_support"], serde_json::json!([]));
+    assert_eq!(support["checkpoint_candidates"], serde_json::json!([]));
+    assert_eq!(
+        support["reason"],
+        "no checkpoint candidate is representable from the trainer cwd"
+    );
+}
+
+#[tokio::test]
+async fn research_policy_evidence_rejects_code_change_and_prior_resume_before_support_reads() {
+    let code_change = ResearchHarness::new("checkpoint-code-change", FIRST_SESSION);
+    code_change.write_checkpoint_fixture(
+        "train.py",
+        b"# ordinary source\n",
+        &[("candidate.json", b"checkpoint")],
+    );
+    code_change.mark_target_code_change();
+    let (started, review) = code_change.run_policy_evidence_attempt().await;
+    assert_eq!(started, 1);
+    let context = ResearchHarness::context_value(&review);
+    assert_eq!(
+        context["operations"]["checkpoint_support"]["reason"],
+        "code-change experiments have no ordinary trainer support"
+    );
+
+    let prior_resume = ResearchHarness::new("checkpoint-prior-resume", FIRST_SESSION);
+    prior_resume.rewrite_target_command(
+        &["python", "train.py", "--resume", "checkpoint.json"],
+        ".",
+    );
+    prior_resume.write_checkpoint_fixture(
+        "train.py",
+        b"# resume source\n",
+        &[("candidate.json", b"checkpoint")],
+    );
+    let (started, review) = prior_resume.run_policy_evidence_attempt().await;
+    assert_eq!(started, 1);
+    let context = ResearchHarness::context_value(&review);
+    assert_eq!(
+        context["operations"]["checkpoint_support"]["reason"],
+        "prior checkpoint sources require a durable checkpoint authority"
+    );
+
+    let persisted_lineage = ResearchHarness::new("checkpoint-prior-lineage", FIRST_SESSION);
+    persisted_lineage.write_checkpoint_fixture(
+        "train.py",
+        b"# ordinary source\n",
+        &[("candidate.json", b"checkpoint")],
+    );
+    persisted_lineage.mark_target_prior_checkpoint_lineage();
+    let (started, review) = persisted_lineage.run_policy_evidence_attempt().await;
+    assert_eq!(started, 1);
+    let context = ResearchHarness::context_value(&review);
+    assert_eq!(
+        context["operations"]["checkpoint_support"]["reason"],
+        "prior checkpoint sources require a durable checkpoint authority"
+    );
+}
+
+#[tokio::test]
+async fn research_policy_evidence_rejects_secret_and_truncated_loader_sources() {
+    let secret = ResearchHarness::new("checkpoint-secret-source", FIRST_SESSION);
+    secret.write_checkpoint_fixture(
+        "train.py",
+        b"API_KEY = \"sk-secret-fixture\"\n",
+        &[("candidate.json", b"checkpoint")],
+    );
+    let (started, review) = secret.run_policy_evidence_attempt().await;
+    assert_eq!(started, 1);
+    let context = ResearchHarness::context_value(&review);
+    assert_eq!(
+        context["operations"]["checkpoint_support"]["reason"],
+        "trainer source contains unsupported control text"
+    );
+
+    let truncated = ResearchHarness::new("checkpoint-truncated-source", FIRST_SESSION);
+    let oversized_source = vec![b'x'; 32 * 1024 + 1];
+    truncated.write_checkpoint_fixture(
+        "train.py",
+        &oversized_source,
+        &[("candidate.json", b"checkpoint")],
+    );
+    let (started, review) = truncated.run_policy_evidence_attempt().await;
+    assert_eq!(started, 1);
+    let context = ResearchHarness::context_value(&review);
+    assert_eq!(
+        context["operations"]["checkpoint_support"]["reason"],
+        "trainer source file is unavailable"
+    );
+}
+
+#[tokio::test]
+async fn research_policy_evidence_reports_durable_proposal_and_submission_mismatch_errors() {
+    let stale_proposal = ResearchHarness::new("checkpoint-stale-proposal", FIRST_SESSION);
+    stale_proposal.write_checkpoint_fixture(
+        "train.py",
+        b"# trainer\n",
+        &[("candidate.json", b"checkpoint")],
+    );
+    stale_proposal.corrupt_target_proposal_digest();
+    let (started, review) = stale_proposal.run_policy_evidence_attempt().await;
+    assert_eq!(started, 0);
+    assert_eq!(review.state, "retry_wait");
+    assert!(review.context_json.is_none());
+    assert_eq!(
+        stale_proposal.review_failure_code(&review.review_id).as_deref(),
+        Some("research_output_invalid")
+    );
+
+    let stale_metadata = ResearchHarness::new("checkpoint-stale-metadata", FIRST_SESSION);
+    stale_metadata.write_checkpoint_fixture(
+        "train.py",
+        b"# trainer\n",
+        &[("candidate.json", b"checkpoint")],
+    );
+    stale_metadata.replace_target_submission_metadata(serde_json::json!({
+        "campaign_id": stale_metadata.campaign_id.clone(),
+        "proposal_id": "foreign-proposal",
+        "experiment_id": stale_metadata.experiment_id.clone(),
+    }));
+    let (started, review) = stale_metadata.run_policy_evidence_attempt().await;
+    assert_eq!(started, 0);
+    assert_eq!(review.state, "retry_wait");
+    assert!(review.context_json.is_none());
+    assert_eq!(
+        stale_metadata.review_failure_code(&review.review_id).as_deref(),
+        Some("research_output_invalid")
+    );
+}
+
+#[tokio::test]
+async fn research_policy_evidence_prunes_whole_candidates_at_the_final_native_cap() {
+    let harness = ResearchHarness::new("checkpoint-cap", FIRST_SESSION);
+    let component = "d".repeat(240);
+    let source_relative_path = "train.py";
+    let mut candidate_storage = Vec::new();
+    for ordinal in 0..4 {
+        let path = (0..3)
+            .map(|_| component.as_str())
+            .chain(std::iter::once(match ordinal {
+                0 => "first.json",
+                1 => "second.json",
+                2 => "third.json",
+                _ => "fourth.json",
+            }))
+            .collect::<Vec<_>>()
+            .join("/");
+        candidate_storage.push((path, b"checkpoint".to_vec()));
+    }
+    let candidate_refs = candidate_storage
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let source = "\"\"\"\"\"\"\n".repeat(4096).into_bytes();
+    harness.rewrite_target_command(&[source_relative_path], ".");
+    harness.write_checkpoint_fixture(source_relative_path, &source, &candidate_refs);
+
+    let (started, review) = harness.run_policy_evidence_attempt().await;
+    assert_eq!(started, 1);
+    let context = ResearchHarness::context_value(&review);
+    let support = &context["operations"]["checkpoint_support"];
+    assert_eq!(support["status"], "available");
+    assert_eq!(support["loader_support"].as_array().unwrap().len(), 1);
+    assert_eq!(support["loader_support"][0]["content"].as_str().unwrap().len(), source.len());
+    let candidates = support["checkpoint_candidates"].as_array().unwrap();
+    assert!(!candidates.is_empty());
+    assert!(candidates.len() < 4);
+    assert_eq!(support["candidates_complete"], false);
+    assert!(support["candidates_omitted_at_least"].as_u64().unwrap() >= 1);
+    let mut references = std::collections::BTreeSet::new();
+    for (ordinal, candidate) in candidates.iter().enumerate() {
+        assert!(references.insert(candidate["reference"].as_str().unwrap()));
+        assert_eq!(candidate["argv_path"], candidate["root_relative_path"]);
+        assert!(candidate["reference"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("checkpoint:{}:{}:", harness.experiment_id, ordinal)));
+        assert!(candidate["root_relative_path"]
+            .as_str()
+            .unwrap()
+            .starts_with(".pueue-agent/artifacts/"));
+    }
 }
 
 #[tokio::test]
