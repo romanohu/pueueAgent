@@ -8,11 +8,13 @@ use crate::{
         inferred_pre_binding_policy_code, AgentRunRepository, CampaignRepository,
         CampaignStatusProjection, Db, DecisionDoctorProjection, EventRepository,
         ProjectRepository, SubmissionRepository,
+        ResearchRepository,
     },
     models::{DecisionAttemptState, DecisionCycle, Event, Project},
     output::{
         bounded_execution_path, bounded_redacted_text, bounded_typed_text, format_state,
         human_header, human_summary, render_decision_status_line, render_id,
+        render_research_status_line,
         DecisionStatusProjection,
     },
     pueue::PueueTask,
@@ -202,6 +204,8 @@ pub fn render_project_status(
         .status_projection_for_project(&project.project_id, now)?
     {
         lines.push(campaign_status_line(&campaign));
+        let research = ResearchRepository::new(db).status_projection(&campaign.campaign_id)?;
+        lines.push(render_research_status_line(&research));
         if campaign.has_objective {
             lines.push(best_status_line(&campaign));
             lines.push(plateau_status_line(&campaign));
@@ -412,6 +416,8 @@ pub fn render_project_status_compact(
         .status_projection_for_project(&project.project_id, now)?
     {
         lines.push(campaign_status_line(&campaign));
+        let research = ResearchRepository::new(db).status_projection(&campaign.campaign_id)?;
+        lines.push(render_research_status_line(&research));
         if campaign.has_objective {
             lines.push(best_status_line(&campaign));
             lines.push(plateau_status_line(&campaign));

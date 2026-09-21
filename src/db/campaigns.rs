@@ -2809,6 +2809,22 @@ impl<'db> CampaignRepository<'db> {
                 "state does not permit an operator resume",
             ));
         }
+        let research_blocked: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM campaign_research
+                     WHERE campaign_id = ?1 AND blocked_reason IS NOT NULL
+                 )",
+                [&campaign.campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check research recovery before campaign resume"))?;
+        if research_blocked {
+            return Err(validation_error(
+                "campaign",
+                "cannot resume while research recovery remains blocked",
+            ));
+        }
         validate_project_available(&transaction, project_id)?;
         let unsafe_count: i64 = transaction
             .query_row(

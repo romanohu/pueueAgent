@@ -11,6 +11,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use clap::Parser;
+use rusqlite::types::Value;
 use pueue_agent::{
     agent::{AgentRunner, AgentRunnerConfig},
     cancel::{cancel_task_with, render_cancel_result},
@@ -18,13 +19,14 @@ use pueue_agent::{
     db::{
         AgentRunRepository, CampaignRepository, Db, EventRepository, ExperimentRepository,
         HealthRepository, IncidentRepository, ProjectRepository, StartCampaignRequest,
-        TaskObservationRepository, TerminationRequestRepository,
+        ResearchRepository, TaskObservationRepository, TerminationRequestRepository,
     },
     diagnostics::render_project_status_json,
     models::{
-        AgentContextMode, AgentRunStatus, CampaignState, EventKind, ExperimentTerminalOutcome,
-        HealthState, NewAgentRun, NewEvent, NewIncident, NewProject, NewTaskObservation,
-        NewTerminationRequest, ProposalKind, SignalSummaryEntry, TerminationRequestStatus,
+        AgentContextMode, AgentRunStatus, CampaignState, EventKind, ExecutionProjection,
+        ExperimentTerminalOutcome, HealthState, NewAgentRun, NewEvent, NewIncident, NewProject,
+        NewTaskObservation, NewTerminationRequest, ProposalKind, SignalSummaryEntry,
+        TerminationRequestStatus,
     },
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueTask},
@@ -945,6 +947,22 @@ struct OperatorHarness {
     now: i64,
 }
 
+#[derive(Debug, PartialEq)]
+struct RecoverySnapshot {
+    campaign_research: Vec<Vec<Value>>,
+    proposals: Vec<Vec<Value>>,
+    submissions: Vec<Vec<Value>>,
+    experiments: Vec<Vec<Value>>,
+    research_reviews: Vec<Vec<Value>>,
+    budget_reservations: Vec<Vec<Value>>,
+    events: Vec<Vec<Value>>,
+    agent_runs: Vec<Vec<Value>>,
+    agent_run_events: Vec<Vec<Value>>,
+    termination_requests: Vec<Vec<Value>>,
+    decision_cycles: Vec<Vec<Value>>,
+    decision_attempts: Vec<Vec<Value>>,
+}
+
 impl OperatorHarness {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
@@ -1193,8 +1211,242 @@ max_agent_runs = 10
             .state
     }
 
+    fn snapshot_rows(&self, query: &str) -> Vec<Vec<Value>> {
+        let connection = self.db.connect().unwrap();
+        let mut statement = connection.prepare(query).unwrap();
+        let column_count = statement.column_count();
+        statement
+            .query_map([], |row| {
+                let mut values = Vec::with_capacity(column_count);
+                for index in 0..column_count {
+                    values.push(row.get(index)?);
+                }
+                Ok(values)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn recovery_snapshot(&self) -> RecoverySnapshot {
+        RecoverySnapshot {
+            campaign_research: self.snapshot_rows(
+                "SELECT * FROM campaign_research
+                 WHERE campaign_id = 'campaign-cli'",
+            ),
+            proposals: self.snapshot_rows(
+                "SELECT * FROM proposals
+                 WHERE campaign_id = 'campaign-cli' ORDER BY proposal_id",
+            ),
+            submissions: self.snapshot_rows(
+                "SELECT * FROM submissions
+                 WHERE project_id = 'project-a' ORDER BY submission_id",
+            ),
+            experiments: self.snapshot_rows(
+                "SELECT * FROM experiments
+                 WHERE campaign_id = 'campaign-cli' ORDER BY experiment_id",
+            ),
+            research_reviews: self.snapshot_rows(
+                "SELECT * FROM research_reviews
+                 WHERE campaign_id = 'campaign-cli' ORDER BY review_id",
+            ),
+            budget_reservations: self.snapshot_rows(
+                "SELECT * FROM budget_reservations
+                 WHERE campaign_id = 'campaign-cli' ORDER BY reservation_id",
+            ),
+            events: self.snapshot_rows(
+                "SELECT * FROM events
+                 WHERE project_id = 'project-a' ORDER BY event_id",
+            ),
+            agent_runs: self.snapshot_rows(
+                "SELECT * FROM agent_runs
+                 WHERE project_id = 'project-a' ORDER BY run_id",
+            ),
+            agent_run_events: self.snapshot_rows(
+                "SELECT * FROM agent_run_events
+                 WHERE project_id = 'project-a' ORDER BY run_id, event_id",
+            ),
+            termination_requests: self.snapshot_rows(
+                "SELECT * FROM termination_requests
+                 WHERE project_id = 'project-a' ORDER BY request_id",
+            ),
+            decision_cycles: self.snapshot_rows(
+                "SELECT * FROM decision_cycles
+                 WHERE campaign_id = 'campaign-cli' ORDER BY cycle_id",
+            ),
+            decision_attempts: self.snapshot_rows(
+                "SELECT attempts.* FROM decision_attempts AS attempts
+                 JOIN decision_cycles AS cycles ON cycles.cycle_id = attempts.cycle_id
+                 WHERE cycles.campaign_id = 'campaign-cli'
+                 ORDER BY attempts.cycle_id, attempts.attempt_number",
+            ),
+        }
+    }
+
+    fn prepare_blocked_paused_research(&self, session_id: Option<&str>, generation: i64) {
+        ResearchRepository::new(&self.db)
+            .ensure_campaign("campaign-cli")
+            .unwrap();
+        CampaignRepository::new(&self.db)
+            .pause("project-a", self.now + 1)
+            .unwrap();
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE campaign_research
+                 SET session_id = ?1, session_generation = ?2,
+                     blocked_reason = 'research_policy_blocked', next_due_at = NULL
+                 WHERE campaign_id = 'campaign-cli'",
+                rusqlite::params![session_id, generation],
+            )
+            .unwrap();
+    }
+
+    fn prepare_blocked_active_research(&self, session_id: Option<&str>, generation: i64) {
+        ResearchRepository::new(&self.db)
+            .ensure_campaign("campaign-cli")
+            .unwrap();
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE campaign_research
+                 SET session_id = ?1, session_generation = ?2,
+                     blocked_reason = 'research_policy_blocked', next_due_at = NULL
+                 WHERE campaign_id = 'campaign-cli'",
+                rusqlite::params![session_id, generation],
+            )
+            .unwrap();
+    }
+
+    fn add_open_research_review(&self) {
+        let event_id = self.event(EventKind::CampaignResearch, "recovery-open-review");
+        self.db
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO research_reviews (
+                    review_id, campaign_id, experiment_id, task_signature, attempt,
+                    state, operation_stage, agent_run_id, context_json, context_digest,
+                    response_json, termination_request_id, successor_experiment_id,
+                    evidence_schema_version, session_generation, event_id, not_before,
+                    notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                    created_at, started_at, finished_at, updated_at
+                 ) VALUES (
+                    'recovery-open-review', 'campaign-cli', 'experiment-cli',
+                    'recovery-open-review-signature', 0, 'pending', NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL, NULL, 0, ?1, ?2,
+                    NULL, NULL, NULL, NULL, ?2, NULL, NULL, ?2
+                 )",
+                rusqlite::params![event_id, self.now],
+            )
+            .unwrap();
+    }
+
+    fn add_terminal_research_history(&self) {
+        let event_id = EventRepository::new(&self.db)
+            .insert_idempotent(
+                &NewEvent::new(
+                    "project-a",
+                    EventKind::CampaignResearch,
+                    "recovery-terminal-history-event",
+                    json!({"history": "terminal"}),
+                    self.now,
+                    self.now,
+                )
+                .with_campaign_lineage("campaign-cli", Some("experiment-cli")),
+            )
+            .unwrap()
+            .event_id;
+        let connection = self.db.connect().unwrap();
+        let session_generation: i64 = connection
+            .query_row(
+                "SELECT session_generation FROM campaign_research
+                 WHERE campaign_id = 'campaign-cli'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO research_reviews (
+                    review_id, campaign_id, experiment_id, task_signature, attempt,
+                    state, operation_stage, agent_run_id, context_json, context_digest,
+                    response_json, termination_request_id, successor_experiment_id,
+                    evidence_schema_version, session_generation, event_id, not_before,
+                    notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                    created_at, started_at, finished_at, updated_at
+                 ) VALUES (
+                    'recovery-terminal-history', 'campaign-cli', 'experiment-cli',
+                    'recovery-terminal-history-signature', 1, 'discarded', NULL,
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?1, ?2, ?3,
+                    NULL, 'recovery_terminal_history', NULL, NULL, ?4, ?4, ?5, ?5
+                 )",
+                rusqlite::params![
+                    session_generation,
+                    event_id,
+                    self.now,
+                    self.now,
+                    self.now + 1,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET last_review_id = 'recovery-terminal-history'
+                 WHERE campaign_id = 'campaign-cli'",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn add_native_research_owner(&self, status: AgentRunStatus) {
+        let event_id = self.event(EventKind::CampaignResearch, "recovery-native-owner");
+        let execution = ExecutionProjection::new(
+            "campaign_research",
+            "/bin/codex",
+            "recovery-fixture",
+        )
+        .unwrap();
+        AgentRunRepository::new(&self.db)
+            .insert(
+                &NewAgentRun::new(
+                    "project-a",
+                    event_id,
+                    None,
+                    status,
+                    self.now,
+                    "/tmp/recovery-native-owner.log",
+                )
+                .with_execution(execution),
+            )
+            .unwrap();
+    }
+
     #[cfg(unix)]
     fn run(&self, arguments: &[&str]) -> std::process::Output {
+        self.run_with_codex_fixture(arguments, false, false)
+    }
+
+    #[cfg(unix)]
+    fn run_with_recovery_fixture(&self, arguments: &[&str]) -> std::process::Output {
+        self.run_with_codex_fixture(arguments, true, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_with_owned_recovery_fixture(&self, arguments: &[&str]) -> std::process::Output {
+        self.run_with_codex_fixture(arguments, true, true)
+    }
+
+    #[cfg(unix)]
+    fn run_with_codex_fixture(
+        &self,
+        arguments: &[&str],
+        recovery_fixture: bool,
+        owned_session: bool,
+    ) -> std::process::Output {
         use std::os::unix::fs::PermissionsExt;
 
         let base = fs::canonicalize(self.temp.path()).unwrap();
@@ -1213,9 +1465,61 @@ max_agent_runs = 10
             fs::create_dir_all(directory).unwrap();
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
         }
+        if owned_session {
+            let sessions = codex_home.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700)).unwrap();
+            let project_root = fs::canonicalize(&self.project().root_path).unwrap();
+            let session = sessions.join(format!("rollout-{CODEX_SESSION_ID}.jsonl"));
+            fs::write(
+                &session,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{CODEX_SESSION_ID}\",\"cwd\":{cwd:?}}}}}\n",
+                    cwd = project_root.to_string_lossy()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&session, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let executable = trusted_dir.join("pueue-agent-fixture");
         fs::copy(env!("CARGO_BIN_EXE_pueue-agent"), &executable).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let codex_executable = trusted_dir.join("codex-fixture");
+        if recovery_fixture {
+            let source = codex_executable.with_extension("rs");
+            fs::write(
+                &source,
+                r#"use std::env;
+
+fn main() {
+    let first = env::args().nth(1);
+    match first.as_deref() {
+        Some("--version") => println!("codex 0.138.0"),
+        Some("--help") => println!(
+            "workspace-write read-only --ask-for-approval never --strict-config"
+        ),
+        Some("exec") => println!(
+            "--strict-config --ignore-user-config --ignore-rules --output-schema --output-last-message --json"
+        ),
+        _ => std::process::exit(42),
+    }
+}
+"#,
+            )
+            .unwrap();
+            let output = std::process::Command::new("rustc")
+                .args(["--edition=2021", "-o"])
+                .arg(&codex_executable)
+                .arg(&source)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "generated recovery Codex failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fs::set_permissions(&codex_executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         fs::write(&pueue_config, "fixture: true\n").unwrap();
         fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(
@@ -1223,7 +1527,11 @@ max_agent_runs = 10
             format!(
                 "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\n",
                 trusted_dir.display().to_string(),
-                executable.display().to_string(),
+                if recovery_fixture {
+                    codex_executable.display().to_string()
+                } else {
+                    executable.display().to_string()
+                },
                 executable.display().to_string(),
             ),
         )
@@ -1324,6 +1632,56 @@ max_agent_runs = 10
     }
 }
 
+fn assert_recovery_preserves_snapshot(before: &RecoverySnapshot, after: &RecoverySnapshot) {
+    assert_eq!(before.proposals, after.proposals);
+    assert_eq!(before.submissions, after.submissions);
+    assert_eq!(before.experiments, after.experiments);
+    assert_eq!(before.research_reviews, after.research_reviews);
+    assert_eq!(before.budget_reservations, after.budget_reservations);
+    assert_eq!(before.events, after.events);
+    assert_eq!(before.agent_runs, after.agent_runs);
+    assert_eq!(before.agent_run_events, after.agent_run_events);
+    assert_eq!(before.termination_requests, after.termination_requests);
+    assert_eq!(before.decision_cycles, after.decision_cycles);
+    assert_eq!(before.decision_attempts, after.decision_attempts);
+
+    assert_eq!(before.campaign_research.len(), 1);
+    assert_eq!(after.campaign_research.len(), 1);
+    let before_research = &before.campaign_research[0];
+    let after_research = &after.campaign_research[0];
+    assert_eq!(before_research.len(), 7);
+    assert_eq!(after_research.len(), 7);
+    for column in [0, 1, 2, 5] {
+        assert_eq!(before_research[column], after_research[column]);
+    }
+    assert_eq!(before_research[3], Value::Null);
+    assert!(matches!(after_research[3], Value::Integer(_)));
+    assert_eq!(
+        before_research[4],
+        Value::Text("research_policy_blocked".to_owned())
+    );
+    assert_eq!(after_research[4], Value::Null);
+}
+
+fn assert_seeded_research_history(snapshot: &RecoverySnapshot) {
+    assert_eq!(snapshot.research_reviews.len(), 1);
+    assert!(!snapshot.events.is_empty());
+    assert_eq!(
+        snapshot.research_reviews[0][0],
+        Value::Text("recovery-terminal-history".to_owned())
+    );
+    assert_eq!(snapshot.research_reviews[0][4], Value::Integer(1));
+    assert_eq!(
+        snapshot.research_reviews[0][5],
+        Value::Text("discarded".to_owned())
+    );
+    assert_eq!(snapshot.research_reviews[0][7], Value::Null);
+    assert_eq!(
+        snapshot.campaign_research[0][5],
+        Value::Text("recovery-terminal-history".to_owned())
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn campaign_pause_and_resume_change_only_campaign_state_and_are_idempotent() {
@@ -1341,6 +1699,225 @@ fn campaign_pause_and_resume_change_only_campaign_state_and_are_idempotent() {
         assert_eq!(harness.campaign_state(), CampaignState::Active);
         assert!(!harness.project().paused);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn blocked_research_campaign_requires_explicit_pause_before_resume() {
+    let harness = OperatorHarness::with_campaign();
+    harness.prepare_blocked_active_research(None, 0);
+    let before = harness.recovery_snapshot();
+    let repository = ResearchRepository::new(&harness.db);
+    let expected = repository.state("campaign-cli").unwrap();
+
+    let error = repository
+        .resume_after_validation("project-a", &expected, harness.now + 2)
+        .unwrap_err();
+
+    match error {
+        AppError::Validation { field, .. } => assert_eq!(field, "research.recovery"),
+        other => panic!("expected recovery validation error, got {other:?}"),
+    }
+    assert_eq!(harness.campaign_state(), CampaignState::Active);
+    assert_eq!(repository.state("campaign-cli").unwrap(), expected);
+    assert_eq!(before, harness.recovery_snapshot());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn explicit_recovery_accepts_safe_missing_session_and_preserves_binding() {
+    let harness = OperatorHarness::with_campaign();
+    harness.prepare_blocked_paused_research(Some(CODEX_SESSION_ID), 3);
+    harness.add_terminal_research_history();
+    let before = harness.recovery_snapshot();
+    assert_seeded_research_history(&before);
+
+    let output = harness.run_with_recovery_fixture(&["campaign", "resume", "--json"]);
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(harness.campaign_state(), CampaignState::Active);
+    let state = ResearchRepository::new(&harness.db)
+        .state("campaign-cli")
+        .unwrap();
+    assert_eq!(state.session_id.as_deref(), Some(CODEX_SESSION_ID));
+    assert_eq!(state.session_generation, 3);
+    assert!(state.next_due_at.is_some());
+    assert_eq!(state.blocked_reason, None);
+    let connection = harness.db.connect().unwrap();
+    let review_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM research_reviews WHERE campaign_id = 'campaign-cli'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let run_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE project_id = 'project-a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(review_count, 1);
+    assert_eq!(run_count, 0);
+    assert_recovery_preserves_snapshot(&before, &harness.recovery_snapshot());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn explicit_recovery_accepts_owned_session_with_pinned_capabilities() {
+    let harness = OperatorHarness::with_campaign();
+    harness.prepare_blocked_paused_research(Some(CODEX_SESSION_ID), 5);
+    harness.add_terminal_research_history();
+    let before = harness.recovery_snapshot();
+    assert_seeded_research_history(&before);
+
+    let output = harness.run_with_owned_recovery_fixture(&["campaign", "resume", "--json"]);
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(harness.campaign_state(), CampaignState::Active);
+    let state = ResearchRepository::new(&harness.db)
+        .state("campaign-cli")
+        .unwrap();
+    assert_eq!(state.session_id.as_deref(), Some(CODEX_SESSION_ID));
+    assert_eq!(state.session_generation, 5);
+    assert!(state.next_due_at.is_some());
+    assert_eq!(state.blocked_reason, None);
+    assert_recovery_preserves_snapshot(&before, &harness.recovery_snapshot());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn explicit_recovery_rejects_unsupported_platform_before_clearing_block() {
+    let harness = OperatorHarness::with_campaign();
+    harness.prepare_blocked_paused_research(None, 0);
+
+    let output = harness.run_with_recovery_fixture(&["campaign", "resume"]);
+
+    assert!(!output.status.success());
+    assert_eq!(harness.campaign_state(), CampaignState::Paused);
+    assert_eq!(
+        ResearchRepository::new(&harness.db)
+            .state("campaign-cli")
+            .unwrap()
+            .blocked_reason
+            .as_deref(),
+        Some("research_policy_blocked")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn research_recovery_cas_rejects_stale_reason_session_generation_and_project() {
+    let harness = OperatorHarness::with_campaign();
+    harness.prepare_blocked_paused_research(Some(CODEX_SESSION_ID), 4);
+    let repository = ResearchRepository::new(&harness.db);
+    let current = repository.state("campaign-cli").unwrap();
+
+    let mut wrong_reason = current.clone();
+    wrong_reason.blocked_reason = Some("different_reason".to_owned());
+    assert!(repository
+        .resume_after_validation("project-a", &wrong_reason, harness.now + 2)
+        .is_err());
+
+    let mut wrong_session = current.clone();
+    wrong_session.session_id = Some("019f9f30-5f31-7a40-8e28-bd95e1f6c538".to_owned());
+    assert!(repository
+        .resume_after_validation("project-a", &wrong_session, harness.now + 2)
+        .is_err());
+
+    let mut wrong_generation = current.clone();
+    wrong_generation.session_generation += 1;
+    assert!(repository
+        .resume_after_validation("project-a", &wrong_generation, harness.now + 2)
+        .is_err());
+
+    assert!(repository
+        .resume_after_validation("different-project", &current, harness.now + 2)
+        .is_err());
+
+    assert_eq!(repository.state("campaign-cli").unwrap(), current);
+}
+
+#[cfg(unix)]
+#[test]
+fn research_recovery_cas_rejects_open_review_and_native_owner_interleavings() {
+    fn assert_rejected(prepare: impl FnOnce(&OperatorHarness), expected_field: &str) {
+        let harness = OperatorHarness::with_campaign();
+        harness.prepare_blocked_paused_research(None, 0);
+        let repository = ResearchRepository::new(&harness.db);
+        let expected = repository.state("campaign-cli").unwrap();
+        prepare(&harness);
+
+        let error = repository
+            .resume_after_validation("project-a", &expected, harness.now + 2)
+            .unwrap_err();
+        match error {
+            AppError::Validation { field, .. } => assert_eq!(field, expected_field),
+            other => panic!("expected recovery validation error, got {other:?}"),
+        }
+        assert_eq!(repository.state("campaign-cli").unwrap(), expected);
+        assert_eq!(harness.campaign_state(), CampaignState::Paused);
+    }
+
+    assert_rejected(|harness| harness.add_open_research_review(), "research.review");
+    assert_rejected(
+        |harness| harness.add_native_research_owner(AgentRunStatus::Running),
+        "research.owner",
+    );
+    assert_rejected(
+        |harness| harness.add_native_research_owner(AgentRunStatus::Failed),
+        "research.owner",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn campaign_resume_rejects_a_research_block_restored_after_recovery_clear() {
+    let harness = OperatorHarness::with_campaign();
+    harness.prepare_blocked_paused_research(None, 0);
+    harness.add_terminal_research_history();
+    let before = harness.recovery_snapshot();
+    let repository = ResearchRepository::new(&harness.db);
+    let expected = repository.state("campaign-cli").unwrap();
+    repository
+        .resume_after_validation("project-a", &expected, harness.now + 2)
+        .unwrap();
+    let after_clear = harness.recovery_snapshot();
+    assert_recovery_preserves_snapshot(&before, &after_clear);
+    let (next_due_at, updated_at): (Option<i64>, i64) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT next_due_at, updated_at FROM campaign_research
+             WHERE campaign_id = 'campaign-cli'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(next_due_at, Some(harness.now + 2));
+    assert_eq!(updated_at, harness.now + 2);
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaign_research
+             SET blocked_reason = 'research_recovery_required', next_due_at = NULL
+             WHERE campaign_id = 'campaign-cli'",
+            [],
+        )
+        .unwrap();
+
+    let result = CampaignRepository::new(&harness.db).resume("project-a", harness.now + 3);
+
+    assert!(result.is_err());
+    assert_eq!(harness.campaign_state(), CampaignState::Paused);
+    assert_eq!(
+        repository.state("campaign-cli").unwrap().blocked_reason.as_deref(),
+        Some("research_recovery_required")
+    );
 }
 
 #[cfg(unix)]
@@ -1987,7 +2564,7 @@ fn status_text_output_has_stable_running_health_projection() {
     assert_eq!(
         output,
         format!(
-            "pueue-agent status project=project-a\ndaemon: running\nservice: running\nautomation: active\nproject: project-a\nproject: enabled=true paused=false halted=false\nroot: {}\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\npueue: total=1 active=1 queued=0\nactive_tasks: 1\ntask=41 state=running python train.py\nevents: pending=0 claimed=0 retry_wait=0 in_flight=0 dispatched=0 failed=0 dead_letter=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\ncampaign: id=campaign-cli state=active reason=none experiments=accepted=1 rolling_usage=experiment=1 next_eligible_at=none unreconciled=0 objective_digest=objective-digest-cli\nhealth: id=experiment-cli state=suspicious signals=oomx2 age=8 action=kill_and_resume\nguardrails: consecutive_failures=0/3 experiments=1/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}\nsummary: 1 active task(s), 0 pending event(s), 0 active agent run(s)",
+            "pueue-agent status project=project-a\ndaemon: running\nservice: running\nautomation: active\nproject: project-a\nproject: enabled=true paused=false halted=false\nroot: {}\ngroup: pa-project\nenabled: true\npaused: false\nhalted: no\npueue: total=1 active=1 queued=0\nactive_tasks: 1\ntask=41 state=running python train.py\nevents: pending=0 claimed=0 retry_wait=0 in_flight=0 dispatched=0 failed=0 dead_letter=0\nintegration_errors: 0\nopen_incidents: 0\ntermination_requests: requested=0 sent=0 confirmed=0 timed_out=0 failed=0\nagent_runs: active=0 failed=0\ncampaign: id=campaign-cli state=active reason=none experiments=accepted=1 rolling_usage=experiment=1 next_eligible_at=none unreconciled=0 objective_digest=objective-digest-cli\nresearch: state=idle next_due_at=none last_review_id=none experiment_id=none last_action=none checkpoint_confirmation=none blocked_reason=none discarded_reason=none session_generation=0 session_rebuilt=false\nhealth: id=experiment-cli state=suspicious signals=oomx2 age=8 action=kill_and_resume\nguardrails: consecutive_failures=0/3 experiments=1/20 agent_runs=0/10\ncodex_context: mode=resume session={CODEX_SESSION_ID}\nsummary: 1 active task(s), 0 pending event(s), 0 active agent run(s)",
             harness.project().root_path.display(),
         )
     );

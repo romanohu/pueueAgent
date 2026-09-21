@@ -13,7 +13,7 @@ use crate::{
         inferred_pre_binding_policy_code, AgentRunRepository, CampaignRepository,
         CampaignStatusProjection, CodeChangeRepository, Db, EventExecutionProjection,
         EventRepository, HealthRepository, IncidentRepository, InterventionRepository,
-        ProjectRepository, SubmissionRepository, TaskObservationRepository,
+        ProjectRepository, ResearchRepository, SubmissionRepository, TaskObservationRepository,
         TerminationRequestRepository,
         LATEST_SCHEMA_VERSION,
     },
@@ -30,13 +30,15 @@ use crate::{
     },
     output::{
         bounded_execution_path, bounded_redacted_text, bounded_typed_text, format_state,
-        human_header, human_summary, render_id, DecisionStatusProjection,
+        human_header, human_summary, render_id, render_research_status_line,
+        DecisionStatusProjection,
     },
     pueue::{PueueTask, PUEUE_TIMEOUT},
     pueue_security::MAX_PUEUE_OUTPUT_BYTES,
     project_logs::{inspect_agent_log_dir, ProjectRootLogReader},
     service::{callback_command, ServicePaths, ServiceStatus},
     state,
+    research::ResearchStatusProjection,
     status::{current_decision_projection, PueueSnapshot, StatusInput},
     AppError,
 };
@@ -468,6 +470,8 @@ pub struct DoctorReport {
     pub project_id: String,
     pub root_path: String,
     pub status: DoctorCheckStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub research: Option<ResearchStatusProjection>,
     pub checks: Vec<DoctorCheck>,
 }
 
@@ -499,6 +503,9 @@ pub fn render_doctor_report_value(report: &DoctorReport, json: bool) -> Result<S
     let mut lines = vec![format!("doctor: {}", doctor_status_label(report.status))];
     lines.push(format!("project: {}", bounded_redacted_text(&report.project_id)));
     lines.push(format!("root: {}", report.root_path));
+    if let Some(research) = report.research.as_ref() {
+        lines.push(render_research_status_line(research));
+    }
     lines.extend(report.checks.iter().map(|check| {
         format!(
             "{}: {} — {} [{}]",
@@ -660,7 +667,12 @@ pub fn build_doctor_report_with_policy_and_roots(
         }
     }
 
-    let campaign = CampaignRepository::new(db).doctor_projection_for_project(&project.project_id)?;
+    let campaign_repository = CampaignRepository::new(db);
+    let campaign = campaign_repository.doctor_projection_for_project(&project.project_id)?;
+    let research = campaign_repository
+        .status_projection_for_project(&project.project_id, now)?
+        .map(|campaign| ResearchRepository::new(db).status_projection(&campaign.campaign_id))
+        .transpose()?;
     checks.push(if campaign.live_campaign_count <= 1 {
         doctor_ok(
             "campaign.live_count",
@@ -1363,6 +1375,7 @@ pub fn build_doctor_report_with_policy_and_roots(
         root_path: bounded_execution_path(&project.root_path.to_string_lossy())
             .unwrap_or_else(|| "[invalid]".to_owned()),
         status,
+        research,
         checks,
     })
 }
@@ -2602,7 +2615,8 @@ pub fn render_project_status_json(
             )?
                 .as_ref()
                 .map(DecisionStatusProjection::from);
-            Some(CampaignStatusSummary::new(projection.clone(), decision))
+            let research = ResearchRepository::new(db).status_projection(&projection.campaign_id)?;
+            Some(CampaignStatusSummary::new(projection.clone(), decision, research))
         }
         None => None,
     };
@@ -3297,12 +3311,14 @@ struct CampaignStatusSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     best_metric_value: Option<f64>,
     decision: Option<DecisionStatusProjection>,
+    research: ResearchStatusProjection,
 }
 
 impl CampaignStatusSummary {
     fn new(
         campaign: CampaignStatusProjection,
         decision: Option<DecisionStatusProjection>,
+        research: ResearchStatusProjection,
     ) -> Self {
         let has_objective = campaign.has_objective;
         let best_experiment_id = if has_objective {
@@ -3339,6 +3355,7 @@ impl CampaignStatusSummary {
                 None
             },
             decision,
+            research,
         }
     }
 }

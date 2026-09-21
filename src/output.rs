@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::{
     db::DecisionDoctorProjection,
     models::{Campaign, Experiment, Proposal},
+    research::{ResearchReviewSummary, ResearchStatusProjection},
     AppError,
 };
 
@@ -114,6 +115,8 @@ pub fn render_campaign_status(
         budget_usage,
         task_ids,
         None,
+        None,
+        &[],
         json,
     )
 }
@@ -125,6 +128,8 @@ pub(crate) fn render_campaign_status_with_decision(
     budget_usage: &std::collections::BTreeMap<String, i64>,
     task_ids: &[i64],
     decision: Option<&DecisionStatusProjection>,
+    research: Option<&ResearchStatusProjection>,
+    research_history: &[ResearchReviewSummary],
     json: bool,
 ) -> Result<String, AppError> {
     let experiment_count = experiment_counts.values().sum::<i64>();
@@ -148,6 +153,8 @@ pub(crate) fn render_campaign_status_with_decision(
             "budget_usage": budget_usage,
             "task_ids": task_ids,
             "decision": decision,
+            "research": research,
+            "research_history": research_history,
         }))
         .map_err(|source| AppError::Serialization {
             operation: "serialize campaign status",
@@ -162,6 +169,10 @@ pub(crate) fn render_campaign_status_with_decision(
     ];
     if let Some(decision) = decision {
         lines.push(render_decision_status_line(decision));
+    }
+    if let Some(research) = research {
+        lines.push(render_research_status_line(research));
+        lines.extend(render_research_history_lines(research_history));
     }
     lines.extend([
         format!(
@@ -209,6 +220,62 @@ pub(crate) fn render_campaign_status_with_decision(
         human_summary("campaign state inspected"),
     ]);
     Ok(lines.join("\n"))
+}
+
+pub(crate) fn render_research_status_line(research: &ResearchStatusProjection) -> String {
+    format!(
+        "research: state={} next_due_at={} last_review_id={} experiment_id={} last_action={} checkpoint_confirmation={} blocked_reason={} discarded_reason={} session_generation={} session_rebuilt={}",
+        bounded_redacted_text(&research.state),
+        research
+            .next_due_at
+            .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        safe_optional_text(research.last_review_id.as_deref()).unwrap_or_else(|| "none".to_owned()),
+        safe_optional_text(research.experiment_id.as_deref()).unwrap_or_else(|| "none".to_owned()),
+        safe_optional_text(research.last_action.as_deref()).unwrap_or_else(|| "none".to_owned()),
+        safe_optional_text(research.checkpoint_confirmation.as_deref())
+            .unwrap_or_else(|| "none".to_owned()),
+        safe_optional_text(research.blocked_reason.as_deref()).unwrap_or_else(|| "none".to_owned()),
+        safe_optional_text(research.discarded_reason.as_deref()).unwrap_or_else(|| "none".to_owned()),
+        research.session_generation,
+        session_rebuilt_label(research.session_rebuilt, "直近レビューでセッションを再構成"),
+    )
+}
+
+pub(crate) fn render_research_history_lines(
+    history: &[ResearchReviewSummary],
+) -> Vec<String> {
+    if history.is_empty() {
+        return vec!["research_history: none".to_owned()];
+    }
+    history
+        .iter()
+        .map(|review| {
+            format!(
+                "research_history: review_id={} experiment_id={} state={} last_action={} checkpoint_confirmation={} blocked_reason={} discarded_reason={} session_generation={} session_rebuilt={}",
+                bounded_redacted_text(&review.review_id),
+                bounded_redacted_text(&review.experiment_id),
+                bounded_redacted_text(&review.state),
+                safe_optional_text(review.last_action.as_deref())
+                    .unwrap_or_else(|| "none".to_owned()),
+                safe_optional_text(review.checkpoint_confirmation.as_deref())
+                    .unwrap_or_else(|| "none".to_owned()),
+                safe_optional_text(review.blocked_reason.as_deref())
+                    .unwrap_or_else(|| "none".to_owned()),
+                safe_optional_text(review.discarded_reason.as_deref())
+                    .unwrap_or_else(|| "none".to_owned()),
+                review.session_generation,
+                session_rebuilt_label(review.session_rebuilt, "このレビューでセッションを再構成"),
+            )
+        })
+        .collect()
+}
+
+fn session_rebuilt_label(value: bool, explanation: &str) -> String {
+    if value {
+        format!("true({explanation})")
+    } else {
+        "false".to_owned()
+    }
 }
 
 pub fn render_campaign_mutation(
@@ -394,6 +461,7 @@ pub fn render_experiment_inspection(
     campaign: &Campaign,
     experiment: &Experiment,
     argv_digest: &str,
+    research_history: &[ResearchReviewSummary],
     json: bool,
 ) -> Result<String, AppError> {
     if json {
@@ -416,12 +484,19 @@ pub fn render_experiment_inspection(
                 .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null),
         );
+        object.insert(
+            "research_history".to_owned(),
+            serde_json::to_value(research_history).map_err(|source| AppError::Serialization {
+                operation: "serialize experiment research history",
+                source,
+            })?,
+        );
         return serde_json::to_string(&value).map_err(|source| AppError::Serialization {
             operation: "serialize campaign experiment inspection",
             source,
         });
     }
-    Ok([
+    let mut lines = vec![
         human_header("experiment inspect", &campaign.project_id),
         format!("experiment: {}", bounded_redacted_text(&experiment.experiment_id)),
         format!("campaign: {}", bounded_redacted_text(&experiment.campaign_id)),
@@ -452,6 +527,9 @@ pub fn render_experiment_inspection(
             safe_optional_text(experiment.failure_code.as_deref())
                 .unwrap_or_else(|| "none".to_owned())
         ),
+    ];
+    lines.extend(render_research_history_lines(research_history));
+    lines.extend([
         format!(
             "timestamps: created_at={} updated_at={} finished_at={}",
             experiment.created_at,
@@ -462,8 +540,8 @@ pub fn render_experiment_inspection(
                 .unwrap_or_else(|| "none".to_owned())
         ),
         human_summary("experiment inspected"),
-    ]
-    .join("\n"))
+    ]);
+    Ok(lines.join("\n"))
 }
 
 fn proposal_list_value(proposal: &Proposal) -> serde_json::Value {

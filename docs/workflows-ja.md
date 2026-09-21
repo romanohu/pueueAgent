@@ -112,6 +112,8 @@ pueue-agent doctor --json
 
 `status --json` は service、automation、project、Pueue snapshot、agent run などをまとめますが、submission の一覧は含みません。submission と task の lineage は `runs --json`、特定 task は `inspect <TASK_ID>`、incident の判断根拠は `explain <INCIDENT_ID>` で確認します。低レベル調査で raw Pueue data が必要な場合だけ `pueue status --json` を使い、supervisor の accounting と guardrail の確認には `pueue-agent` の出力を使います。
 
+研究を確認するときは `campaign status --json` の `research` と同じ campaign の `research_history`（直近最大32件）を使います。通常の `status --json` は `campaign.research` だけ、`doctor --json` は top-level の `research` だけを表示し、`experiment inspect <experiment-id> --json` は同じ campaign と指定した experiment に絞った `research_history`（最大32件）を表示します。
+
 ## Terminal decision loop を確認する
 
 terminal experiment が reconciliation されると、supervisor は一意な `decision cycle` を作ります。通常の遷移は `pending` → `analyzing` → `completed` または `waiting` です。bounded failure が service-owned 上限に達した場合は `degraded` になります。
@@ -134,15 +136,15 @@ campaign research reviewer は、service policy の `[campaign].research_interva
 
 研究担当へ渡すのは bounded な観測事実と過去の研究メモです。対象 experiment/task identity、観測時刻、既存の評価値・health 状態への参照は事実として扱い、仮説、改善見込み、次回確認事項は助言として保存します。SQLite の campaign、objective、budget、lineage、best、termination が正本であり、研究メモや会話がこれらを上書きすることはありません。全 transcript や全ログを復元・表示する経路ではありません。
 
-同じ campaign の experiment を切り替えても、研究担当は campaign に所有された同じ session を exact resume します。別 campaign の session、他 role の session、`resume_latest` は流用しません。安全に欠落した session だけは、保存済みの事実、bounded notes、experiment 履歴から fresh な session を再構成できます。再構成後のメモは reconstructed notes であり、失われた transcript の完全復元ではありません。session の所有権、path、policy が確認できない場合は fresh に置き換えず blocked にします。
+同じ campaign の experiment を切り替えるときの session 選択、campaign に所有された session の exact resume、安全に Missing と判定できる session の bounded notes からの再構成は supervisor が行います。別 campaign の session、他 role の session、`resume_latest` は流用しません。再構成後のメモは reconstructed notes であり、失われた transcript の完全復元ではありません。summary の `session_rebuilt` は session generation が 0 より大きく、現在の campaign generation と一致する `last_review_id` の直近 review で再構成が確認された事実、history の各行の `session_rebuilt` はその review 自身の 0 より大きい session generation で再構成が確認された事実を示します。後の session generation が変わっても過去の history 行の事実は変わりません。session の所有権、path、policy が確認できない場合は fresh に置き換えず research state を blocked にします。Research reviewer は supervisor が用意した session-bound な bounded input だけを読み、session を選択・変更せず、blocked enum を返しません。
 
 研究回答の action は次の三つです。
 
 1. `continue`: 対象 experiment をそのまま続け、検証済みの研究メモと次回時刻を保存します。新しい task、proposal、termination は作りません。
 2. `stop_and_next`: 回答の target identity と現在の campaign/health/budget を再検証し、停止要求を永続化して既存 termination manager へ渡します。kill の終了コードだけで停止済みとはせず、確認済みの termination と terminal projection を待ってから、同じ終端 experiment の fresh な terminal decision に引き継ぎます。fresh decision が proposal を返すとは限らず、wait、budget 待ち、拒否になることもあるため、打ち切り後の次候補の受理を保証しません。
-3. `resume_from_checkpoint`: loader と checkpoint の互換性、scope、サイズ、所有権、identity/content digest、後継が読むまでの retention を検証できる場合だけ既存の resume admission へ渡します。任意の framework やすべての candidate を一律に再開する機能ではなく、argv の resume flag や `checkpoint_note` だけでは十分な根拠になりません。実際の load evidence が確認できる場合だけ再開確認済みとし、それ以外は `unconfirmed` のまま表示します。
+3. `resume_from_checkpoint`: `last_action` に記録される要求であり、loader と checkpoint の互換性、source support proof、scope、サイズ、所有権、identity/content digest、後継が terminal になり live reader がいなくなるまでの retention を検証できる場合だけ既存の resume admission へ渡します。campaign ごとの retained research checkpoint は合計 **1 GiB** までです。任意の framework やすべての candidate を一律に再開する機能ではなく、argv の resume flag や `checkpoint_note` だけでは十分な根拠になりません。support が proved unavailable の要求は `checkpoint_confirmation` が `unsupported` となり、適用されず後継も作られません。実際の matching load evidence が確認できない場合は `checkpoint_confirmation` を `unconfirmed` のまま表示します。要求された action、unsupported / unconfirmed の結果、後継の未受理、実際の load confirmation を混同しないでください。
 
-研究 agent の timeout、不正 JSON、通常の runtime failure は bounded な retry として扱い、安全に Missing と判定できた session の再構成も同じ attempt/budget 境界で行います。研究が失敗しただけで learning task を kill しません。session の所有権・path、policy/credential、unsupported runtime の問題は retry や fresh fallback ではなく研究担当だけを blocked にします。review ごとの試行上限には `max_decision_attempts_per_cycle`（既定3）を使いますが、terminal decision の cycle とは別に数えます。再試行・新 session・再構成も既存の agent-run budget を消費し、daemon restart や session generation の変更で試行数・budget をリセットしません。上限到達、所有権不一致、unsafe path、policy/credential、unsupported runtime の問題は機械的な異常検知と既存 health diagnosis を止めません。
+研究 agent の timeout、不正 JSON、通常の runtime failure は bounded な retry として扱い、session の選択・再構成は supervisor が同じ attempt/budget 境界で行います。研究が失敗しただけで learning task を kill しません。session の所有権・path、policy/credential、unsupported runtime の問題は retry や fresh fallback ではなく research state を blocked にします。review ごとの試行上限には `max_decision_attempts_per_cycle`（既定3）を使いますが、terminal decision の cycle とは別に数えます。再試行・新 session・再構成も既存の agent-run budget を消費し、daemon restart や session generation の変更で試行数・budget をリセットしません。上限到達、所有権不一致、unsafe path、policy/credential、unsupported runtime の問題は機械的な異常検知と既存 health diagnosis を止めません。
 
 blocked の研究を復旧するときは、pause、原因修正、preflight 付き resume を明示的に行います。
 
@@ -154,7 +156,7 @@ pueue-agent campaign status --json
 pueue-agent campaign resume
 ```
 
-`campaign resume` は現在の runtime、policy、campaign session（または安全に Missing と判定できる session）を検証してから新しい review を予定します。過去 review の失敗・attempt・消費済み budget・未解決の termination・exhausted な terminal decision は消去しません。daemon の再起動、`pueue-agent wake --reason "<REASON>"`、`research_interval_minutes = 0` は research blocked を解除しません。
+`campaign resume` は現在の runtime、policy、campaign session（または安全に Missing と判定できる session）を検証してから、研究状態の `blocked_reason` を消し、`next_due_at` を現在時刻に設定して更新時刻を記録し、新しい review を予定します。これは blocked recovery に限る三つの研究状態更新で、過去 review の失敗・attempt・消費済み budget・event・未解決の termination・session とその所有権・exhausted な terminal decision は消去しません。表示用の research reason は原因を説明する bounded な補助表示であり、それだけで durable な blocked state を解除できません。daemon の再起動、`pueue-agent wake --reason "<REASON>"`、`research_interval_minutes = 0` は research blocked を解除しません。
 
 ## 監視とエージェントの起動を区別する
 
@@ -162,12 +164,12 @@ pueue-agent campaign resume
 | --- | --- | --- |
 | pattern / stall detector | `config.toml` の `[check]`。ログ信号や出力停止を機械的に確認 | 観測自体は agent を起動しない。action により event / termination request を作る |
 | running-health observer / diagnosis | service policy の `observer_interval_minutes`（既定30分）で観測し、疑わしい場合だけ診断 | diagnosis は常に fresh |
-| campaign research reviewer | service policy の `[campaign].research_interval_minutes`（既定30分）。healthy な running experiment も対象 | 同じ campaign の session を exact resume。安全な Missing だけ notes から fresh に再構成し、unsafe/所有権不一致は blocked |
+| campaign research reviewer | service policy の `[campaign].research_interval_minutes`（既定30分）。healthy な running experiment も対象 | supervisor が同じ campaign の session を選び exact resume。安全な Missing だけ notes から再構成し、unsafe/所有権不一致は research state を blocked。reviewer は session を選ばず三つの action だけを返す |
 | terminal decision | 実験の終了・照合後、または有限待機の期限後 | decision は常に fresh。SQLite 由来の証拠を渡す |
 | Periodic DeepCheck（通常 agent） | `[check].deep_check_interval_minutes` を正の値に設定した場合。既定0は無効 | `[agent.context]` の fresh / resume / resume_latest に従う |
 | code-change editor | code-change proposal の受理後 | 初回 fresh、修正時だけ同じ session を一度 resume（合計最大2 attempts） |
 
-SQLite に履歴が残ることと、agent の会話 session が継続することは別です。research reviewer だけが campaign 所有の session を exact resume し、session 欠落時は安全に判定できる場合に限り notes から再構成します。`agent.context.mode = "resume_latest"` を指定しても、decision / diagnosis が同じ会話を引き継ぐようにはなりません。
+SQLite に履歴が残ることと、agent の会話 session が継続することは別です。supervisor だけが campaign 所有の session を選んで exact resume し、session 欠落時は安全に判定できる場合に限り notes から再構成します。Research reviewer は supervisor が渡す session-bound evidence を読み、session の選択・変更や blocked 判定をしません。`agent.context.mode = "resume_latest"` を指定しても、decision / diagnosis が同じ会話を引き継ぐようにはなりません。
 
 running health は OOM・エラー信号やログ停止の診断であり、毎30分に同じ研究 agent が収束見込みを判断して新しい設定へ切り替える機能ではありません。campaign research reviewer は別の周期で healthy な実験を判断します。`kill_and_resume` は終了確認後の同一 argv の後継実験です。checkpoint から再開できるかどうかは、その学習コマンドと保存済み成果物の互換性・保持を検証できる場合に限られ、未確認の loader を「再開確認済み」とは表示しません。
 

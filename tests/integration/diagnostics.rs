@@ -9,7 +9,8 @@ use pueue_agent::{
     db::{
         AgentRunRepository, CampaignRepository, CodeChangeRepository, Db, DecisionRepository,
         EventRepository, ExperimentRepository, HealthRepository, IncidentRepository,
-        InterventionRepository, ProjectRepository, StartCampaignRequest, TaskObservationRepository,
+        InterventionRepository, ProjectRepository, ResearchRepository, StartCampaignRequest,
+        TaskObservationRepository,
         TerminationRequestRepository, LATEST_SCHEMA_VERSION,
     },
     diagnostics::{
@@ -1914,6 +1915,329 @@ fn campaign_status_human_compact_and_json_project_bounded_campaign_state() {
 }
 
 #[test]
+fn operator_surfaces_render_bounded_research_projection_and_scoped_history() {
+    let harness = DiagnosticsHarness::new();
+    let campaign_id = harness.start_campaign();
+    let experiment_id = "diagnostics-campaign-experiment";
+    let (other_experiment_id, _) = harness.add_terminal_decision_cycle(
+        &campaign_id,
+        "surface-other",
+        1,
+        90,
+        "completed",
+        None,
+        90,
+    );
+    ResearchRepository::new(&harness.db)
+        .ensure_campaign(&campaign_id)
+        .unwrap();
+    let event = EventRepository::new(&harness.db)
+        .insert_idempotent(
+            &NewEvent::new(
+                "project-a",
+                EventKind::CampaignResearch,
+                "surface-research-event",
+                json!({"response": "TRANSCRIPT_SECRET"}),
+                100,
+                100,
+            )
+            .with_campaign_lineage(&campaign_id, Some(experiment_id)),
+        )
+        .unwrap();
+    let other_event = EventRepository::new(&harness.db)
+        .insert_idempotent(
+            &NewEvent::new(
+                "project-a",
+                EventKind::CampaignResearch,
+                "surface-other-research-event",
+                json!({"response": "OTHER_TRANSCRIPT_SECRET"}),
+                2000,
+                2000,
+            )
+            .with_campaign_lineage(&campaign_id, Some(&other_experiment_id)),
+        )
+        .unwrap();
+    let response_for = |review_id: &str, experiment_id: &str| {
+        json!({
+            "schema_version": 1,
+            "review_id": review_id,
+            "experiment_id": experiment_id,
+            "context_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "resume_from_checkpoint",
+            "reason": "bounded",
+            "evidence_refs": [],
+            "notes": "TRANSCRIPT_SECRET",
+            "next_direction": null,
+            "checkpoint": {
+                "path": "checkpoint.json",
+                "argv": ["python", "train.py"],
+                "working_directory": ".",
+                "support_evidence_refs": ["checkpoint:bounded"]
+            }
+        })
+    };
+    let notes = json!({
+        "checkpoint_unsupported": "unsupported",
+        "display": "TRANSCRIPT_SECRET"
+    });
+    let connection = harness.db.connect().unwrap();
+    for index in 0..34 {
+        let review_id = format!("surface-matching-{index:03}");
+        let created_at = 1000 + index as i64;
+        connection
+            .execute(
+                "INSERT INTO research_reviews (
+                     review_id, campaign_id, experiment_id, task_signature, attempt,
+                     state, operation_stage, agent_run_id, context_json, context_digest,
+                     response_json, termination_request_id, successor_experiment_id,
+                     evidence_schema_version, session_generation, event_id, not_before,
+                     notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                     created_at, started_at, finished_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'surface-signature', 0, 'completed', NULL, NULL,
+                           NULL, NULL, ?4, NULL, NULL, NULL, 2, ?5, ?6, ?7, NULL,
+                           NULL, NULL, ?6, ?6, ?6, ?6)",
+                rusqlite::params![
+                    review_id,
+                    campaign_id,
+                    experiment_id,
+                    response_for(&review_id, experiment_id).to_string(),
+                    event.event_id,
+                    created_at,
+                    notes.to_string(),
+                ],
+            )
+            .unwrap();
+    }
+    let other_review_id = "surface-other-review";
+    let other_failure_code = "token=ghp_abcdefghijklmnopqrstuvwxyz123456";
+    connection
+        .execute(
+            "INSERT INTO research_reviews (
+                 review_id, campaign_id, experiment_id, task_signature, attempt,
+                 state, operation_stage, agent_run_id, context_json, context_digest,
+                 response_json, termination_request_id, successor_experiment_id,
+                 evidence_schema_version, session_generation, event_id, not_before,
+                 notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                 created_at, started_at, finished_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'surface-signature', 0, 'blocked', NULL, NULL,
+                       NULL, NULL, ?4, NULL, NULL, NULL, 2, ?5, 2000, NULL, ?6,
+                       NULL, NULL, 2000, 2000, 2000, 2000)",
+            rusqlite::params![
+                other_review_id,
+                campaign_id,
+                other_experiment_id,
+                response_for(other_review_id, &other_experiment_id).to_string(),
+                other_event.event_id,
+                other_failure_code,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE campaign_research
+             SET session_generation = 2, next_due_at = 999, last_review_id = ?1
+             WHERE campaign_id = ?2",
+            rusqlite::params!["surface-matching-033", campaign_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let snapshot_sql_rows = |connection: &rusqlite::Connection, sql: &str| {
+        connection
+            .prepare(sql)
+            .unwrap()
+            .query_map([], |row| {
+                (0..row.as_ref().column_count())
+                    .map(|index| row.get(index))
+                    .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let snapshot = || {
+        let connection = harness.db.connect().unwrap();
+        (
+            snapshot_sql_rows(
+                &connection,
+                "SELECT * FROM campaign_research ORDER BY campaign_id",
+            ),
+            snapshot_sql_rows(
+                &connection,
+                "SELECT * FROM research_reviews ORDER BY review_id",
+            ),
+            snapshot_sql_rows(&connection, "SELECT * FROM events ORDER BY event_id"),
+        )
+    };
+    let before = snapshot();
+
+    let input = harness.input(PueueSnapshot::Tasks(Vec::new()));
+    let campaign_json = pueue_agent::campaign::render_status_for_project(
+        &harness.db,
+        &harness.project(),
+        true,
+    )
+    .unwrap();
+    let campaign_human = pueue_agent::campaign::render_status_for_project(
+        &harness.db,
+        &harness.project(),
+        false,
+    )
+    .unwrap();
+    let status_json = render_project_status_json(&harness.db, &harness.project(), &input).unwrap();
+    let status_human = render_project_status(&harness.db, &harness.project(), &input).unwrap();
+    let status_compact = render_project_status_compact(&harness.db, &harness.project(), &input).unwrap();
+    let experiment_json = pueue_agent::campaign::render_experiment_for_project(
+        &harness.db,
+        &harness.project(),
+        experiment_id,
+        true,
+    )
+    .unwrap();
+    let experiment_human = pueue_agent::campaign::render_experiment_for_project(
+        &harness.db,
+        &harness.project(),
+        experiment_id,
+        false,
+    )
+    .unwrap();
+    let doctor_json = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+        true,
+    )
+    .unwrap();
+    let doctor_human = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+        false,
+    )
+    .unwrap();
+
+    let campaign_value: Value = serde_json::from_str(&campaign_json).unwrap();
+    assert_eq!(campaign_value["schema_version"], 1);
+    assert_eq!(campaign_value["research"]["state"], "completed");
+    assert_eq!(campaign_value["research"]["last_action"], "resume_from_checkpoint");
+    assert_eq!(campaign_value["research"]["checkpoint_confirmation"], "unsupported");
+    let campaign_history = campaign_value["research_history"].as_array().unwrap();
+    assert_eq!(campaign_history.len(), 32);
+    let expected_campaign_review_ids = std::iter::once(other_review_id.to_owned())
+        .chain((3..=33).rev().map(|index| format!("surface-matching-{index:03}")))
+        .collect::<Vec<_>>();
+    let actual_campaign_review_ids = campaign_history
+        .iter()
+        .map(|review| review["review_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(actual_campaign_review_ids, expected_campaign_review_ids);
+    assert_eq!(campaign_history[0]["experiment_id"], other_experiment_id);
+    assert!(campaign_history[1..]
+        .iter()
+        .all(|review| review["experiment_id"] == experiment_id));
+    assert!(campaign_human.contains("last_action=resume_from_checkpoint"));
+    assert!(campaign_human.contains("checkpoint_confirmation=unsupported"));
+    let campaign_history_lines = campaign_human
+        .lines()
+        .filter(|line| line.starts_with("research_history:"))
+        .collect::<Vec<_>>();
+    assert_eq!(campaign_history_lines.len(), 32);
+    let actual_campaign_human_review_ids = campaign_history_lines
+        .iter()
+        .map(|line| {
+            line.split_whitespace()
+                .find_map(|token| token.strip_prefix("review_id="))
+                .expect("human research history review_id")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual_campaign_human_review_ids, expected_campaign_review_ids);
+    assert!(campaign_json.contains("[REDACTED]"));
+    assert!(campaign_human.contains("[REDACTED]"));
+    assert!(!campaign_json.contains(other_failure_code));
+    assert!(!campaign_human.contains(other_failure_code));
+
+    let status_value: Value = serde_json::from_str(&status_json).unwrap();
+    assert_eq!(status_value["schema_version"], 1);
+    assert_eq!(
+        status_value["campaign"]["research"]["last_review_id"],
+        "surface-matching-033"
+    );
+    assert!(status_value.get("research_history").is_none());
+    assert!(status_value["campaign"].get("research_history").is_none());
+    for rendered in [&status_human, &status_compact] {
+        assert!(rendered.contains("research: state=completed"), "{rendered}");
+        assert!(rendered.contains("last_action=resume_from_checkpoint"), "{rendered}");
+        assert!(rendered.contains("checkpoint_confirmation=unsupported"), "{rendered}");
+        assert!(!rendered.contains("research_history"), "{rendered}");
+    }
+
+    let experiment_value: Value = serde_json::from_str(&experiment_json).unwrap();
+    assert_eq!(experiment_value["schema_version"], 1);
+    let experiment_history = experiment_value["research_history"].as_array().unwrap();
+    assert_eq!(experiment_history.len(), 32);
+    let expected_experiment_review_ids = (2..=33)
+        .rev()
+        .map(|index| format!("surface-matching-{index:03}"))
+        .collect::<Vec<_>>();
+    let actual_experiment_review_ids = experiment_history
+        .iter()
+        .map(|review| review["review_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(actual_experiment_review_ids, expected_experiment_review_ids);
+    assert!(experiment_history.iter().all(|review| {
+        review["experiment_id"] == experiment_id
+            && review["review_id"] != other_review_id
+    }));
+    assert!(!experiment_json.contains(other_review_id));
+    let experiment_history_lines = experiment_human
+        .lines()
+        .filter(|line| line.starts_with("research_history:"))
+        .collect::<Vec<_>>();
+    assert_eq!(experiment_history_lines.len(), 32);
+    let actual_experiment_human_review_ids = experiment_history_lines
+        .iter()
+        .map(|line| {
+            line.split_whitespace()
+                .find_map(|token| token.strip_prefix("review_id="))
+                .expect("human experiment history review_id")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual_experiment_human_review_ids, expected_experiment_review_ids);
+    assert!(!experiment_human.contains(other_review_id));
+
+    let doctor_value: Value = serde_json::from_str(&doctor_json).unwrap();
+    assert_eq!(doctor_value["schema_version"], 1);
+    assert_eq!(doctor_value["research"]["state"], "completed");
+    assert!(doctor_value.get("research_history").is_none());
+    assert!(doctor_human.contains("research: state=completed"));
+    assert!(!doctor_json.contains("research_history"));
+    assert!(!doctor_human.contains("research_history"));
+
+    for rendered in [
+        &campaign_json,
+        &campaign_human,
+        &status_json,
+        &status_human,
+        &status_compact,
+        &experiment_json,
+        &experiment_human,
+        &doctor_json,
+        &doctor_human,
+    ] {
+        assert!(!rendered.contains("TRANSCRIPT_SECRET"), "{rendered}");
+        assert!(!rendered.contains("OTHER_TRANSCRIPT_SECRET"), "{rendered}");
+        assert!(!rendered.contains("response_json"), "{rendered}");
+    }
+    assert_eq!(before, snapshot());
+}
+
+#[test]
 fn decision_status_prefers_the_active_analysis_over_a_newer_pending_cycle() {
     let harness = DiagnosticsHarness::new();
     let now = unix_now();
@@ -2409,14 +2733,14 @@ fn decision_doctor_reports_duplicate_active_attempts() {
 fn decision_doctor_reports_overdue_running_analysis() {
     let harness = DiagnosticsHarness::new();
     let now = unix_now();
-    let (_, cycle_id) = harness.start_terminal_decision(now - 180);
+    let (campaign_id, cycle_id) = harness.start_terminal_decision(now - 180);
     harness.write_project_config(1);
     let decisions = DecisionRepository::new(&harness.db);
     let reservation = decisions
         .reserve_next_attempt("project-a", &cycle_id, now - 179)
         .unwrap()
         .unwrap();
-    let context_json = "{}";
+    let context_json = r#"{"schema_version":1}"#;
     decisions
         .store_evidence(
             &reservation,
@@ -2429,11 +2753,12 @@ fn decision_doctor_reports_overdue_running_analysis() {
         .insert_idempotent(&NewEvent::new(
             "project-a",
             EventKind::CampaignDecision,
-            "overdue-decision-run",
+            format!("campaign-decision:v1:{cycle_id}"),
             json!({}),
             now - 180,
             now - 180,
-        ))
+        )
+        .with_campaign_lineage(&campaign_id, Some("diagnostics-campaign-experiment")))
         .unwrap();
     EventRepository::new(&harness.db)
         .claim_batch(now - 179, now + 60, 1)
@@ -2526,7 +2851,7 @@ fn decision_doctor_reports_digest_mismatch_without_payload_or_repair() {
         .reserve_next_attempt("project-a", &cycle_id, now + 1)
         .unwrap()
         .unwrap();
-    let context_json = r#"{"prompt":"digest-raw-prompt-secret"}"#;
+    let context_json = r#"{"schema_version":1,"prompt":"digest-raw-prompt-secret"}"#;
     decisions
         .store_evidence(&reservation, context_json, &"0".repeat(64), now + 2)
         .unwrap();
@@ -2889,6 +3214,134 @@ fn campaign_status_is_absent_for_legacy_projects() {
     assert!(!human.lines().any(|line| line.starts_with("campaign:")));
     assert!(!compact.lines().any(|line| line.starts_with("campaign:")));
     assert!(serde_json::from_str::<Value>(&json).unwrap().get("campaign").is_none());
+
+    let doctor_json = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+        true,
+    )
+    .unwrap();
+    let doctor_human = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+        false,
+    )
+    .unwrap();
+    assert!(serde_json::from_str::<Value>(&doctor_json)
+        .unwrap()
+        .get("research")
+        .is_none());
+    assert!(!doctor_human.lines().any(|line| line.starts_with("research:")));
+    assert!(!doctor_json.contains("research_history"));
+    assert!(!doctor_human.contains("research_history"));
+}
+
+#[test]
+fn doctor_projects_research_for_retired_only_campaign() {
+    let harness = DiagnosticsHarness::new();
+    harness.start_campaign();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE campaigns SET state = 'retired', state_reason = 'fixture_retired'",
+            [],
+        )
+        .unwrap();
+
+    let json = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+        true,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["research"]["state"], "idle");
+    assert_eq!(value["research"]["session_generation"], 0);
+}
+
+#[test]
+fn operator_surfaces_render_idle_research_for_existing_campaign_without_state() {
+    let harness = DiagnosticsHarness::new();
+    harness.start_campaign();
+    let connection = harness.db.connect().unwrap();
+    let research_rows: i64 = connection
+        .query_row("SELECT COUNT(*) FROM campaign_research", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(research_rows, 0);
+    drop(connection);
+
+    let input = harness.input(PueueSnapshot::Tasks(Vec::new()));
+    let campaign_json = pueue_agent::campaign::render_status_for_project(
+        &harness.db,
+        &harness.project(),
+        true,
+    )
+    .unwrap();
+    let campaign_human = pueue_agent::campaign::render_status_for_project(
+        &harness.db,
+        &harness.project(),
+        false,
+    )
+    .unwrap();
+    let status_json = render_project_status_json(&harness.db, &harness.project(), &input).unwrap();
+    let status_human = render_project_status(&harness.db, &harness.project(), &input).unwrap();
+    let status_compact = render_project_status_compact(&harness.db, &harness.project(), &input).unwrap();
+    let doctor_json = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+        true,
+    )
+    .unwrap();
+    let doctor_human = render_doctor_report(
+        &harness.db,
+        &harness.project(),
+        &doctor_paths(&harness),
+        doctor_external(),
+        100,
+        false,
+    )
+    .unwrap();
+
+    let campaign_value: Value = serde_json::from_str(&campaign_json).unwrap();
+    assert_eq!(campaign_value["research"]["state"], "idle");
+    assert_eq!(campaign_value["research"]["session_generation"], 0);
+    assert!(campaign_value["research"]["last_review_id"].is_null());
+    assert_eq!(campaign_value["research_history"].as_array().unwrap().len(), 0);
+    assert!(campaign_human.contains("research: state=idle"));
+    assert!(campaign_human.contains("research_history: none"));
+
+    let status_value: Value = serde_json::from_str(&status_json).unwrap();
+    assert_eq!(status_value["campaign"]["research"]["state"], "idle");
+    assert_eq!(status_value["campaign"]["research"]["session_generation"], 0);
+    assert!(status_value["campaign"]["research"]["last_review_id"].is_null());
+    assert!(status_value["campaign"].get("research_history").is_none());
+    assert!(status_value.get("research_history").is_none());
+    for rendered in [&status_human, &status_compact] {
+        assert!(rendered.contains("research: state=idle"), "{rendered}");
+        assert!(!rendered.contains("research_history"), "{rendered}");
+    }
+
+    let doctor_value: Value = serde_json::from_str(&doctor_json).unwrap();
+    assert_eq!(doctor_value["research"]["state"], "idle");
+    assert_eq!(doctor_value["research"]["session_generation"], 0);
+    assert!(doctor_value.get("research_history").is_none());
+    assert!(doctor_human.contains("research: state=idle"));
+    assert!(!doctor_json.contains("research_history"));
+    assert!(!doctor_human.contains("research_history"));
 }
 
 #[test]

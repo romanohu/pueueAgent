@@ -41,6 +41,10 @@ fn update(root: &std::path::Path, apply: Option<&str>) -> std::process::Output {
     command.output().unwrap()
 }
 
+fn old_marked_template() -> Vec<u8> {
+    include_bytes!("../../templates/legacy/instructions-v1.md").to_vec()
+}
+
 #[cfg(unix)]
 fn update_token(root: &std::path::Path, before: &[u8], after: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -102,6 +106,98 @@ fn preview_prints_substantive_managed_instruction_diff() {
     assert!(output.contains("+## Standard role"));
     assert!(output.contains("+## Diagnosis role"));
     assert!(output.contains("-## Phase 2 decision agent"));
+}
+
+#[test]
+fn preview_then_apply_updates_an_old_marked_distribution_and_preserves_custom_bytes() {
+    let (_temporary, instruction_path, _legacy_original) = initialized_legacy_project();
+    let old_managed = old_marked_template();
+    let original = [
+        b"operator prefix\r\n".as_slice(),
+        old_managed.as_slice(),
+        b"operator suffix\n".as_slice(),
+    ]
+    .concat();
+    fs::write(&instruction_path, &original).unwrap();
+    let root = instruction_path.parent().unwrap().parent().unwrap();
+
+    let preview = update(root, None);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview_text = String::from_utf8(preview.stdout).unwrap();
+    assert!(preview_text.contains("status: update_available"));
+    assert!(preview_text.contains("managed distribution: previous v1 -> current v1"));
+    assert!(preview_text.contains("+## Research role"));
+    let token = preview_text
+        .lines()
+        .find_map(|line| line.strip_prefix("preview_token: "))
+        .expect("old marked distribution preview must return a token")
+        .to_owned();
+    assert_eq!(fs::read(&instruction_path).unwrap(), original);
+
+    let apply = update(root, Some(&token));
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    assert!(String::from_utf8_lossy(&apply.stdout).contains("status: updated"));
+    let updated = fs::read(&instruction_path).unwrap();
+    assert!(updated.starts_with(b"operator prefix\r\n"));
+    assert!(updated.ends_with(b"operator suffix\n"));
+    assert_eq!(
+        updated
+            .windows(include_bytes!("../../templates/instructions.md").len())
+            .filter(|window| *window == include_bytes!("../../templates/instructions.md"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_dir(root.join(".pueue-agent/instructions.backups"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read(
+            fs::read_dir(root.join(".pueue-agent/instructions.backups"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path()
+        )
+        .unwrap(),
+        original
+    );
+}
+
+#[test]
+fn tampered_old_marked_distribution_fails_closed_without_writing() {
+    let (_temporary, instruction_path, _legacy_original) = initialized_legacy_project();
+    let mut old_managed = old_marked_template();
+    let body_offset = old_managed
+        .windows(b"## Standard role".len())
+        .position(|window| window == b"## Standard role")
+        .expect("frozen previous template must contain its role heading");
+    old_managed[body_offset] = b'X';
+    let contents = [
+        b"operator prefix\r\n".as_slice(),
+        old_managed.as_slice(),
+        b"operator suffix\n".as_slice(),
+    ]
+    .concat();
+    fs::write(&instruction_path, &contents).unwrap();
+    let root = instruction_path.parent().unwrap().parent().unwrap();
+
+    let preview = update(root, None);
+    assert!(!preview.status.success());
+    assert!(String::from_utf8_lossy(&preview.stderr).contains("instructions: conflict"));
+    assert_eq!(fs::read(&instruction_path).unwrap(), contents);
+    assert!(!root.join(".pueue-agent/instructions.backups").exists());
 }
 
 #[cfg(unix)]

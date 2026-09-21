@@ -155,16 +155,16 @@ git -C <project-root> worktree list --porcelain
 
 - **構文:** `pueue-agent campaign <status|pause|resume|retire|review> [--json] [--pueue-config PUEUE_CONFIG] [PROJECT_ROOT]`
 - **目的:** 対象プロジェクトの最新 campaign の状態を確認、または operator による状態遷移を実行します。
-- **状態変更:** `status` は読み取り専用です。`pause`、`resume`、`retire` は campaign の状態だけを変更し、project や既存 Pueue task を直接変更しません。
+- **状態変更:** `status` は読み取り専用です。通常の `pause`、`resume`、`retire` は campaign の状態を変更し、project や既存 Pueue task を直接変更しません。research が blocked の campaign で preflight 付き `resume` が成功した場合だけ、研究状態の `blocked_reason` を消し、`next_due_at` を現在時刻に設定して更新時刻を記録し、新しい review を予定します。過去の review 履歴、budget、event、session とその所有権は保持されます。
 - **主なオプション:** `--json`、`--pueue-config`、任意の `PROJECT_ROOT`。
 - **例:** `pueue-agent campaign status --json .`、`pueue-agent campaign pause .`
 - **失敗時の確認:** project に campaign があることを確認します。`resume` は project が有効で pause/halt されておらず、未照合または termination 状態不明の experiment がない場合だけ実行できます。`retire` はすべての experiment が終端かつ照合済みの場合だけ実行できます。
 
 `status` は campaign ID、状態、objective digest、proposal / experiment / budget の集計、task ID と時刻を表示します。`campaign status --json` の `decision` も project status と同じ current cycle と 8 field を投影し、cycle がなければ `null` です。objective 本文、raw argv、raw decision evidence は既定出力と JSON に含めません。
 
-同じ campaign scope の研究担当の状態も bounded に表示します。JSON 出力では、研究状態、次回の予定時刻、直近 review と対象 experiment、最後の action、blocked / discarded の理由、session 世代、session 再構成の有無、checkpoint の確認状態を意味する field として投影します。実装上の planned field 名は `state`、`next_due_at`、`last_review_id`、`experiment_id`、`last_action`、`blocked_reason`、`discarded_reason`、`session_generation`、`session_rebuilt`、`checkpoint_confirmation` です。研究が存在しない campaign は idle として扱われ、次回予定日を作りません。値は bounded / redacted で、raw session ID、prompt、transcript、credential は表示しません。
+同じ campaign scope の研究担当の状態も bounded に表示します。`campaign status --json` の `research` には `state`、`next_due_at`、`last_review_id`、`experiment_id`、`last_action`、`blocked_reason`、`discarded_reason`、`session_generation`、`session_rebuilt`、`checkpoint_confirmation` の10フィールドを出し、別の `research_history` には同じ campaign の review を新しい順に最大32件出します。`session_rebuilt` は summary では session generation が 0 より大きく、現在の campaign generation と一致する `last_review_id` の直近 review でセッション再構成が確認された事実だけを示し、後続の通常の resume を含む session 全体の由来を示すものではありません。history の各行ではその review 自身の 0 より大きい session generation でセッション再構成が確認された事実を示し、後の session generation が変わっても過去の history 行の事実を書き換えません。研究が存在しない campaign は idle として扱われ、次回予定日を作りません。値は bounded / redacted で、raw session ID、prompt、transcript、credential は表示しません。
 
-研究 review の履歴を広域の新しい history CLI で取得することはできません。`campaign status --json` または campaign に scope された表示に含まれる直近最大32件の bounded representation だけを使い、別 campaign の review を混ぜないでください。対象 experiment の実体は既存の `pueue-agent experiment inspect <experiment-id> --json` で確認します。
+研究 review の履歴を広域の新しい history CLI で取得することはできません。通常の `status --json` は `campaign.research` だけを出し、履歴を出しません。`doctor --json` は該当 campaign がある場合に top-level の任意フィールド `research` だけを出し、履歴を出しません。対象 experiment の `pueue-agent experiment inspect <experiment-id> --json` には、その experiment と同じ campaign に属する review だけを新しい順に最大32件の `research_history` として出します。いずれも別 campaign の review を混ぜません。
 
 `review accept` は `goal_reached_pending_review` の campaign を `retired`（`goal_accepted`）へ、`review reject` は `active` へ戻し、該当 `goal_reached` 決定イベントを `dead_letter` 化します。いずれも同一トランザクションで operator log を残し、非終端 experiment や予約が残る場合は失敗します。`accept` は idempotent で、`reject` は pending-review 以外では失敗します。
 
@@ -179,7 +179,7 @@ pueue-agent campaign review accept [--note TEXT]
 pueue-agent campaign review reject [--note TEXT]
 ```
 
-研究担当が blocked になった場合は、原因確認なしに `wake` や daemon restart で解除しません。まず campaign の自律処理を明示的に止め、runtime、policy、instructions、campaign に結び付いた research session を確認してから再開します。
+research state が blocked になった場合は、原因確認なしに `wake` や daemon restart で解除しません。supervisor が campaign の自律処理を明示的に止め、runtime、policy、instructions、campaign に結び付いた research session を確認してから再開します。
 
 ```bash
 pueue-agent campaign pause
@@ -189,13 +189,13 @@ pueue-agent campaign status --json
 pueue-agent campaign resume
 ```
 
-`campaign resume` は preflight が成功した場合だけ研究の blocked を解除して新しい review を予定します。安全に欠落した session は保存済みの bounded notes から再構成できますが、所有権を確認できない session は fresh に置き換えません。過去 review の失敗、試行数、消費済み budget、未解決の停止要求、terminal decision の exhausted cycle は消去しません。
+`campaign resume` は supervisor の preflight が成功した場合だけ research state の blocked を解除して新しい review を予定します。supervisor は安全に欠落した session だけを保存済みの bounded notes から再構成し、所有権を確認できない session は fresh に置き換えません。表示された `blocked_reason` は原因を説明するための bounded な表示で、原因が別の表示から補われる場合でも、それだけで durable な block を解除する権限にはなりません。過去 review の失敗、試行数、消費済み budget、未解決の停止要求、event、session とその所有権、terminal decision の exhausted cycle は消去しません。
 
 研究担当の action は `continue`、`stop_and_next`、`resume_from_checkpoint` の三つです。`continue` は新しい task を作らず、`stop_and_next` は対象 task の停止確認と terminal projection の後に fresh な terminal decision へ渡し、`resume_from_checkpoint` は互換性・scope・サイズ・retention を検証できる checkpoint だけを対象にします。停止コマンドの終了だけでは後継投入の前提を満たさず、fresh decision が待機・拒否を返すこともあります。研究の timeout や不正回答だけで learning task を kill することはありません。
 
-研究担当の周期は service policy の `[campaign].research_interval_minutes` で、既定30、`0..=1440` の範囲、`0` は無効です。`observer_interval_minutes` と `[check].deep_check_interval_minutes` とは別の値です。timeout、不正回答、通常の runtime failure と、安全に Missing と判定できた session の再構成は `max_decision_attempts_per_cycle`（既定3）の有限上限と既存 agent-run budget を使います。session の所有権・path、policy/credential、unsupported runtime の問題は retry や fresh fallback ではなく blocked です。上限到達後は bounded な blocked reason を残し、無限 retry や budget の返却は行いません。
+研究担当の周期は service policy の `[campaign].research_interval_minutes` で、既定30、`0..=1440` の範囲、`0` は無効です。`observer_interval_minutes` と `[check].deep_check_interval_minutes` とは別の値です。timeout、不正回答、通常の runtime failure と、安全に Missing と判定できた session の再構成は supervisor が `max_decision_attempts_per_cycle`（既定3）の有限上限と既存 agent-run budget の範囲で扱います。session の所有権・path、policy/credential、unsupported runtime の問題は retry や fresh fallback ではなく research state を blocked にします。上限到達後は bounded な blocked reason を残し、無限 retry や budget の返却は行いません。Research reviewer は blocked enum を返さず、三つの action だけを返します。
 
-checkpoint は、対象コマンドの loader と保存物の対応、検証可能な scope/サイズ、所有権・identity・内容 digest、後継が読むまでの retention を確認できる supported path に限ります。任意の framework や candidate を一律に扱う機能ではなく、argv の resume flag や研究メモだけでは「再開確認済み」になりません。実際の load evidence が確認できない場合は `checkpoint_confirmation` を `unconfirmed` として扱います。
+checkpoint は、対象コマンドの loader と保存物の対応、source support proof、検証可能な scope/サイズ、所有権・identity・内容 digest、後継が terminal になり live reader がいなくなるまでの retention を確認できる supported path に限ります。campaign ごとの retained research checkpoint の合計は **1 GiB** までです。任意の framework や candidate を一律に扱う機能ではなく、argv の resume flag や研究メモだけでは「再開確認済み」になりません。要求された `resume_from_checkpoint` は `last_action` に残りますが、support が proved unavailable なら `checkpoint_confirmation` は `unsupported` となり、適用も後継もありません。対応する load evidence が確認できない場合は `checkpoint_confirmation` を `unconfirmed` として扱います。要求された action、unsupported / unconfirmed の結果、後継の未受理、実際の load confirmation を別々に確認してください。
 
 ### `pueue-agent proposal`
 

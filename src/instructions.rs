@@ -17,13 +17,16 @@ pub(super) mod classification {
     pub(super) const CURRENT_TEMPLATE: &[u8] = include_bytes!("../templates/instructions.md");
     pub(super) const LEGACY_TEMPLATE: &[u8] =
         include_bytes!("../templates/legacy/instructions-v0.md");
+    pub(super) const PREVIOUS_TEMPLATE: &[u8] =
+        include_bytes!("../templates/legacy/instructions-v1.md");
     pub(super) const RESERVED_MARKER_PREFIX: &[u8] = b"<!-- pueue-agent:instructions";
     pub(super) const BEGIN_MARKER: &[u8] = b"<!-- pueue-agent:instructions v1 begin -->";
     pub(super) const END_MARKER: &[u8] = b"<!-- pueue-agent:instructions v1 end -->";
 }
 
 use classification::{
-    BEGIN_MARKER, CURRENT_TEMPLATE, END_MARKER, LEGACY_TEMPLATE, MAX_BYTES, RESERVED_MARKER_PREFIX,
+    BEGIN_MARKER, CURRENT_TEMPLATE, END_MARKER, LEGACY_TEMPLATE, MAX_BYTES, PREVIOUS_TEMPLATE,
+    RESERVED_MARKER_PREFIX,
 };
 
 const TOKEN_DOMAIN: &[u8] = b"pueue-agent:instructions-update:v1\0";
@@ -64,7 +67,11 @@ pub fn update(
     let before_sha256 = sha256_hex(&inspected.bytes);
     let classification = classify(&inspected.bytes)?;
 
-    let Classification::UpdateAvailable { candidate } = classification else {
+    let Classification::UpdateAvailable {
+        candidate,
+        before_template,
+    } = classification
+    else {
         return Ok(InstructionsUpdate {
             status: UpdateStatus::Current,
             preview_token: None,
@@ -78,7 +85,11 @@ pub fn update(
     let after_sha256 = sha256_hex(&candidate);
     let root_bytes = path_bytes(&inspected.canonical_root)?;
     let preview_token = update_token(root_bytes, &inspected.bytes, &candidate);
-    let diff = Some(render_bounded_diff(&inspected.bytes, &candidate));
+    let diff = Some(render_bounded_diff(
+        &inspected.bytes,
+        &candidate,
+        before_template,
+    ));
 
     if let Some(apply_token) = apply_token {
         if apply_token != preview_token || !is_digest(apply_token) {
@@ -168,7 +179,10 @@ pub fn render_update(result: &InstructionsUpdate) -> String {
 #[derive(Debug)]
 enum Classification {
     Current,
-    UpdateAvailable { candidate: Vec<u8> },
+    UpdateAvailable {
+        candidate: Vec<u8>,
+        before_template: &'static [u8],
+    },
 }
 
 fn classify(input: &[u8]) -> Result<Classification, AppError> {
@@ -184,21 +198,57 @@ fn classify(input: &[u8]) -> Result<Classification, AppError> {
     let end_count = count_occurrences(input, END_MARKER);
     let reserved_marker_count = count_occurrences(input, RESERVED_MARKER_PREFIX);
     let current_count = count_occurrences(input, CURRENT_TEMPLATE);
+    let previous_count = count_occurrences(input, PREVIOUS_TEMPLATE);
     let legacy_count = count_occurrences(input, LEGACY_TEMPLATE);
 
     if current_count == 1
         && begin_count == 1
         && end_count == 1
         && reserved_marker_count == 2
+        && previous_count == 0
         && legacy_count == 0
     {
         return Ok(Classification::Current);
     }
 
     // Marker-bearing files are recognized only when the complete, exact
-    // current distribution is present.  This rejects duplicate, mixed, and
-    // malformed marker layouts before they can be treated as Current.
-    if reserved_marker_count != 0 || begin_count != 0 || end_count != 0 || current_count != 0 {
+    // current or previous managed distribution is present.  This rejects
+    // duplicate, mixed, and malformed marker layouts before they can be
+    // treated as Current or UpdateAvailable.
+    if previous_count == 1
+        && current_count == 0
+        && legacy_count == 0
+        && begin_count == 1
+        && end_count == 1
+        && reserved_marker_count == 2
+    {
+        let start = find_subslice(input, PREVIOUS_TEMPLATE).expect("previous_count proves a match");
+        let mut candidate =
+            Vec::with_capacity(input.len() - PREVIOUS_TEMPLATE.len() + CURRENT_TEMPLATE.len());
+        candidate.extend_from_slice(&input[..start]);
+        candidate.extend_from_slice(CURRENT_TEMPLATE);
+        candidate.extend_from_slice(&input[start + PREVIOUS_TEMPLATE.len()..]);
+        if candidate.len() > MAX_BYTES {
+            return Err(conflict("updated instruction file exceeds 65536 bytes"));
+        }
+        std::str::from_utf8(&candidate)
+            .map_err(|_| conflict("updated instruction file is not valid UTF-8"))?;
+        return Ok(Classification::UpdateAvailable {
+            candidate,
+            before_template: PREVIOUS_TEMPLATE,
+        });
+    }
+
+    // Marker-bearing files are recognized only when the complete, exact
+    // current distribution is present after the previous-template branch.
+    // This rejects duplicate, mixed, and malformed marker layouts before
+    // they can be treated as Current.
+    if reserved_marker_count != 0
+        || begin_count != 0
+        || end_count != 0
+        || current_count != 0
+        || previous_count != 0
+    {
         return Err(conflict(
             "managed instruction markers are malformed or duplicated",
         ));
@@ -221,24 +271,34 @@ fn classify(input: &[u8]) -> Result<Classification, AppError> {
     }
     std::str::from_utf8(&candidate)
         .map_err(|_| conflict("updated instruction file is not valid UTF-8"))?;
-    Ok(Classification::UpdateAvailable { candidate })
+    Ok(Classification::UpdateAvailable {
+        candidate,
+        before_template: LEGACY_TEMPLATE,
+    })
 }
 
 pub(crate) fn is_current_distribution(input: &[u8]) -> bool {
     matches!(classify(input), Ok(Classification::Current))
 }
 
-fn render_bounded_diff(before: &[u8], after: &[u8]) -> String {
-    let mut diff = String::from("managed distribution: legacy 5d1a8e0 -> current v1\n");
+fn render_bounded_diff(before: &[u8], after: &[u8], before_template: &[u8]) -> String {
+    let source_label = if before_template == LEGACY_TEMPLATE {
+        "legacy 5d1a8e0"
+    } else {
+        "previous v1"
+    };
+    let mut diff = format!("managed distribution: {source_label} -> current v1\n");
     diff.push_str(&format!(
         "bytes {} -> {}; custom prefix/suffix preserved byte-for-byte\n",
         before.len(),
         after.len()
     ));
-    diff.push_str("--- legacy managed template\n+++ current managed template\n");
+    diff.push_str(&format!(
+        "--- {source_label} managed template\n+++ current managed template\n"
+    ));
 
-    let before_lines = std::str::from_utf8(LEGACY_TEMPLATE)
-        .expect("frozen legacy instructions template is UTF-8")
+    let before_lines = std::str::from_utf8(before_template)
+        .expect("frozen managed instructions template is UTF-8")
         .lines()
         .collect::<Vec<_>>();
     let after_lines = std::str::from_utf8(CURRENT_TEMPLATE)
@@ -412,9 +472,30 @@ mod tests {
         bytes.extend_from_slice(LEGACY_TEMPLATE);
         bytes.extend_from_slice(b"suffix\n");
 
-        let Classification::UpdateAvailable { candidate } = classify(&bytes).unwrap() else {
+        let Classification::UpdateAvailable { candidate, .. } = classify(&bytes).unwrap() else {
             panic!("expected an available update");
         };
+        assert!(candidate.starts_with(b"prefix\r\n"));
+        assert!(candidate.ends_with(b"suffix\n"));
+        assert!(candidate
+            .windows(CURRENT_TEMPLATE.len())
+            .any(|window| window == CURRENT_TEMPLATE));
+    }
+
+    #[test]
+    fn replaces_one_exact_previous_marked_distribution_with_current() {
+        let mut bytes = b"prefix\r\n".to_vec();
+        bytes.extend_from_slice(PREVIOUS_TEMPLATE);
+        bytes.extend_from_slice(b"suffix\n");
+
+        let Classification::UpdateAvailable {
+            candidate,
+            before_template,
+        } = classify(&bytes).unwrap()
+        else {
+            panic!("expected an available update");
+        };
+        assert_eq!(before_template, PREVIOUS_TEMPLATE);
         assert!(candidate.starts_with(b"prefix\r\n"));
         assert!(candidate.ends_with(b"suffix\n"));
         assert!(candidate
@@ -428,6 +509,9 @@ mod tests {
         duplicate.extend_from_slice(CURRENT_TEMPLATE);
         assert!(classify(&duplicate).is_err());
 
+        let mixed = [PREVIOUS_TEMPLATE, CURRENT_TEMPLATE].concat();
+        assert!(classify(&mixed).is_err());
+
         let malformed = b"<!-- pueue-agent:instructions v1 begin -->\ncustom\n<!-- pueue-agent:instructions v1 end -->\n";
         assert!(classify(malformed).is_err());
     }
@@ -439,13 +523,26 @@ mod tests {
             b"<!-- pueue-agent:instructions v1 begin\n".as_slice(),
         ] {
             assert!(classify(&[CURRENT_TEMPLATE, extra_marker].concat()).is_err());
+            assert!(classify(&[PREVIOUS_TEMPLATE, extra_marker].concat()).is_err());
             assert!(classify(&[LEGACY_TEMPLATE, extra_marker].concat()).is_err());
         }
     }
 
     #[test]
+    fn rejects_tampered_previous_marked_distribution() {
+        let mut bytes = PREVIOUS_TEMPLATE.to_vec();
+        let index = bytes
+            .windows(b"## Standard role".len())
+            .position(|window| window == b"## Standard role")
+            .expect("frozen previous template must contain its role heading");
+        bytes[index] = b'X';
+
+        assert!(classify(&bytes).is_err());
+    }
+
+    #[test]
     fn renders_substantive_managed_instruction_diff() {
-        let diff = render_bounded_diff(LEGACY_TEMPLATE, CURRENT_TEMPLATE);
+        let diff = render_bounded_diff(LEGACY_TEMPLATE, CURRENT_TEMPLATE, LEGACY_TEMPLATE);
 
         assert!(diff.contains("+## Standard role"));
         assert!(diff.contains("+## Diagnosis role"));

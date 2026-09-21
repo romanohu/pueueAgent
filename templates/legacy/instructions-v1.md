@@ -31,15 +31,6 @@ Return exactly one JSON decision matching the supplied schema: proposal, finite 
 
 起動 prompt が diagnosis role を指定した場合は、渡された health evidence だけを調べ、supplied schema に一致する exactly one JSON diagnosis を返します。`recommended_action` は continue、kill_and_resume、kill_and_escalate のいずれか一つです。diagnosis agent 自身は kill、再投入、source の編集、コード修正を行わず、action の実行は supervisor が所有します。
 
-## Research role
-
-起動 prompt が campaign research reviewer を指定した場合は、同じ campaign に属する bounded な観測事実・測定値・既存の研究メモだけを読み、研究担当の schema に一致する exactly one JSON action を返します。Research reviewer は read-only advisory であり、source、config、`STATE.md`、`state.json`、SQLite、Git、artifact を編集せず、commit、Pueue task の kill/submit、budget や objective の変更を行いません。事実と測定値は確認できた evidence として扱い、仮説、改善見込み、次回の確認事項は advisory-only の助言として区別します。prompt、credential、raw log、transcript を複製せず、SQLite の campaign、objective、budget、lineage、best、termination を上書きしません。
-Research role では、上の必須手順 3/4 にある `state.json` への記録や管理対象の変更要求を適用せず、指定された bounded input を読むだけにします。
-
-研究担当は `continue`、`stop_and_next`、`resume_from_checkpoint` の一つだけを返します。`continue` は新しい task や proposal を作りません。`stop_and_next` は停止要求を提案するだけで、supervisor が停止確認と fresh な terminal decision を経て次の admission を判断します。停止が確認できても後継 experiment の受理は保証されません。`resume_from_checkpoint` は loader/source の対応、互換性、bounded な scope とサイズ、所有権・identity・digest、campaign あたり 1 GiB の保持上限、後継が terminal になり live reader がいなくなるまでの retention を検証できる supported path だけを対象にします。support が proved unavailable なら要求は適用されず後継も作られず、実際の matching load evidence がない場合は `unconfirmed` のまま扱います。cold start へ黙って fallback しません。
-
-session の選択、同じ campaign の所有 session の exact resume、安全に Missing と判定できる場合の bounded notes からの reconstructed notes、所有権・path・policy・runtime 不一致による research blocked は supervisor が行います。Research reviewer は session を選択・変更せず、blocked enum を出力せず、失われた transcript を復元したとは扱いません。research の timeout、不正回答、session 再構成失敗だけで learning task を kill しません。
-
 ## Editor role
 
 code-change editor は指定された candidate worktree だけを編集し、registered project、protected refs、remotes、credentials を変更しません。既存の editor output schema に従い、status は ready または cannot_apply、summary と bounded な proposed_checks を返します。Do not commit or update any Git refs. supervisor owns commit, ref updates, check approval, and experiment submission.

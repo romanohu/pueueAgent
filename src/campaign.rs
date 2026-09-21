@@ -2,6 +2,7 @@ use std::{
     ffi::OsString,
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Stdio},
+    sync::Arc,
     time::Duration,
 };
 
@@ -9,7 +10,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
+    agent::{AgentRunner, AgentRunnerConfig},
     code_change,
+    config,
+    codex_command::probe_installed_codex_capabilities,
     db::{
         CampaignRepository, CheckpointDispatchSelection, CodeChangeReentry, CodeChangeRepository,
         Db, DecisionReservation, ExperimentRepository, ManagedSubmissionIntent, ProjectRepository,
@@ -18,8 +22,9 @@ use crate::{
     },
     environment::ProjectAdmissionLock,
     execution_policy::{
-        preflight_code_change_runtime, CampaignLimits, ProjectRootAnchor, ResolvedExecutionPolicy,
-        VerifiedProjectRoot, VerifiedWorkingDirectory,
+        preflight_code_change_runtime, preflight_decision_runtime, resolve_decision_project_policy,
+        CampaignLimits, ProjectRootAnchor, ResolvedExecutionPolicy, VerifiedProjectRoot,
+        VerifiedWorkingDirectory,
     },
     models::{
         Campaign, CampaignState, CodeChangeRun, Experiment, ExperimentStatus, NewCodeChangeRun,
@@ -153,6 +158,13 @@ pub fn render_status_for_project(
     )?
     .as_ref()
     .map(DecisionStatusProjection::from);
+    let research_repository = ResearchRepository::new(db);
+    let research = research_repository.status_projection(&campaign.campaign_id)?;
+    let research_history = research_repository.recent_status_summaries(
+        &campaign.campaign_id,
+        None,
+        32,
+    )?;
     render_campaign_status_with_decision(
         &campaign,
         proposal_count,
@@ -160,6 +172,8 @@ pub fn render_status_for_project(
         &budget_usage,
         &task_ids,
         decision.as_ref(),
+        Some(&research),
+        &research_history,
         json,
     )
 }
@@ -174,12 +188,62 @@ pub fn pause_for_project(
     render_campaign_mutation(&campaign, "pause", json)
 }
 
-pub fn resume_for_project(
+pub async fn resume_for_project(
     db: &Db,
     project: &Project,
     now: i64,
     json: bool,
+    policy: Arc<ResolvedExecutionPolicy>,
 ) -> Result<String, AppError> {
+    let repository = ResearchRepository::new(db);
+    let Some(campaign) = CampaignRepository::new(db).find_latest_by_project(&project.project_id)?
+    else {
+        let campaign = CampaignRepository::new(db).resume(&project.project_id, now)?;
+        return render_campaign_mutation(&campaign, "resume", json);
+    };
+    let initial_state = repository.state(&campaign.campaign_id)?;
+    if initial_state.blocked_reason.is_none() {
+        let campaign = CampaignRepository::new(db).resume(&project.project_id, now)?;
+        return render_campaign_mutation(&campaign, "resume", json);
+    }
+
+    preflight_decision_runtime().map_err(AppError::from)?;
+    let project_config = config::load(&project.config_path)?;
+    let runner = AgentRunner::new(AgentRunnerConfig::production(), Arc::clone(&policy));
+    let project_policy = runner
+        .resolve_project_policy(project, &project_config)
+        .map_err(AppError::from)?;
+    let decision_policy = resolve_decision_project_policy(runner.execution_policy(), &project_policy)
+        .map_err(AppError::from)?;
+    let _project_lock = runner
+        .try_acquire_project_admission_lock(&decision_policy)
+        .map_err(AppError::from)?
+        .ok_or(AppError::Runtime {
+            operation: "acquire project recovery admission lock",
+        })?;
+
+    let expected = repository.state(&campaign.campaign_id)?;
+    let Some(_) = expected.blocked_reason.as_deref() else {
+        let campaign = CampaignRepository::new(db).resume(&project.project_id, now)?;
+        return render_campaign_mutation(&campaign, "resume", json);
+    };
+
+    let capabilities = probe_installed_codex_capabilities(&decision_policy.agent_anchor)
+        .await
+        .map_err(AppError::from)?;
+    if !capabilities.supports_research_policy() {
+        return Err(AppError::from(
+            crate::execution_policy::PolicyViolation::new(
+                crate::execution_policy::PolicyViolationCode::UnsafeCodexArgument,
+                crate::execution_policy::PolicyViolationStage::PreBinding,
+            ),
+        ));
+    }
+    if let Some(session_id) = expected.session_id.as_deref() {
+        runner.research_context_for(&decision_policy, session_id)?;
+    }
+
+    repository.resume_after_validation(&project.project_id, &expected, now)?;
     let campaign = CampaignRepository::new(db).resume(&project.project_id, now)?;
     render_campaign_mutation(&campaign, "resume", json)
 }
@@ -270,7 +334,18 @@ pub fn render_experiment_for_project(
             field: "experiment_id",
             message: "does not identify an experiment in this project campaign",
         })?;
-    render_experiment_inspection(&campaign, &experiment, &argv_digest, json)
+    let research_history = ResearchRepository::new(db).recent_status_summaries(
+        &campaign.campaign_id,
+        Some(&experiment.experiment_id),
+        32,
+    )?;
+    render_experiment_inspection(
+        &campaign,
+        &experiment,
+        &argv_digest,
+        &research_history,
+        json,
+    )
 }
 
 fn latest_campaign(db: &Db, project: &Project) -> Result<Campaign, AppError> {

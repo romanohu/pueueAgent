@@ -23,12 +23,14 @@ use crate::{
         CampaignState, EventStatus, ExperimentStatus, Incident, Project, ProposalKind,
         ProposalStatus, SubmissionKind, SubmissionStatus, TaskObservation, TerminationRequest,
     },
+    output::bounded_redacted_text,
     proposals::{self, ProposalInput},
     pueue::PueueTask,
     reconcile::{
         managed_task_run_signature, managed_task_run_signature_for_observation, task_signature,
         try_canonical_command_display_os,
     },
+    research::{ResearchReviewSummary, ResearchStatusProjection},
     research_checkpoint::{
         checkpoint_learning_spec_digest, checkpoint_source_layout,
         checkpoint_support_from_persisted_context, parse_prepared_checkpoint,
@@ -50,6 +52,14 @@ const RESEARCH_RETRY_FAILURE_UNSAFE: &str = "research_session_unsafe";
 const RESEARCH_RETRY_FAILURE_POLICY: &str = "research_policy_blocked";
 const MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES: usize =
     crate::research_checkpoint::MAX_PREPARED_CHECKPOINT_BYTES;
+const MAX_RESEARCH_STATUS_ID_BYTES: i64 = 128;
+const MAX_RESEARCH_STATUS_STATE_BYTES: i64 = 32;
+const MAX_RESEARCH_STATUS_REASON_BYTES: i64 = 128;
+const MAX_RESEARCH_STATUS_DOCUMENT_BYTES: i64 =
+    crate::research_protocol::MAX_RESEARCH_ANSWER_BYTES as i64;
+const MAX_RESEARCH_STATUS_RECOVERY_REASON_BYTES: i64 = 128;
+const MAX_RESEARCH_STATUS_SESSION_BINDING_BYTES: i64 = 32;
+const MAX_RESEARCH_STATUS_CHECKPOINT_REASON_BYTES: i64 = 1024;
 const MAX_CHECKPOINT_UNSUPPORTED_REASON_BYTES: usize = 1024;
 const MAX_CHECKPOINT_CLEANUP_TERMINATION_TEXT_BYTES: usize = crate::process::MAX_FIELD_SIZE;
 const MAX_CHECKPOINT_CLEANUP_TERMINATION_STATUS_BYTES: usize = 32;
@@ -213,6 +223,34 @@ pub struct ResearchReview {
     pub checkpoint_json: Option<String>,
     pub(crate) checkpoint_json_state: CheckpointJsonState,
     pub session_generation: i64,
+}
+
+#[derive(Debug)]
+struct ResearchStatusReviewRow {
+    review_id: Option<String>,
+    experiment_id: Option<String>,
+    state: Option<String>,
+    session_generation: Option<i64>,
+    failure_code: Option<String>,
+    response_json: Option<String>,
+    recovery_reason: Option<String>,
+    session_binding: Option<String>,
+    checkpoint_unsupported: Option<String>,
+    checkpoint_is_null: bool,
+    operation_stage_is_null: bool,
+    termination_request_is_null: bool,
+    successor_experiment_is_null: bool,
+    decision_cycle_is_null: bool,
+    created_at: Option<i64>,
+}
+
+#[derive(Debug)]
+struct ResearchStatusStateRow {
+    session_generation: i64,
+    next_due_at: Option<i64>,
+    blocked_reason_present: bool,
+    blocked_reason: Option<String>,
+    last_review_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -827,6 +865,322 @@ impl<'db> ResearchRepository<'db> {
                     blocked_reason: None,
                 })
             })
+    }
+
+    pub fn resume_after_validation(
+        &self,
+        expected_project_id: &str,
+        expected: &ResearchState,
+        now: i64,
+    ) -> Result<(), AppError> {
+        let expected_blocked_reason = expected.blocked_reason.as_deref().ok_or(
+            validation_error(
+                "research.blocked_reason",
+                "explicit recovery requires a current block",
+            ),
+        )?;
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin research recovery validation"))?;
+        if Self::project_has_unresolved_native_research_owner(&transaction, expected_project_id)? {
+            return Err(validation_error(
+                "research.owner",
+                "cannot recover while a native research owner is unresolved",
+            ));
+        }
+        let has_active_research_run: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM agent_runs
+                     WHERE project_id = ?1
+                       AND execution_kind = 'campaign_research'
+                       AND status IN ('starting', 'running')
+                 )",
+                [expected_project_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check active research recovery run"))?;
+        if has_active_research_run {
+            return Err(validation_error(
+                "research.run",
+                "cannot recover while a research run is active",
+            ));
+        }
+        if has_open_review(&transaction, &expected.campaign_id)? {
+            return Err(validation_error(
+                "research.review",
+                "cannot recover while a research review is open",
+            ));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE campaign_research
+                 SET blocked_reason = NULL, next_due_at = ?1, updated_at = ?2
+                 WHERE campaign_id = ?3
+                   AND blocked_reason = ?4
+                   AND session_id IS ?5
+                   AND session_generation = ?6
+                   AND EXISTS (
+                       SELECT 1
+                       FROM campaigns AS campaign
+                       JOIN projects AS project
+                         ON project.project_id = campaign.project_id
+                       WHERE campaign.campaign_id = campaign_research.campaign_id
+                         AND campaign.campaign_id = ?3
+                         AND campaign.project_id = ?7
+                         AND campaign.state = 'paused'
+                         AND campaign.state_reason = 'operator_paused'
+                         AND project.enabled = 1
+                         AND project.paused = 0
+                         AND project.halted_reason IS NULL
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM research_reviews AS review
+                       WHERE review.campaign_id = campaign_research.campaign_id
+                         AND review.state IN ('pending','running','ready','retry_wait')
+                   )",
+                params![
+                    now,
+                    now,
+                    expected.campaign_id,
+                    expected_blocked_reason,
+                    expected.session_id,
+                    expected.session_generation,
+                    expected_project_id,
+                ],
+            )
+            .map_err(database_error("clear validated research recovery block"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "research.recovery",
+                "campaign state changed during explicit recovery",
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit validated research recovery"))
+    }
+
+    /// Return the bounded, typed research state for an existing campaign.
+    ///
+    /// This deliberately uses a primitive-only query.  In particular, it
+    /// never reads context, checkpoint, or notes documents and only reads a
+    /// response after SQLite has applied the accepted 128 KiB answer bound.
+    /// `session_rebuilt` is a fact of the selected latest review itself:
+    /// 「直近レビューでセッションを再構成」.
+    pub fn status_projection(
+        &self,
+        campaign_id: &str,
+    ) -> Result<ResearchStatusProjection, AppError> {
+        let connection = self.db.connect()?;
+        let Some(state) = connection
+            .query_row(
+                &format!(
+                    "SELECT
+                         CASE WHEN typeof(research.session_generation) = 'integer'
+                                   AND research.session_generation >= 0
+                              THEN research.session_generation ELSE 0 END,
+                         CASE WHEN typeof(research.next_due_at) = 'integer'
+                              THEN research.next_due_at END,
+                         CASE WHEN research.blocked_reason IS NOT NULL
+                              THEN 1 ELSE 0 END,
+                         CASE WHEN typeof(research.blocked_reason) = 'text'
+                                   AND length(CAST(research.blocked_reason AS BLOB))
+                                       BETWEEN 1 AND {MAX_RESEARCH_STATUS_REASON_BYTES}
+                              THEN research.blocked_reason END,
+                         CASE WHEN typeof(research.last_review_id) = 'text'
+                                   AND length(CAST(research.last_review_id AS BLOB))
+                                       BETWEEN 1 AND {MAX_RESEARCH_STATUS_ID_BYTES}
+                              THEN research.last_review_id END
+                     FROM campaigns AS campaign
+                     LEFT JOIN campaign_research AS research
+                       ON research.campaign_id = campaign.campaign_id
+                     WHERE campaign.campaign_id = ?1"
+                ),
+                [campaign_id],
+                |row| {
+                    Ok(ResearchStatusStateRow {
+                        session_generation: row.get(0)?,
+                        next_due_at: row.get(1)?,
+                        blocked_reason_present: row.get::<_, i64>(2)? == 1,
+                        blocked_reason: row.get(3)?,
+                        last_review_id: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(database_error("read bounded research status state"))?
+        else {
+            return Err(validation_error(
+                "campaign_id",
+                "does not identify a persisted campaign",
+            ));
+        };
+
+        let selected_review = state.last_review_id.as_deref().and_then(|review_id| {
+            connection
+                .query_row(
+                    &format!(
+                        "{} WHERE review.campaign_id = ?1 AND review.review_id = ?2",
+                        research_status_review_select()
+                    ),
+                    params![campaign_id, review_id],
+                    research_status_review_from_row,
+                )
+                .optional()
+                .map_err(database_error("read bounded latest research review"))
+                .transpose()
+        })
+        .transpose()?;
+        let selected_review = selected_review.filter(|review| {
+            review.review_id.as_deref() == state.last_review_id.as_deref()
+        });
+
+        let selected_state = selected_review
+            .as_ref()
+            .and_then(|review| review.state.as_deref())
+            .filter(|state| known_research_review_state(state));
+        let selected_review_id = selected_review
+            .as_ref()
+            .and_then(|review| review.review_id.clone());
+        let experiment_id = selected_review
+            .as_ref()
+            .and_then(|review| review.experiment_id.as_deref())
+            .map(bounded_redacted_text);
+        let last_action = selected_review
+            .as_ref()
+            .and_then(research_status_action);
+        let blocked_reason = if state.blocked_reason_present {
+            state.blocked_reason.as_deref().map(bounded_redacted_text)
+        } else if selected_state == Some("blocked") {
+            selected_review
+                .as_ref()
+                .and_then(|review| review.failure_code.as_deref())
+                .map(bounded_redacted_text)
+        } else {
+            None
+        };
+        let projection_state = if state.blocked_reason_present {
+            "blocked"
+        } else {
+            selected_state.unwrap_or("idle")
+        };
+        let session_rebuilt = selected_review.as_ref().is_some_and(|review| {
+            research_status_session_rebuilt(review, Some(state.session_generation))
+        });
+        let checkpoint_confirmation = selected_review
+            .as_ref()
+            .and_then(|review| research_status_action(review).map(|action| (review, action)))
+            .and_then(|(review, action)| {
+                research_status_checkpoint_confirmation(review, &action)
+            });
+        let discarded_reason = if selected_state == Some("discarded") {
+            selected_review
+                .as_ref()
+                .and_then(|review| review.failure_code.as_deref())
+                .map(bounded_redacted_text)
+        } else {
+            None
+        };
+
+        Ok(ResearchStatusProjection {
+            state: projection_state.to_owned(),
+            next_due_at: state.next_due_at,
+            last_review_id: selected_review_id.map(|review_id| bounded_redacted_text(&review_id)),
+            experiment_id,
+            last_action,
+            blocked_reason,
+            discarded_reason,
+            session_generation: state.session_generation,
+            session_rebuilt,
+            checkpoint_confirmation,
+        })
+    }
+
+    /// Return at most 32 deterministic, bounded review summaries for one
+    /// campaign.  An experiment filter, when supplied, is exact and remains
+    /// scoped by the campaign id.
+    /// Historical `session_rebuilt` values remain facts of their own review,
+    /// even after the campaign advances to a later session generation.
+    pub fn recent_status_summaries(
+        &self,
+        campaign_id: &str,
+        experiment_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ResearchReviewSummary>, AppError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.db.connect()?;
+        let campaign_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM campaigns WHERE campaign_id = ?1
+                 )",
+                [campaign_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check research history campaign"))?;
+        if !campaign_exists {
+            return Err(validation_error(
+                "campaign_id",
+                "does not identify a persisted campaign",
+            ));
+        }
+
+        let bounded_limit = limit.min(MAX_RESEARCH_REVIEW_LIST as usize) as i64;
+        let query = if experiment_id.is_some() {
+            format!(
+                "{} WHERE review.campaign_id = ?1 AND review.experiment_id = ?2
+                 ORDER BY review.created_at DESC, review.review_id DESC
+                 LIMIT ?3",
+                research_status_review_select()
+            )
+        } else {
+            format!(
+                "{} WHERE review.campaign_id = ?1
+                 ORDER BY review.created_at DESC, review.review_id DESC
+                 LIMIT ?2",
+                research_status_review_select()
+            )
+        };
+        let mut statement = connection
+            .prepare(&query)
+            .map_err(database_error("prepare bounded research history query"))?;
+        let mut summaries = Vec::new();
+        if let Some(experiment_id) = experiment_id {
+            let rows = statement
+                .query_map(
+                    params![campaign_id, experiment_id, bounded_limit],
+                    research_status_review_from_row,
+                )
+                .map_err(database_error("query bounded research history"))?;
+            for row in rows {
+                if let Some(summary) = research_status_summary_from_row(
+                    row.map_err(database_error("read bounded research history row"))?,
+                    None,
+                ) {
+                    summaries.push(summary);
+                }
+            }
+        } else {
+            let rows = statement
+                .query_map(
+                    params![campaign_id, bounded_limit],
+                    research_status_review_from_row,
+                )
+                .map_err(database_error("query bounded research history"))?;
+            for row in rows {
+                if let Some(summary) = research_status_summary_from_row(
+                    row.map_err(database_error("read bounded research history row"))?,
+                    None,
+                ) {
+                    summaries.push(summary);
+                }
+            }
+        }
+        Ok(summaries)
     }
 
     pub fn schedule_running(
@@ -10028,6 +10382,179 @@ fn research_review_id(
     format!("research-review:v1:{:x}", digest.finalize())
 }
 
+fn research_status_review_select() -> String {
+    let guarded_note_scalar = |path: &str, byte_limit: i64| {
+        format!(
+            "CASE WHEN typeof(review.notes_json) = 'text'
+                       AND length(CAST(review.notes_json AS BLOB))
+                           BETWEEN 1 AND {MAX_CHECKPOINT_CLEANUP_NOTES_BYTES}
+                  THEN CASE WHEN json_valid(review.notes_json) = 1
+                                  AND json_type(review.notes_json, '{path}') = 'text'
+                                  AND length(CAST(json_extract(review.notes_json, '{path}') AS BLOB))
+                                      BETWEEN 1 AND {byte_limit}
+                             THEN json_extract(review.notes_json, '{path}') END
+                  END"
+        )
+    };
+    format!(
+        "SELECT
+             CASE WHEN typeof(review.review_id) = 'text'
+                       AND length(CAST(review.review_id AS BLOB))
+                           BETWEEN 1 AND {MAX_RESEARCH_STATUS_ID_BYTES}
+                  THEN review.review_id END,
+             CASE WHEN typeof(review.experiment_id) = 'text'
+                       AND length(CAST(review.experiment_id AS BLOB))
+                           BETWEEN 1 AND {MAX_RESEARCH_STATUS_ID_BYTES}
+                  THEN review.experiment_id END,
+             CASE WHEN typeof(review.state) = 'text'
+                       AND length(CAST(review.state AS BLOB))
+                           BETWEEN 1 AND {MAX_RESEARCH_STATUS_STATE_BYTES}
+                  THEN review.state END,
+             CASE WHEN typeof(review.session_generation) = 'integer'
+                       AND review.session_generation >= 0
+                  THEN review.session_generation END,
+             CASE WHEN typeof(review.failure_code) = 'text'
+                       AND length(CAST(review.failure_code AS BLOB))
+                           BETWEEN 1 AND {MAX_RESEARCH_STATUS_REASON_BYTES}
+                  THEN review.failure_code END,
+             CASE WHEN typeof(review.response_json) = 'text'
+                       AND length(CAST(review.response_json AS BLOB))
+                           BETWEEN 1 AND {MAX_RESEARCH_STATUS_DOCUMENT_BYTES}
+                  THEN review.response_json END,
+             {},
+             {},
+             {},
+             CASE WHEN review.checkpoint_json IS NULL THEN 1 ELSE 0 END,
+             CASE WHEN review.operation_stage IS NULL THEN 1 ELSE 0 END,
+             CASE WHEN review.termination_request_id IS NULL THEN 1 ELSE 0 END,
+             CASE WHEN review.successor_experiment_id IS NULL THEN 1 ELSE 0 END,
+             CASE WHEN review.decision_cycle_id IS NULL THEN 1 ELSE 0 END,
+             CASE WHEN typeof(review.created_at) = 'integer'
+                  THEN review.created_at END
+         FROM research_reviews AS review",
+        guarded_note_scalar("$.recovery_reason", MAX_RESEARCH_STATUS_RECOVERY_REASON_BYTES),
+        guarded_note_scalar("$.session_binding", MAX_RESEARCH_STATUS_SESSION_BINDING_BYTES),
+        guarded_note_scalar(
+            "$.checkpoint_unsupported",
+            MAX_RESEARCH_STATUS_CHECKPOINT_REASON_BYTES,
+        ),
+    )
+}
+
+fn research_status_review_from_row(row: &Row<'_>) -> rusqlite::Result<ResearchStatusReviewRow> {
+    Ok(ResearchStatusReviewRow {
+        review_id: row.get(0)?,
+        experiment_id: row.get(1)?,
+        state: row.get(2)?,
+        session_generation: row.get(3)?,
+        failure_code: row.get(4)?,
+        response_json: row.get(5)?,
+        recovery_reason: row.get(6)?,
+        session_binding: row.get(7)?,
+        checkpoint_unsupported: row.get(8)?,
+        checkpoint_is_null: row.get::<_, i64>(9)? == 1,
+        operation_stage_is_null: row.get::<_, i64>(10)? == 1,
+        termination_request_is_null: row.get::<_, i64>(11)? == 1,
+        successor_experiment_is_null: row.get::<_, i64>(12)? == 1,
+        decision_cycle_is_null: row.get::<_, i64>(13)? == 1,
+        created_at: row.get(14)?,
+    })
+}
+
+fn known_research_review_state(state: &str) -> bool {
+    matches!(
+        state,
+        "pending" | "running" | "ready" | "completed" | "retry_wait" | "discarded" | "blocked"
+    )
+}
+
+fn research_status_action(review: &ResearchStatusReviewRow) -> Option<String> {
+    let review_id = review.review_id.as_deref()?;
+    let experiment_id = review.experiment_id.as_deref()?;
+    let response_json = review.response_json.as_deref()?;
+    let answer = parse_research_answer(response_json.as_bytes()).ok()?;
+    if answer.review_id != review_id || answer.experiment_id != experiment_id {
+        return None;
+    }
+    Some(bounded_redacted_text(&answer.action))
+}
+
+fn research_status_session_rebuilt(
+    review: &ResearchStatusReviewRow,
+    current_generation: Option<i64>,
+) -> bool {
+    let Some(generation) = review.session_generation else {
+        return false;
+    };
+    generation > 0
+        && current_generation.is_none_or(|current| current == generation)
+        && review.recovery_reason.as_deref() == Some("research_session_missing")
+        && review.session_binding.as_deref() == Some("confirmed")
+}
+
+fn research_status_checkpoint_confirmation(
+    review: &ResearchStatusReviewRow,
+    action: &str,
+) -> Option<String> {
+    if action != "resume_from_checkpoint" {
+        return None;
+    }
+    let unsupported = review.state.as_deref() == Some("completed")
+        && review
+            .checkpoint_unsupported
+            .as_deref()
+            .is_some_and(|reason| {
+                !reason.is_empty() && !reason.chars().any(char::is_control)
+            })
+        && review.checkpoint_is_null
+        && review.operation_stage_is_null
+        && review.termination_request_is_null
+        && review.successor_experiment_is_null
+        && review.decision_cycle_is_null;
+    Some(if unsupported {
+        "unsupported".to_owned()
+    } else {
+        "unconfirmed".to_owned()
+    })
+}
+
+fn research_status_summary_from_row(
+    review: ResearchStatusReviewRow,
+    current_generation: Option<i64>,
+) -> Option<ResearchReviewSummary> {
+    let review_id = review.review_id.as_deref()?;
+    let experiment_id = review.experiment_id.as_deref()?;
+    let state = review.state.as_deref()?;
+    if !known_research_review_state(state) || review.created_at.is_none() {
+        return None;
+    }
+    let last_action = research_status_action(&review);
+    let checkpoint_confirmation = last_action
+        .as_deref()
+        .and_then(|action| research_status_checkpoint_confirmation(&review, action));
+    let blocked_reason = if state == "blocked" {
+        review.failure_code.as_deref().map(bounded_redacted_text)
+    } else {
+        None
+    };
+    let discarded_reason = if state == "discarded" {
+        review.failure_code.as_deref().map(bounded_redacted_text)
+    } else {
+        None
+    };
+    Some(ResearchReviewSummary {
+        review_id: bounded_redacted_text(review_id),
+        experiment_id: bounded_redacted_text(experiment_id),
+        state: bounded_redacted_text(state),
+        last_action,
+        blocked_reason,
+        discarded_reason,
+        session_generation: review.session_generation.unwrap_or(0),
+        session_rebuilt: research_status_session_rebuilt(&review, current_generation),
+        checkpoint_confirmation,
+    })
+}
+
 fn review_from_row(row: &Row<'_>) -> rusqlite::Result<ResearchReview> {
     let (checkpoint_json, checkpoint_json_state) = checkpoint_json_from_row(row)?;
     Ok(ResearchReview {
@@ -10483,6 +11010,804 @@ mod tests {
         (temp, db, run.run_id, project_id.to_owned())
     }
 
+
+    fn producer_shaped_large_notes(
+        connection: &Connection,
+        review_id: &str,
+        run_id: i64,
+        recovery_reason: Option<&str>,
+        session_binding: Option<&str>,
+        checkpoint_unsupported: Option<&str>,
+    ) -> String {
+        let current_notes: String = connection
+            .query_row(
+                "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+                [review_id],
+                |row| row.get(0),
+            )
+            .expect("producer-shaped notes source");
+        let mut notes: Value = serde_json::from_str(&current_notes)
+            .expect("producer-shaped notes JSON");
+        let native_recovery = notes
+            .get("retry_history")
+            .and_then(Value::as_array)
+            .and_then(|history| history.first())
+            .and_then(|entry| entry.get("native_recovery"))
+            .cloned()
+            .expect("producer-shaped native recovery");
+        let session_id = "11111111-1111-4111-8111-111111111111";
+        let context_json = json!({
+            "facts": {"bounded_retry_context": "x".repeat(16_000)}
+        })
+        .to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let mut history = Vec::new();
+        for attempt in 0..MAX_CHECKPOINT_CLEANUP_RETRY_ENTRIES {
+            let mut entry = json!({
+                "attempt": attempt,
+                "agent_run_id": run_id,
+                "failure_code": "research_output_invalid",
+                "context_json": context_json,
+                "context_digest": context_digest,
+                "planned_session_id": session_id,
+                "confirmed_session_id": session_id,
+                "session_binding": "confirmed"
+            });
+            if attempt == 0 {
+                entry["native_recovery"] = native_recovery.clone();
+            }
+            history.push(entry);
+        }
+        notes["retry_history"] = Value::Array(history);
+        if let Some(recovery_reason) = recovery_reason {
+            notes["recovery_reason"] = Value::String(recovery_reason.to_owned());
+        }
+        if let Some(session_binding) = session_binding {
+            notes["session_binding"] = Value::String(session_binding.to_owned());
+        }
+        if let Some(checkpoint_unsupported) = checkpoint_unsupported {
+            notes["checkpoint_unsupported"] = Value::String(checkpoint_unsupported.to_owned());
+        }
+        let notes_json = notes.to_string();
+        assert!(notes_json.len() > MAX_RESEARCH_STATUS_DOCUMENT_BYTES as usize);
+        assert!(notes_json.len() <= MAX_CHECKPOINT_CLEANUP_NOTES_BYTES);
+        notes_json
+    }
+
+    #[test]
+    fn research_status_projection_is_idle_when_campaign_state_is_missing() {
+        let (_temp, db, _run_id, _project_id) = detached_history_fixture();
+        let connection = db.connect().expect("status projection connection");
+        connection
+            .execute(
+                "DELETE FROM campaign_research WHERE campaign_id = ?1",
+                ["detached-history-campaign"],
+            )
+            .expect("remove campaign research state");
+
+        let projection = ResearchRepository::new(&db)
+            .status_projection("detached-history-campaign")
+            .expect("status projection");
+        assert_eq!(projection.state, "idle");
+        assert_eq!(projection.next_due_at, None);
+        assert_eq!(projection.last_review_id, None);
+        assert_eq!(projection.session_generation, 0);
+        assert!(!projection.session_rebuilt);
+    }
+
+    #[test]
+    fn research_status_projection_prefers_campaign_block_reason_then_latest_blocked_review() {
+        let (_temp, db, _run_id, _project_id) = detached_history_fixture();
+        let connection = db.connect().expect("blocked projection connection");
+        let review_id: String = connection
+            .query_row(
+                "SELECT review_id FROM research_reviews
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("blocked projection review");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'blocked', failure_code = 'review-blocked'
+                 WHERE review_id = ?1",
+                [review_id.as_str()],
+            )
+            .expect("block latest review");
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET blocked_reason = 'campaign-blocked', last_review_id = ?1
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [review_id.as_str()],
+            )
+            .expect("set campaign block reason");
+
+        let repository = ResearchRepository::new(&db);
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("campaign blocked projection");
+        assert_eq!(projection.state, "blocked");
+        assert_eq!(projection.blocked_reason.as_deref(), Some("campaign-blocked"));
+
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET blocked_reason = NULL
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+            )
+            .expect("clear campaign block reason");
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("review blocked projection");
+        assert_eq!(projection.state, "blocked");
+        assert_eq!(projection.blocked_reason.as_deref(), Some("review-blocked"));
+
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'discarded', failure_code = 'discarded-review'
+                 WHERE review_id = ?1",
+                [review_id.as_str()],
+            )
+            .expect("discard latest review");
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("discarded review projection");
+        assert_eq!(projection.state, "discarded");
+        assert_eq!(projection.blocked_reason, None);
+        assert_eq!(projection.discarded_reason.as_deref(), Some("discarded-review"));
+    }
+
+    #[test]
+    fn research_status_projection_serializes_only_bounded_fields() {
+        let (_temp, db, _run_id, _project_id) = detached_history_fixture();
+        let projection = ResearchRepository::new(&db)
+            .status_projection("detached-history-campaign")
+            .expect("serialized status projection");
+        let value = serde_json::to_value(projection).expect("serialize projection");
+        let object = value.as_object().expect("projection object");
+        assert_eq!(object.len(), 10);
+        for key in [
+            "state",
+            "next_due_at",
+            "last_review_id",
+            "experiment_id",
+            "last_action",
+            "blocked_reason",
+            "discarded_reason",
+            "session_generation",
+            "session_rebuilt",
+            "checkpoint_confirmation",
+        ] {
+            assert!(object.contains_key(key), "missing projection key {key}");
+        }
+        let serialized = value.to_string();
+        for secret in ["native_recovery", "session_id", "context_json", "response_json"] {
+            assert!(!serialized.contains(secret), "raw field leaked: {secret}");
+        }
+    }
+
+    #[test]
+    fn research_status_history_is_capped_and_tie_broken_by_review_id() {
+        let (_temp, db, _run_id, _project_id) = detached_history_fixture();
+        let connection = db.connect().expect("history projection connection");
+        let (experiment_id, event_id): (String, i64) = connection
+            .query_row(
+                "SELECT experiment_id, event_id FROM research_reviews
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("history projection source ids");
+        for index in 0..35_i64 {
+            let review_id = format!("status-history-{index:02}");
+            connection
+                .execute(
+                    "INSERT INTO research_reviews (
+                         review_id, campaign_id, experiment_id, task_signature, attempt,
+                         state, operation_stage, agent_run_id, context_json, context_digest,
+                         response_json, termination_request_id, successor_experiment_id,
+                         evidence_schema_version, session_generation, event_id, not_before,
+                         notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                         created_at, started_at, finished_at, updated_at
+                     ) VALUES (?1, 'detached-history-campaign', ?2, 'history-signature', 0,
+                               'completed', NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                               NULL, 0, ?3, 0, NULL, NULL, NULL, NULL,
+                               ?4, NULL, ?4, ?4)",
+                    rusqlite::params![review_id, experiment_id, event_id, 4_000 + index],
+                )
+                .expect("insert bounded history row");
+        }
+        for review_id in ["status-history-z", "status-history-a"] {
+            connection
+                .execute(
+                    "INSERT INTO research_reviews (
+                         review_id, campaign_id, experiment_id, task_signature, attempt,
+                         state, operation_stage, agent_run_id, context_json, context_digest,
+                         response_json, termination_request_id, successor_experiment_id,
+                         evidence_schema_version, session_generation, event_id, not_before,
+                         notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                         created_at, started_at, finished_at, updated_at
+                     ) VALUES (?1, 'detached-history-campaign', ?2, 'history-tie-signature', 0,
+                               'completed', NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                               NULL, 0, ?3, 0, NULL, NULL, NULL, NULL,
+                               5_000, NULL, 5_000, 5_000)",
+                    rusqlite::params![review_id, experiment_id, event_id],
+                )
+                .expect("insert tie-broken history row");
+        }
+        connection
+            .execute(
+                "INSERT INTO campaigns (
+                     campaign_id, project_id, objective_text, objective_digest,
+                     initial_argv_json, state, state_reason, baseline_experiment_id,
+                     next_eligible_at, created_at, updated_at
+                 )
+                 SELECT 'foreign-history-campaign', project_id, objective_text,
+                        objective_digest, initial_argv_json, 'retired', NULL, NULL,
+                        NULL, 6_000, 6_000
+                 FROM campaigns
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+            )
+            .expect("insert foreign history campaign");
+        connection
+            .execute(
+                "INSERT INTO research_reviews (
+                     review_id, campaign_id, experiment_id, task_signature, attempt,
+                     state, operation_stage, agent_run_id, context_json, context_digest,
+                     response_json, termination_request_id, successor_experiment_id,
+                     evidence_schema_version, session_generation, event_id, not_before,
+                     notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                     created_at, started_at, finished_at, updated_at
+                 ) VALUES ('status-foreign-campaign', 'foreign-history-campaign', ?1,
+                           'foreign-history-signature', 0, 'completed', NULL, NULL,
+                           NULL, NULL, NULL, NULL, NULL, NULL, 0, ?2, 6_000,
+                           NULL, NULL, NULL, NULL, 6_000, NULL, 6_000, 6_000)",
+                rusqlite::params![experiment_id, event_id],
+            )
+            .expect("insert foreign history review");
+
+        let repository = ResearchRepository::new(&db);
+        let summaries = repository
+            .recent_status_summaries("detached-history-campaign", None, 100)
+            .expect("bounded history summaries");
+        assert_eq!(summaries.len(), 32);
+        assert_eq!(summaries[0].review_id, "status-history-z");
+        assert_eq!(summaries[1].review_id, "status-history-a");
+        assert_eq!(summaries[2].review_id, "status-history-34");
+        assert!(summaries
+            .iter()
+            .all(|summary| summary.review_id != "status-foreign-campaign"));
+        assert!(repository
+            .recent_status_summaries(
+                "detached-history-campaign",
+                Some("different-experiment"),
+                32,
+            )
+            .expect("exact experiment history filter")
+            .is_empty());
+    }
+
+    #[test]
+    fn research_status_projection_strictly_parses_action_and_checkpoint_outcome() {
+        let (_temp, db, run_id, project_id) = detached_history_fixture();
+        let connection = db.connect().expect("action projection connection");
+        let (review_id, experiment_id): (String, String) = connection
+            .query_row(
+                "SELECT review_id, experiment_id FROM research_reviews
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("action projection review");
+        let response = json!({
+            "schema_version": 1,
+            "review_id": review_id,
+            "experiment_id": experiment_id,
+            "context_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "continue",
+            "reason": "bounded",
+            "evidence_refs": [],
+            "notes": "bounded",
+            "next_direction": null,
+            "checkpoint": null
+        });
+        let unsupported_notes = producer_shaped_large_notes(
+            &connection,
+            &review_id,
+            run_id,
+            None,
+            None,
+            Some("candidate runtime unavailable"),
+        );
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', response_json = ?1, notes_json = '{}',
+                     failure_code = NULL
+                 WHERE review_id = ?2",
+                rusqlite::params![response.to_string(), review_id],
+            )
+            .expect("store strict continue answer");
+        let repository = ResearchRepository::new(&db);
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("continue projection");
+        assert_eq!(projection.last_action.as_deref(), Some("continue"));
+        assert_eq!(projection.checkpoint_confirmation, None);
+
+        let mut wrong_review_response = response.clone();
+        wrong_review_response["review_id"] = json!("wrong-review");
+        let wrong_review_response = wrong_review_response.to_string();
+        let parsed_wrong_review = parse_research_answer(wrong_review_response.as_bytes())
+            .expect("wrong review answer remains protocol-valid");
+        assert_eq!(parsed_wrong_review.review_id, "wrong-review");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET response_json = ?1
+                 WHERE review_id = ?2",
+                rusqlite::params![wrong_review_response, review_id],
+            )
+            .expect("store wrong review answer");
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("wrong review answer projection");
+        assert_eq!(projection.last_action, None);
+
+        let mut wrong_experiment_response = response.clone();
+        wrong_experiment_response["experiment_id"] = json!("wrong-experiment");
+        let wrong_experiment_response = wrong_experiment_response.to_string();
+        let parsed_wrong_experiment = parse_research_answer(wrong_experiment_response.as_bytes())
+            .expect("wrong experiment answer remains protocol-valid");
+        assert_eq!(parsed_wrong_experiment.experiment_id, "wrong-experiment");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET response_json = ?1
+                 WHERE review_id = ?2",
+                rusqlite::params![wrong_experiment_response, review_id],
+            )
+            .expect("store wrong experiment answer");
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("wrong experiment answer projection");
+        assert_eq!(projection.last_action, None);
+
+        let oversized_response = "x".repeat(crate::research_protocol::MAX_RESEARCH_ANSWER_BYTES + 1);
+        connection
+            .execute(
+                "UPDATE research_reviews SET response_json = ?1 WHERE review_id = ?2",
+                rusqlite::params![oversized_response, review_id],
+            )
+            .expect("store oversized answer");
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("oversized answer projection");
+        assert_eq!(projection.last_action, None);
+
+        let resume_response = json!({
+            "schema_version": 1,
+            "review_id": review_id,
+            "experiment_id": experiment_id,
+            "context_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "action": "resume_from_checkpoint",
+            "reason": "bounded",
+            "evidence_refs": ["checkpoint:bounded"],
+            "notes": "bounded",
+            "next_direction": null,
+            "checkpoint": {
+                "path": "checkpoint.json",
+                "argv": ["python", "train.py"],
+                "working_directory": ".",
+                "support_evidence_refs": ["checkpoint:bounded"]
+            }
+        });
+        connection
+            .execute(
+                "INSERT INTO incidents (
+                    incident_id, project_id, kind, task_key, fingerprint, status,
+                    first_seen_at, last_seen_at, acknowledged_at, resolved_at
+                 ) VALUES (901, ?1, 'research_status_test', NULL,
+                           'research-status-test', 'open', 6_000, 6_000, NULL, NULL)",
+                [project_id.as_str()],
+            )
+            .expect("store checkpoint shape test incident");
+        connection
+            .execute(
+                "INSERT INTO termination_requests (
+                    request_id, incident_id, project_id, task_signature, reason,
+                    status, requested_at, dispatch_lease_until, grace_until,
+                    confirmed_at, last_error
+                 ) VALUES (901, 901, ?1, 'research-status-test', 'status-test',
+                           'requested', 6_000, NULL, NULL, NULL, NULL)",
+                [project_id.as_str()],
+            )
+            .expect("store checkpoint shape test termination");
+        connection
+            .execute(
+                "INSERT INTO decision_cycles (
+                    cycle_id, campaign_id, source_experiment_id, state,
+                    next_wake_at, consecutive_failed_attempts, last_decision_kind,
+                    last_failure_code, last_failure_summary, created_at, updated_at,
+                    source_terminal_at
+                 ) VALUES ('status-test-cycle', 'detached-history-campaign', ?1,
+                           'completed', NULL, 0, NULL, NULL, NULL, 6_000, 6_000, 1)",
+                [experiment_id.as_str()],
+            )
+            .expect("store checkpoint shape test decision cycle");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET response_json = ?1, notes_json = ?2,
+                     checkpoint_json = NULL, operation_stage = NULL,
+                     termination_request_id = NULL, successor_experiment_id = NULL,
+                     decision_cycle_id = NULL
+                 WHERE review_id = ?3",
+                rusqlite::params![
+                    resume_response.to_string(),
+                    unsupported_notes.clone(),
+                    review_id,
+                ],
+            )
+            .expect("store unsupported checkpoint answer");
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("unsupported checkpoint projection");
+        assert_eq!(projection.last_action.as_deref(), Some("resume_from_checkpoint"));
+        assert_eq!(
+            projection.checkpoint_confirmation.as_deref(),
+            Some("unsupported")
+        );
+
+        let restore_unsupported = || {
+            connection
+                .execute(
+                    "UPDATE research_reviews
+                     SET state = 'completed', notes_json = ?1,
+                         checkpoint_json = NULL, operation_stage = NULL,
+                         termination_request_id = NULL, successor_experiment_id = NULL,
+                         decision_cycle_id = NULL
+                     WHERE review_id = ?2",
+                    rusqlite::params![unsupported_notes.clone(), review_id],
+                )
+                .expect("restore unsupported checkpoint proof");
+        };
+        let assert_unconfirmed = |label: &str| {
+            let projection = repository
+                .status_projection("detached-history-campaign")
+                .expect("checkpoint shape projection");
+            assert_eq!(
+                projection.last_action.as_deref(),
+                Some("resume_from_checkpoint"),
+                "{label}: requested action"
+            );
+            assert_eq!(
+                projection.checkpoint_confirmation.as_deref(),
+                Some("unconfirmed"),
+                "{label}: checkpoint confirmation"
+            );
+        };
+
+        connection
+            .execute(
+                "UPDATE research_reviews SET state = 'ready' WHERE review_id = ?1",
+                [review_id.as_str()],
+            )
+            .expect("mutate completed state for checkpoint proof");
+        assert_unconfirmed("non-completed state");
+        restore_unsupported();
+
+        connection
+            .execute(
+                "UPDATE research_reviews SET checkpoint_json = '{}'
+                 WHERE review_id = ?1",
+                [review_id.as_str()],
+            )
+            .expect("mutate checkpoint shape for checkpoint proof");
+        assert_unconfirmed("non-null checkpoint");
+        restore_unsupported();
+
+        connection
+            .execute(
+                "UPDATE research_reviews SET operation_stage = 'intent'
+                 WHERE review_id = ?1",
+                [review_id.as_str()],
+            )
+            .expect("mutate operation stage for checkpoint proof");
+        assert_unconfirmed("non-null operation stage");
+        restore_unsupported();
+
+        connection
+            .execute(
+                "UPDATE research_reviews SET termination_request_id = 901
+                 WHERE review_id = ?1",
+                [review_id.as_str()],
+            )
+            .expect("mutate termination request for checkpoint proof");
+        assert_unconfirmed("non-null termination request");
+        restore_unsupported();
+
+        connection
+            .execute(
+                "UPDATE research_reviews SET successor_experiment_id = ?1
+                 WHERE review_id = ?2",
+                rusqlite::params![experiment_id, review_id],
+            )
+            .expect("mutate successor experiment for checkpoint proof");
+        assert_unconfirmed("non-null successor experiment");
+        restore_unsupported();
+
+        connection
+            .execute(
+                "UPDATE research_reviews SET decision_cycle_id = 'status-test-cycle'
+                 WHERE review_id = ?1",
+                [review_id.as_str()],
+            )
+            .expect("mutate decision cycle for checkpoint proof");
+        assert_unconfirmed("non-null decision cycle");
+
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET notes_json = ?1
+                 WHERE review_id = ?2",
+                rusqlite::params![
+                    json!({"checkpoint_unsupported": "line\nbreak"}).to_string(),
+                    review_id,
+                ],
+            )
+            .expect("store malformed checkpoint diagnostic");
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("malformed checkpoint projection");
+        assert_eq!(
+            projection.checkpoint_confirmation.as_deref(),
+            Some("unconfirmed")
+        );
+    }
+
+    #[test]
+    fn research_status_session_rebuilt_is_selected_review_fact_and_history_preserves_it() {
+        let (_temp, db, run_id, _project_id) = detached_history_fixture();
+        let connection = db.connect().expect("session projection connection");
+        let (review_id, experiment_id, event_id): (String, String, i64) = connection
+            .query_row(
+                "SELECT review_id, experiment_id, event_id FROM research_reviews
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("session projection review");
+        let reconstruction_notes = producer_shaped_large_notes(
+            &connection,
+            &review_id,
+            run_id,
+            Some("research_session_missing"),
+            Some("confirmed"),
+            None,
+        );
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET session_generation = 1, last_review_id = ?1,
+                     blocked_reason = NULL
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [review_id.as_str()],
+            )
+            .expect("set reconstructed campaign generation");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', session_generation = 1,
+                     notes_json = ?1, response_json = NULL
+                 WHERE review_id = ?2",
+                rusqlite::params![reconstruction_notes, review_id],
+            )
+            .expect("store confirmed reconstruction notes");
+        let repository = ResearchRepository::new(&db);
+        assert!(repository
+            .status_projection("detached-history-campaign")
+            .expect("confirmed reconstruction projection")
+            .session_rebuilt);
+
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET notes_json = ?1
+                 WHERE review_id = ?2",
+                rusqlite::params![
+                    json!({
+                        "recovery_reason": "research_session_missing",
+                        "session_binding": "pending"
+                    })
+                    .to_string(),
+                    review_id,
+                ],
+            )
+            .expect("store pending reconstruction notes");
+        assert!(!repository
+            .status_projection("detached-history-campaign")
+            .expect("pending reconstruction projection")
+            .session_rebuilt);
+
+        connection
+            .execute(
+                "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
+                rusqlite::params![json!({"session_binding": "confirmed"}).to_string(), review_id],
+            )
+            .expect("store ordinary resume notes");
+        assert!(!repository
+            .status_projection("detached-history-campaign")
+            .expect("ordinary resume projection")
+            .session_rebuilt);
+
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET notes_json = ?1
+                 WHERE review_id = ?2",
+                rusqlite::params![reconstruction_notes, review_id],
+            )
+            .expect("restore historical reconstruction notes");
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET session_generation = 2, last_review_id = ?1
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [review_id.as_str()],
+            )
+            .expect("select stale reconstruction review");
+        assert!(!repository
+            .status_projection("detached-history-campaign")
+            .expect("generation-mismatched reconstruction projection")
+            .session_rebuilt);
+        connection
+            .execute(
+                "INSERT INTO research_reviews (
+                     review_id, campaign_id, experiment_id, task_signature, attempt,
+                     state, operation_stage, agent_run_id, context_json, context_digest,
+                     response_json, termination_request_id, successor_experiment_id,
+                     evidence_schema_version, session_generation, event_id, not_before,
+                     notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                     created_at, started_at, finished_at, updated_at
+                 ) VALUES ('status-current-generation', 'detached-history-campaign', ?1,
+                           'current-generation-signature', 0, 'completed', NULL, NULL,
+                           NULL, NULL, NULL, NULL, NULL, NULL, 2, ?2, 0, '{}', NULL,
+                           NULL, NULL, 5_000, NULL, 5_000, 5_000)",
+                rusqlite::params![experiment_id, event_id],
+            )
+            .expect("insert later generation review");
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET session_generation = 2, last_review_id = 'status-current-generation'
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+            )
+            .expect("advance campaign generation");
+        assert!(!repository
+            .status_projection("detached-history-campaign")
+            .expect("stale selected reconstruction projection")
+            .session_rebuilt);
+        let history = repository
+            .recent_status_summaries("detached-history-campaign", None, 32)
+            .expect("historical reconstruction summaries");
+        let historical = history
+            .iter()
+            .find(|summary| summary.review_id == review_id)
+            .expect("historical reconstruction entry");
+        assert!(historical.session_rebuilt);
+    }
+
+    #[test]
+    fn research_status_projection_omits_wrong_type_malformed_and_oversized_scalars() {
+        let (_temp, db, _run_id, _project_id) = detached_history_fixture();
+        let connection = db.connect().expect("malformed projection connection");
+        let review_id: String = connection
+            .query_row(
+                "SELECT review_id FROM research_reviews
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("malformed projection review");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'blocked', failure_code = 'review-fallback'
+                 WHERE review_id = ?1",
+                [review_id.as_str()],
+            )
+            .expect("prepare blocked review fallback");
+
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET response_json = zeroblob(8), notes_json = zeroblob(8),
+                     failure_code = zeroblob(8)
+                 WHERE review_id = ?1",
+                [review_id.as_str()],
+            )
+            .expect("store wrong type projection values");
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET blocked_reason = zeroblob(8)
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+            )
+            .expect("store wrong type campaign reason");
+        let repository = ResearchRepository::new(&db);
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("wrong type projection");
+        assert_eq!(projection.state, "blocked");
+        assert_eq!(projection.last_action, None);
+        assert!(!projection.session_rebuilt);
+        assert_eq!(projection.blocked_reason, None);
+
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET blocked_reason = ''
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [],
+            )
+            .expect("store empty campaign reason");
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("empty campaign reason projection");
+        assert_eq!(projection.state, "blocked");
+        assert_eq!(projection.blocked_reason, None);
+
+        let oversized_reason = "x".repeat(MAX_RESEARCH_STATUS_REASON_BYTES as usize + 1);
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET blocked_reason = ?1
+                 WHERE campaign_id = 'detached-history-campaign'",
+                [oversized_reason.as_str()],
+            )
+            .expect("store oversized campaign reason");
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("oversized campaign reason projection");
+        assert_eq!(projection.state, "blocked");
+        assert_eq!(projection.blocked_reason, None);
+
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET notes_json = ?1, response_json = NULL
+                 WHERE review_id = ?2",
+                rusqlite::params!["{malformed", review_id],
+            )
+            .expect("store malformed notes document");
+        assert!(!repository
+            .status_projection("detached-history-campaign")
+            .expect("malformed notes projection")
+            .session_rebuilt);
+
+        let oversized_notes = "x".repeat(MAX_CHECKPOINT_CLEANUP_NOTES_BYTES + 1);
+        connection
+            .execute(
+                "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
+                rusqlite::params![oversized_notes, review_id],
+            )
+            .expect("store oversized notes document");
+        let projection = repository
+            .status_projection("detached-history-campaign")
+            .expect("oversized notes projection");
+        assert!(!projection.session_rebuilt);
+        let serialized = serde_json::to_string(&projection).expect("serialize bounded projection");
+        assert!(!serialized.contains("malformed"));
+        assert!(!serialized.contains("xxx"));
+    }
 
     fn available_checkpoint_context_response(
         project_id: &str,

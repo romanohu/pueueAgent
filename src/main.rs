@@ -81,7 +81,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Start(args) => commands::start(args),
         Command::Stop(args) => commands::stop(args),
         Command::Daemon(args) => commands::daemon(args).await,
-        Command::Campaign(args) => commands::campaign(args),
+        Command::Campaign(args) => commands::campaign(args).await,
         Command::Proposal(args) => commands::proposal(args),
         Command::Experiment(args) => commands::experiment(args),
     }
@@ -491,7 +491,7 @@ mod commands {
         Ok(())
     }
 
-    pub fn campaign(args: CampaignArgs) -> Result<(), AppError> {
+    pub async fn campaign(args: CampaignArgs) -> Result<(), AppError> {
         match args.action {
             CampaignAction::Status(args) => {
                 let (db, project, _, _) =
@@ -515,7 +515,7 @@ mod commands {
                 );
             }
             CampaignAction::Resume(args) => {
-                let (db, project, _, _) = resolve_project(args.project_root, args.pueue_config)?;
+                let (db, project, _, policy) = resolve_project(args.project_root, args.pueue_config)?;
                 println!(
                     "{}",
                     pueue_agent::campaign::resume_for_project(
@@ -523,7 +523,9 @@ mod commands {
                         &project,
                         unix_timestamp()?,
                         args.json,
-                    )?
+                        policy,
+                    )
+                    .await?
                 );
             }
             CampaignAction::Retire(args) => {

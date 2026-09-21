@@ -7,6 +7,8 @@
 
 use std::collections::BTreeSet;
 
+use serde::Serialize;
+
 use crate::{
     agent::{AgentHandle, AgentRunner, AgentSpawnError, AgentSpawnStage, BoundCleanupHandle},
     config,
@@ -20,6 +22,39 @@ use crate::{
     retry::{retry_backoff_seconds, RetryPolicy},
     AppError,
 };
+
+/// The bounded research state that operator surfaces may expose for an
+/// existing campaign.  This deliberately contains no session, prompt,
+/// context, response, checkpoint, or transcript material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResearchStatusProjection {
+    pub state: String,
+    pub next_due_at: Option<i64>,
+    pub last_review_id: Option<String>,
+    pub experiment_id: Option<String>,
+    pub last_action: Option<String>,
+    pub blocked_reason: Option<String>,
+    pub discarded_reason: Option<String>,
+    pub session_generation: i64,
+    pub session_rebuilt: bool,
+    pub checkpoint_confirmation: Option<String>,
+}
+
+/// The minimal bounded representation of one historical research review.
+/// It is intentionally separate from `ResearchReview`, whose raw payload
+/// fields are not suitable for operator output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResearchReviewSummary {
+    pub review_id: String,
+    pub experiment_id: String,
+    pub state: String,
+    pub last_action: Option<String>,
+    pub blocked_reason: Option<String>,
+    pub discarded_reason: Option<String>,
+    pub session_generation: i64,
+    pub session_rebuilt: bool,
+    pub checkpoint_confirmation: Option<String>,
+}
 
 #[derive(Default)]
 pub struct ResearchPassReport {
