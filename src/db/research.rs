@@ -13841,7 +13841,7 @@ mod tests {
                     .expect("phase unreconciled submission update");
                 connection
                     .execute(
-                        "UPDATE budget_reservations SET status = 'consumed'
+                        "UPDATE budget_reservations SET status = 'reserved'
                          WHERE experiment_id = ?1 AND dimension = 'experiment'",
                         [&fixture.authority.successor_experiment_id],
                     )
@@ -18807,7 +18807,7 @@ mod tests {
                         .unwrap();
                     connection
                         .execute(
-                            "UPDATE budget_reservations SET status = 'consumed'
+                            "UPDATE budget_reservations SET status = 'reserved'
                              WHERE experiment_id = ?1 AND dimension = 'experiment'",
                             [&prepared.authority.successor_experiment_id],
                         )
@@ -18974,55 +18974,34 @@ mod tests {
     #[test]
     fn checkpoint_pre_add_failure_rejects_post_add_and_unreconciled_without_writes() {
         let cases: Vec<(&str, fn(&CheckpointDispatchFixture, &Connection))> = vec![
-            ("post-add accepted", |prepared, connection| {
-                    connection
-                        .execute(
-                            "UPDATE submissions SET status = 'accepted', pueue_task_id = 99,
-                             task_signature = 'pueue-managed-run:v1:post-add'
-                             WHERE submission_id = ?1",
-                            [&prepared.authority.submission_id],
-                        )
-                        .unwrap();
-                    connection
-                        .execute(
-                            "UPDATE experiments
-                             SET status = 'accepted', pueue_task_id = 99,
-                                 task_signature = 'pueue-managed-run:v1:post-add'
-                             WHERE experiment_id = ?1",
-                            [&prepared.authority.successor_experiment_id],
-                        )
-                        .unwrap();
-                    connection
-                        .execute(
-                            "UPDATE budget_reservations SET status = 'consumed'
-                             WHERE experiment_id = ?1 AND dimension = 'experiment'",
-                            [&prepared.authority.successor_experiment_id],
-                        )
-                        .unwrap();
+            ("post-add accepted", |prepared, _connection| {
+                let repository = ExperimentRepository::new(&prepared.fixture.db);
+                repository
+                    .begin_checkpoint_submitting_or_defer(&prepared.authority, 3_204)
+                    .expect("post-add accepted submitting CAS")
+                    .expect("post-add accepted submitting transition");
+                repository
+                    .mark_accepted(
+                        &prepared.authority.successor_experiment_id,
+                        99,
+                        "pueue-managed-run:v1:post-add",
+                        3_205,
+                    )
+                    .expect("post-add accepted transition");
             }),
-            ("unreconciled", |prepared, connection| {
-                    connection
-                        .execute(
-                            "UPDATE submissions SET status = 'unreconciled'
-                             WHERE submission_id = ?1",
-                            [&prepared.authority.submission_id],
-                        )
-                        .unwrap();
-                    connection
-                        .execute(
-                            "UPDATE experiments
-                             SET status = 'unreconciled', failure_code = 'identity-mismatch'
-                             WHERE experiment_id = ?1",
-                            [&prepared.authority.successor_experiment_id],
-                        )
-                        .unwrap();
-                    connection
-                        .execute(
-                            "UPDATE budget_reservations SET status = 'consumed'
-                             WHERE experiment_id = ?1 AND dimension = 'experiment'",
-                            [&prepared.authority.successor_experiment_id],
-                        )
-                        .unwrap();
+            ("unreconciled", |prepared, _connection| {
+                let repository = ExperimentRepository::new(&prepared.fixture.db);
+                repository
+                    .begin_checkpoint_submitting_or_defer(&prepared.authority, 3_204)
+                    .expect("unreconciled submitting CAS")
+                    .expect("unreconciled submitting transition");
+                repository
+                    .mark_unreconciled(
+                        &prepared.authority.successor_experiment_id,
+                        "identity-mismatch",
+                        3_205,
+                    )
+                    .expect("unreconciled transition");
             }),
         ];
         let failures: Vec<_> = cases

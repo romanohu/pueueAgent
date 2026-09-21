@@ -4275,7 +4275,7 @@ pub(super) fn checkpoint_successor_graph_matches_authority(
                 && intent.experiment.finished_at.is_none()
         }
         ExperimentStatus::Accepted => {
-            reservation_status == "consumed"
+            reservation_status == "reserved"
                 && intent.submission.status == SubmissionStatus::Accepted
                 && intent.experiment.pueue_task_id.is_some()
                 && intent.experiment.task_signature.is_some()
@@ -4286,7 +4286,7 @@ pub(super) fn checkpoint_successor_graph_matches_authority(
                 && intent.experiment.finished_at.is_none()
         }
         ExperimentStatus::Unreconciled => {
-            reservation_status == "consumed"
+            reservation_status == "reserved"
                 && intent.submission.status == SubmissionStatus::Unreconciled
                 && intent.experiment.pueue_task_id.is_none()
                 && intent.experiment.task_signature.is_none()

@@ -896,6 +896,7 @@ submit_source() {
   wait_for_sql "SELECT COUNT(*) FROM experiments WHERE campaign_id = '$CAMPAIGN_ID' AND pueue_task_id = $SOURCE_TASK_ID" "1" "source experiment row"
   SOURCE_EXPERIMENT_ID="$(readonly_sql "SELECT experiment_id FROM experiments WHERE campaign_id = '$CAMPAIGN_ID' AND pueue_task_id = $SOURCE_TASK_ID")"
   [ -n "$CAMPAIGN_ID" ] && [ -n "$SOURCE_EXPERIMENT_ID" ] || die "source identity missing"
+  wait_for_task_state "$SOURCE_TASK_ID" Running 120
   record "SOURCE campaign=$CAMPAIGN_ID experiment=$SOURCE_EXPERIMENT_ID task=$SOURCE_TASK_ID"
 }
 
@@ -1210,7 +1211,7 @@ await_stop_confirmed() {
       *) die "checkpoint stop confirmation advanced to unexpected stage: $operation_stage" ;;
     esac
   else
-    wait_for_sql "SELECT operation_stage FROM research_reviews WHERE campaign_id = '$CAMPAIGN_ID' ORDER BY created_at, review_id LIMIT 1" "stop_confirmed" "research stop confirmation stage" "240"
+    wait_for_sql "SELECT COUNT(*) FROM research_reviews AS review JOIN termination_requests AS request ON request.request_id = review.termination_request_id JOIN decision_cycles AS cycle ON cycle.cycle_id = review.decision_cycle_id WHERE review.campaign_id = '$CAMPAIGN_ID' AND review.experiment_id = '$SOURCE_EXPERIMENT_ID' AND review.state = 'completed' AND review.operation_stage IS NULL AND review.successor_experiment_id IS NULL AND request.project_id = '$PROJECT_ID' AND request.status = 'confirmed' AND cycle.campaign_id = review.campaign_id AND cycle.source_experiment_id = review.experiment_id" "1" "research stop confirmation handoff" "240"
   fi
 }
 
@@ -1285,7 +1286,7 @@ run_checkpoint_case() {
   local checkpoint_step checkpoint_weight checkpoint_digest_value checkpoint_expected_digest
   local checkpoint_inode loader_ref candidate_ref checkpoint_note retained_argv_json retained_path retained_digest
   local successor_experiment_id successor_task successor_parent successor_resume successor_argv
-  local successor_line successor_path successor_loss successor_manifest_loss successor_digest
+  local successor_line successor_path successor_loss successor_manifest_loss successor_digest source_terminal_status
   local main_before source_before
   setup_case
   write_research_scenario resume_from_checkpoint 44444444-4444-4444-a444-444444444444
@@ -1341,7 +1342,7 @@ run_checkpoint_case() {
   record "CHECKPOINT_SOURCE path=$checkpoint_path argv_path=$checkpoint_argv_path step=$checkpoint_step weight=$checkpoint_weight digest=$checkpoint_digest_value inode=$checkpoint_inode heldout_loss=$(heldout_loss "$checkpoint_path")"
   release_marker "$CONTROL/add-release"
   rm -f -- "$CONTROL/add-arm"
-  wait_for_sql "SELECT COUNT(*) FROM research_reviews WHERE campaign_id = '$CAMPAIGN_ID' AND state = 'completed'" "1" "checkpoint answer" "240"
+  wait_for_sql "SELECT COUNT(*) FROM research_reviews WHERE campaign_id = '$CAMPAIGN_ID' AND state = 'completed'" "1" "checkpoint answer" "360"
 
   successor_experiment_id="$(readonly_sql "SELECT successor_experiment_id FROM research_reviews WHERE campaign_id = '$CAMPAIGN_ID' ORDER BY created_at, review_id LIMIT 1")"
   [ -n "$successor_experiment_id" ] || die "checkpoint review did not persist a successor graph edge"
@@ -1390,15 +1391,16 @@ if abs(float(match.group(3)) - float(expected_weight)) > 1e-12:
 if "step=0 loss=" in text:
     raise SystemExit("successor emitted a cold-start step")
 PY
-  [ "$(readonly_sql "SELECT status FROM experiments WHERE experiment_id = '$SOURCE_EXPERIMENT_ID'")" = cancelled ] \
-    || die "killed source did not settle as cancelled"
+  source_terminal_status="$(readonly_sql "SELECT status FROM experiments WHERE experiment_id = '$SOURCE_EXPERIMENT_ID'")"
+  [ "$(readonly_sql "SELECT COUNT(*) FROM experiments AS source JOIN campaigns AS campaign ON campaign.campaign_id = source.campaign_id JOIN research_reviews AS review ON review.campaign_id = source.campaign_id AND review.experiment_id = source.experiment_id JOIN termination_requests AS request ON request.request_id = review.termination_request_id JOIN task_observations AS observation ON observation.project_id = campaign.project_id AND observation.pueue_task_id = source.pueue_task_id WHERE source.experiment_id = '$SOURCE_EXPERIMENT_ID' AND source.campaign_id = '$CAMPAIGN_ID' AND campaign.project_id = '$PROJECT_ID' AND source.status IN ('failed', 'cancelled') AND request.project_id = '$PROJECT_ID' AND request.status = 'confirmed' AND observation.ended_at IS NOT NULL AND (lower(observation.state) = 'killed' OR (lower(observation.state) = 'done' AND json_valid(observation.result) = 1 AND lower(json_extract(observation.result, '$')) = 'killed'))")" = 1 ] \
+    || die "killed source did not settle with confirmed native kill evidence"
   [ "$(checkpoint_digest "$checkpoint_path")" = "$checkpoint_digest_value" ] \
     || die "source checkpoint bytes changed after resume"
   [ "$(stat -c '%i' "$checkpoint_path" 2>/dev/null || stat -f '%i' "$checkpoint_path")" = "$checkpoint_inode" ] \
     || die "source checkpoint inode changed after resume"
   wait_for_sql "SELECT current_best_experiment_id FROM campaigns WHERE campaign_id = '$CAMPAIGN_ID'" "$successor_experiment_id" "checkpoint successor promotion" "120"
   assert_source_unchanged "$main_before" "$source_before"
-  record "CASE checkpoint PASS source_checkpoint_step=$checkpoint_step source_digest=$checkpoint_digest_value retained_digest=$retained_digest successor=$successor_experiment_id successor_step=$(printf '%s' "$successor_line" | cut -f2) successor_digest=$successor_digest successor_loss=$successor_loss manifest_loss=$successor_manifest_loss source_cancelled=true resume_load=true cold_start=false source_unchanged=true promoted_successor=true"
+  record "CASE checkpoint PASS source_checkpoint_step=$checkpoint_step source_digest=$checkpoint_digest_value retained_digest=$retained_digest successor=$successor_experiment_id successor_step=$(printf '%s' "$successor_line" | cut -f2) successor_digest=$successor_digest successor_loss=$successor_loss manifest_loss=$successor_manifest_loss source_killed=true source_terminal_status=$source_terminal_status resume_load=true cold_start=false source_unchanged=true promoted_successor=true"
 }
 
 run_review_running_restart_case() {

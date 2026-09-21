@@ -1834,6 +1834,56 @@ mod tests {
                         )
                         .unwrap();
                 }
+                "unreconciled" => {
+                    let authority = match ResearchRepository::new(&fixture.db)
+                        .checkpoint_dispatch_authority(
+                            &fixture.project.project_id,
+                            &successor_id,
+                            3_298,
+                        )
+                        .unwrap()
+                    {
+                        crate::db::CheckpointDispatchSelection::Ready(authority) => authority,
+                        other => panic!("unexpected unreconciled checkpoint authority: {other:?}"),
+                    };
+                    ExperimentRepository::new(&fixture.db)
+                        .begin_checkpoint_submitting_or_defer(&authority, 3_299)
+                        .unwrap()
+                        .expect("unreconciled submitting transition");
+                    ExperimentRepository::new(&fixture.db)
+                        .mark_unreconciled(&successor_id, "identity-mismatch", 3_300)
+                        .unwrap();
+                    let reservation_status: String = fixture
+                        .db
+                        .connect()
+                        .unwrap()
+                        .query_row(
+                            "SELECT status FROM budget_reservations
+                             WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                            [&successor_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(reservation_status, "reserved");
+                    let mut ownership_connection = fixture.db.connect().unwrap();
+                    let transaction = ownership_connection
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .unwrap();
+                    match research_ownership_in_transaction(
+                        &transaction,
+                        &fixture.project.project_id,
+                        &fixture.checkpoint.campaign_id,
+                        &fixture.checkpoint.source_experiment_id,
+                    )
+                    .unwrap()
+                    {
+                        ResearchOwnership::Open(Some(owner)) => {
+                            assert!(!owner.recovery_required);
+                        }
+                        other => panic!("unexpected unreconciled checkpoint owner: {other:?}"),
+                    }
+                    transaction.commit().unwrap();
+                }
                 _ => {
                     connection
                         .execute(

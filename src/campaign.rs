@@ -2757,7 +2757,7 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "UPDATE budget_reservations SET status = 'consumed'
+                "UPDATE budget_reservations SET status = 'reserved'
                  WHERE experiment_id = ?1 AND dimension = 'experiment'",
                 [successor_id],
             )
@@ -3146,6 +3146,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_accepted_reserved_replay_is_idempotent_and_consumed_corruption_blocks() {
+        let fixture = crate::research_checkpoint::runtime_checkpoint_dispatch_fixture_bridge();
+        let checkpoint = fixture.checkpoint.clone();
+        let successor_id = fixture.intent.experiment.experiment_id.clone();
+        let pueue = CheckpointLeaseProbePueue::new(
+            &fixture.policy,
+            &checkpoint.campaign_id,
+            &checkpoint.review_id,
+            &checkpoint.retained_checkpoint,
+        );
+        let add_cleanup_blocked = Arc::clone(&pueue.add_cleanup_blocked);
+        let coordinator = CampaignCoordinator::new(
+            &fixture.db,
+            &pueue,
+            CampaignLimits::default(),
+        )
+        .with_execution_policy(&fixture.policy);
+        let admission = coordinator.acquire_admission(&fixture.project).unwrap();
+        let first = coordinator
+            .submit_checkpoint_intent_with_admission(
+                &fixture.intent,
+                &fixture.project,
+                admission,
+                3_105,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(first, CampaignSubmission::Submitted(_)));
+        let experiment = ExperimentRepository::new(&fixture.db)
+            .find_by_id(&successor_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(experiment.status, ExperimentStatus::Accepted);
+        assert_eq!(experiment.pueue_task_id, Some(77));
+        let reservation_status: String = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM budget_reservations
+                 WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                [&successor_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reservation_status, "reserved");
+
+        let replay_intent = {
+            let mut connection = fixture.db.connect().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let owner = match crate::db::research_ownership_in_transaction(
+                &transaction,
+                &fixture.project.project_id,
+                &checkpoint.campaign_id,
+                &checkpoint.source_experiment_id,
+            )
+            .unwrap()
+            {
+                crate::db::ResearchOwnership::Open(Some(owner)) => owner,
+                other => panic!("unexpected accepted checkpoint owner: {other:?}"),
+            };
+            assert_eq!(owner.operation_stage.as_deref(), Some("successor_reserved"));
+            assert!(!owner.recovery_required, "accepted+reserved owner must remain valid");
+            let replay_intent = match crate::db::accept_checkpoint_successor_in_transaction(
+                &transaction,
+                &owner,
+                &CampaignLimits::default(),
+                3_106,
+            )
+            .unwrap()
+            {
+                crate::db::CheckpointSuccessorAdmission::Ready(intent) => intent,
+                other => panic!("unexpected accepted checkpoint replay: {other:?}"),
+            };
+            transaction.commit().unwrap();
+            replay_intent
+        };
+        let replay_admission = coordinator.acquire_admission(&fixture.project).unwrap();
+        let replay = coordinator
+            .submit_checkpoint_intent_with_admission(
+                &replay_intent,
+                &fixture.project,
+                replay_admission,
+                3_107,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(replay, CampaignSubmission::Submitted(_)));
+        assert_eq!(*add_cleanup_blocked.lock().unwrap(), vec![true]);
+
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE budget_reservations SET status = 'consumed'
+                 WHERE experiment_id = ?1 AND dimension = 'experiment'
+                   AND status = 'reserved'",
+                [&successor_id],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let corrupted_owner = match crate::db::research_ownership_in_transaction(
+            &transaction,
+            &fixture.project.project_id,
+            &checkpoint.campaign_id,
+            &checkpoint.source_experiment_id,
+        )
+        .unwrap()
+        {
+            crate::db::ResearchOwnership::Open(Some(owner)) => owner,
+            other => panic!("unexpected corrupted checkpoint owner: {other:?}"),
+        };
+        assert!(corrupted_owner.recovery_required);
+        assert!(matches!(
+            crate::db::accept_checkpoint_successor_in_transaction(
+                &transaction,
+                &corrupted_owner,
+                &CampaignLimits::default(),
+                3_108,
+            ),
+            Err(AppError::Validation {
+                field: "research.owner",
+                ..
+            })
+        ));
+        transaction.commit().unwrap();
+
+        crate::environment::cleanup_retained_research_file(
+            &fixture.policy,
+            &checkpoint.campaign_id,
+            &checkpoint.review_id,
+            &checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn checkpoint_stale_reserved_clone_observing_submitting_never_adds_or_preadd_fails() {
         let fixture = crate::research_checkpoint::runtime_checkpoint_dispatch_fixture_bridge();
         let experiment_id = fixture.intent.experiment.experiment_id.clone();
@@ -3181,6 +3324,129 @@ mod tests {
         assert_eq!(submission.status, crate::models::SubmissionStatus::Unreconciled);
         assert_eq!(submission.pueue_task_id, None);
         assert_eq!(submission.task_signature, None);
+        let reservation_status: String = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM budget_reservations
+                 WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                [&experiment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reservation_status, "reserved");
+
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let owner = match crate::db::research_ownership_in_transaction(
+            &transaction,
+            &fixture.project.project_id,
+            &fixture.checkpoint.campaign_id,
+            &fixture.checkpoint.source_experiment_id,
+        )
+        .unwrap()
+        {
+            crate::db::ResearchOwnership::Open(Some(owner)) => owner,
+            other => panic!("unexpected unreconciled checkpoint owner: {other:?}"),
+        };
+        assert_eq!(owner.operation_stage.as_deref(), Some("successor_reserved"));
+        assert!(
+            !owner.recovery_required,
+            "unreconciled+reserved owner must remain valid"
+        );
+        let replay_intent = match crate::db::accept_checkpoint_successor_in_transaction(
+            &transaction,
+            &owner,
+            &CampaignLimits::default(),
+            3_106,
+        )
+        .unwrap()
+        {
+            crate::db::CheckpointSuccessorAdmission::Ready(intent) => intent,
+            other => panic!("unexpected unreconciled checkpoint replay: {other:?}"),
+        };
+        transaction.commit().unwrap();
+
+        let replay_admission = coordinator.acquire_admission(&fixture.project).unwrap();
+        let replay = coordinator
+            .submit_checkpoint_intent_with_admission(
+                &replay_intent,
+                &fixture.project,
+                replay_admission,
+                3_107,
+            )
+            .await;
+        assert!(matches!(
+            replay,
+            Err(AppError::Validation {
+                field: "experiment",
+                message: "submission may already have reached Pueue; reconciliation is required",
+            })
+        ));
+        assert_eq!(*add_count.lock().unwrap(), 0);
+        let replayed_experiment = ExperimentRepository::new(&fixture.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed_experiment.status, ExperimentStatus::Unreconciled);
+        assert_eq!(
+            replayed_experiment.failure_code.as_deref(),
+            Some(ADD_INTERRUPTED_REASON)
+        );
+        assert_eq!(replayed_experiment.pueue_task_id, None);
+        let replayed_submission = SubmissionRepository::new(&fixture.db)
+            .find_by_id(&fixture.intent.experiment.submission_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replayed_submission.status,
+            crate::models::SubmissionStatus::Unreconciled
+        );
+        assert_eq!(replayed_submission.pueue_task_id, None);
+
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE budget_reservations SET status = 'consumed'
+                 WHERE experiment_id = ?1 AND dimension = 'experiment'
+                   AND status = 'reserved'",
+                [&experiment_id],
+            )
+            .unwrap();
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let corrupted_owner = match crate::db::research_ownership_in_transaction(
+            &transaction,
+            &fixture.project.project_id,
+            &fixture.checkpoint.campaign_id,
+            &fixture.checkpoint.source_experiment_id,
+        )
+        .unwrap()
+        {
+            crate::db::ResearchOwnership::Open(Some(owner)) => owner,
+            other => panic!("unexpected corrupted unreconciled owner: {other:?}"),
+        };
+        assert!(corrupted_owner.recovery_required);
+        assert!(matches!(
+            crate::db::accept_checkpoint_successor_in_transaction(
+                &transaction,
+                &corrupted_owner,
+                &CampaignLimits::default(),
+                3_108,
+            ),
+            Err(AppError::Validation {
+                field: "research.owner",
+                ..
+            })
+        ));
+        transaction.commit().unwrap();
     }
 
     #[tokio::test]
