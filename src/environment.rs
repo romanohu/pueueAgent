@@ -13,16 +13,17 @@ use std::{
     fmt,
     fs::File,
     io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Instant,
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::execution_policy::{
     ExecutableIdentity, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
-    PolicyViolationDetail, ResolvedExecutionPolicy, ResolvedProjectExecutionPolicy,
-    TempUnsafeReason, VerifiedProjectRoot,
+    PolicyViolationDetail, ProjectRootAnchor, ResolvedExecutionPolicy,
+    ResolvedProjectExecutionPolicy, TempUnsafeReason, VerifiedProjectRoot,
 };
 #[cfg(target_os = "linux")]
 use std::{io::Write, sync::Mutex};
@@ -115,6 +116,545 @@ const MAX_DECISION_ARTIFACT_SCAN_ENTRIES: usize = 4096;
 const MAX_RESEARCH_STDOUT_BYTES: u64 = 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_RESEARCH_STDERR_BYTES: u64 = 256 * 1024;
+const RESEARCH_HASH_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResearchDirectoryRecord {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) owner: u32,
+    pub(crate) mode: u32,
+    pub(crate) mount_identity: [u64; 2],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResearchFileRecord {
+    pub(crate) relative_path: String,
+    pub(crate) root: ResearchDirectoryRecord,
+    pub(crate) parent: ResearchDirectoryRecord,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) owner: u32,
+    pub(crate) mode: u32,
+    pub(crate) mount_identity: [u64; 2],
+    pub(crate) logical_bytes: u64,
+    pub(crate) allocated_bytes: u64,
+    pub(crate) sha256: String,
+}
+
+/// A source-file capability.  The descriptors and named-chain authority stay
+/// private so callers can only use the bounded, revalidated read operation.
+pub(crate) struct VerifiedResearchFile {
+    file: File,
+    root: File,
+    parent: File,
+    root_anchor: ProjectRootAnchor,
+    components: Vec<OsString>,
+    leaf_name: OsString,
+    record: ResearchFileRecord,
+    leaf_links: u64,
+}
+
+impl VerifiedResearchFile {
+    pub(crate) fn record(&self) -> &ResearchFileRecord {
+        &self.record
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResearchLeafSnapshot {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    mode: u32,
+    mount_identity: MountIdentity,
+    logical_bytes: u64,
+    allocated_bytes: u64,
+    links: u64,
+}
+
+/// Open a regular source file below a startup-pinned project root and retain
+/// the descriptor chain needed to revalidate every later read by name.
+pub(crate) fn open_verified_research_file(
+    policy: &ResolvedExecutionPolicy,
+    root_anchor: &ProjectRootAnchor,
+    relative: &Path,
+    max_bytes: u64,
+) -> Result<VerifiedResearchFile, PolicyViolation> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (policy, root_anchor, relative, max_bytes);
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::RunBoundPreMarker,
+        ));
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let components = research_relative_components(relative)?;
+        let registered = policy
+            .project_root_anchor(&root_anchor.canonical_path)
+            .map_err(|violation| stage_violation(violation, PolicyViolationStage::PreBinding))?;
+        if registered != *root_anchor {
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::RootChanged,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        let verified_root = root_anchor.verify_identity()?;
+        let root_mount = directory_mount_identity_at(
+            &verified_root.directory,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        let root_record = research_directory_record_at(
+            &verified_root.directory,
+            root_mount,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        if root_record.device != root_anchor.identity.device
+            || root_record.inode != root_anchor.identity.inode
+            || root_record.owner != root_anchor.identity.owner
+            || root_record.mode != root_anchor.identity.mode
+        {
+            return Err(temp_violation_at(
+                TempUnsafeReason::IdentityChanged,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+
+        let mut current = verified_root
+            .directory
+            .try_clone()
+            .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, PolicyViolationStage::RunBoundPreMarker))?;
+        let mut parent_record = root_record.clone();
+        for component in &components[..components.len() - 1] {
+            let next = open_directory_on_mount(
+                &current,
+                component,
+                root_mount,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            let next_record = research_directory_record_at(
+                &next,
+                root_mount,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            current = next;
+            parent_record = next_record;
+        }
+
+        let leaf_name = components.last().cloned().ok_or_else(|| {
+            temp_violation_at(
+                TempUnsafeReason::InvalidEntry,
+                PolicyViolationStage::RunBoundPreMarker,
+            )
+        })?;
+        let file = open_research_file_on_mount(
+            &current,
+            &leaf_name,
+            root_mount,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        let before = research_leaf_snapshot(
+            &file,
+            root_mount,
+            max_bytes,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        let (hashed_bytes, digest) = hash_research_file(
+            &file,
+            max_bytes,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        let after = research_leaf_snapshot(
+            &file,
+            root_mount,
+            max_bytes,
+            PolicyViolationStage::RunBoundPreMarker,
+        )?;
+        if before != after || hashed_bytes != before.logical_bytes {
+            return Err(temp_violation_at(
+                TempUnsafeReason::IdentityChanged,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+
+        let parent = current
+            .try_clone()
+            .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, PolicyViolationStage::RunBoundPreMarker))?;
+        let root = verified_root
+            .directory
+            .try_clone()
+            .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, PolicyViolationStage::RunBoundPreMarker))?;
+        let record = ResearchFileRecord {
+            relative_path: components
+                .iter()
+                .map(|component| component.to_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("/"),
+            root: root_record,
+            parent: parent_record,
+            device: before.device,
+            inode: before.inode,
+            owner: before.owner,
+            mode: before.mode,
+            mount_identity: before.mount_identity.0,
+            logical_bytes: before.logical_bytes,
+            allocated_bytes: before.allocated_bytes,
+            sha256: digest,
+        };
+        let verified = VerifiedResearchFile {
+            file,
+            root,
+            parent,
+            root_anchor: root_anchor.clone(),
+            components,
+            leaf_name,
+            record,
+            leaf_links: before.links,
+        };
+        let _ = revalidate_research_file(&verified, max_bytes)?;
+        Ok(verified)
+    }
+}
+
+/// Read the complete source text from offset zero after bounded structural and
+/// digest revalidation before and after the read.
+pub(crate) fn read_verified_research_file(
+    file: &VerifiedResearchFile,
+    max_bytes: u64,
+) -> Result<Vec<u8>, PolicyViolation> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (file, max_bytes);
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::UnsupportedPlatform,
+            PolicyViolationStage::Finalized,
+        ));
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if file.record.logical_bytes > max_bytes {
+            return Err(temp_violation_at(
+                TempUnsafeReason::ByteLimit,
+                PolicyViolationStage::Finalized,
+            ));
+        }
+        let source = revalidate_research_file(file, max_bytes)?;
+        let size = usize::try_from(file.record.logical_bytes).map_err(|_| {
+            temp_violation_at(TempUnsafeReason::ByteLimit, PolicyViolationStage::Finalized)
+        })?;
+        let mut bytes = vec![0_u8; size];
+        read_research_bytes(&source, &mut bytes, PolicyViolationStage::Finalized)?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        if digest != file.record.sha256 {
+            return Err(temp_violation_at(
+                TempUnsafeReason::IdentityChanged,
+                PolicyViolationStage::Finalized,
+            ));
+        }
+        let _ = revalidate_research_file(file, max_bytes)?;
+        Ok(bytes)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn research_relative_components(relative: &Path) -> Result<Vec<OsString>, PolicyViolation> {
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        return Err(temp_violation_at(
+            TempUnsafeReason::InvalidEntry,
+            PolicyViolationStage::RunBoundPreMarker,
+        ));
+    }
+    let mut components = Vec::new();
+    let mut bytes = 0usize;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(temp_violation_at(
+                TempUnsafeReason::InvalidEntry,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        };
+        let Some(name) = name.to_str() else {
+            return Err(temp_violation_at(
+                TempUnsafeReason::InvalidEntry,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        };
+        if name.is_empty() {
+            return Err(temp_violation_at(
+                TempUnsafeReason::InvalidEntry,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        bytes = bytes.checked_add(name.len() + 1).ok_or_else(|| {
+            temp_violation_at(TempUnsafeReason::ByteLimit, PolicyViolationStage::RunBoundPreMarker)
+        })?;
+        if bytes > 4096 {
+            return Err(temp_violation_at(
+                TempUnsafeReason::ByteLimit,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        components.push(OsString::from(name));
+    }
+    if components.is_empty() {
+        return Err(temp_violation_at(
+            TempUnsafeReason::InvalidEntry,
+            PolicyViolationStage::RunBoundPreMarker,
+        ));
+    }
+    Ok(components)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn research_directory_record_at(
+    directory: &File,
+    expected_mount: MountIdentity,
+    stage: PolicyViolationStage,
+) -> Result<ResearchDirectoryRecord, PolicyViolation> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = directory
+        .metadata()
+        .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
+    let mount_identity = directory_mount_identity_at(directory, stage)?;
+    let owner = metadata.uid();
+    let mode = metadata.mode() & 0o7777;
+    let links = metadata.nlink();
+    if mount_identity != expected_mount
+        || !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || owner != unsafe { libc::geteuid() as u32 }
+        || mode & 0o022 != 0
+        || links == 0
+    {
+        return Err(temp_violation_at(TempUnsafeReason::InvalidEntry, stage));
+    }
+    Ok(ResearchDirectoryRecord {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner,
+        mode,
+        mount_identity: mount_identity.0,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn research_leaf_snapshot(
+    file: &File,
+    expected_mount: MountIdentity,
+    max_bytes: u64,
+    stage: PolicyViolationStage,
+) -> Result<ResearchLeafSnapshot, PolicyViolation> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
+    let mount_identity = directory_mount_identity_at(file, stage)?;
+    let owner = metadata.uid();
+    let mode = metadata.mode() & 0o7777;
+    let links = metadata.nlink();
+    if mount_identity != expected_mount
+        || !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || owner != unsafe { libc::geteuid() as u32 }
+        || mode & 0o022 != 0
+        || links != 1
+    {
+        return Err(temp_violation_at(TempUnsafeReason::InvalidEntry, stage));
+    }
+    let allocated_bytes = metadata.blocks().checked_mul(512).ok_or_else(|| {
+        temp_violation_at(TempUnsafeReason::ByteLimit, stage)
+    })?;
+    if metadata.len() > max_bytes {
+        return Err(temp_violation_at(TempUnsafeReason::ByteLimit, stage));
+    }
+    Ok(ResearchLeafSnapshot {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner,
+        mode,
+        mount_identity,
+        logical_bytes: metadata.len(),
+        allocated_bytes,
+        links,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hash_research_file(
+    file: &File,
+    max_bytes: u64,
+    stage: PolicyViolationStage,
+) -> Result<(u64, String), PolicyViolation> {
+    use std::os::unix::fs::FileExt;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; RESEARCH_HASH_BUFFER_BYTES];
+    let mut offset = 0_u64;
+    loop {
+        let read = file
+            .read_at(&mut buffer, offset)
+            .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
+        if read == 0 {
+            break;
+        }
+        offset = offset.checked_add(read as u64).ok_or_else(|| {
+            temp_violation_at(TempUnsafeReason::ByteLimit, stage)
+        })?;
+        if offset > max_bytes {
+            return Err(temp_violation_at(TempUnsafeReason::ByteLimit, stage));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((offset, format!("{:x}", hasher.finalize())))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_research_bytes(
+    file: &File,
+    bytes: &mut [u8],
+    stage: PolicyViolationStage,
+) -> Result<(), PolicyViolation> {
+    use std::os::unix::fs::FileExt;
+
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let read = file
+            .read_at(&mut bytes[offset..], offset as u64)
+            .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
+        if read == 0 {
+            return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+        }
+        offset = offset.checked_add(read).ok_or_else(|| {
+            temp_violation_at(TempUnsafeReason::ByteLimit, stage)
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn research_leaf_matches_record(
+    snapshot: ResearchLeafSnapshot,
+    record: &ResearchFileRecord,
+    expected_links: u64,
+    stage: PolicyViolationStage,
+) -> Result<(), PolicyViolation> {
+    if snapshot.device != record.device
+        || snapshot.inode != record.inode
+        || snapshot.owner != record.owner
+        || snapshot.mode != record.mode
+        || snapshot.mount_identity.0 != record.mount_identity
+        || snapshot.logical_bytes != record.logical_bytes
+        || snapshot.allocated_bytes != record.allocated_bytes
+        || snapshot.links != expected_links
+    {
+        return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn revalidate_research_file(
+    file: &VerifiedResearchFile,
+    max_bytes: u64,
+) -> Result<File, PolicyViolation> {
+    let stage = PolicyViolationStage::Finalized;
+    file.root_anchor.verify_identity()?;
+    let expected_mount = MountIdentity(file.record.root.mount_identity);
+    let root_record = research_directory_record_at(&file.root, expected_mount, stage)?;
+    if root_record != file.record.root {
+        return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+    }
+    let retained_parent = research_directory_record_at(&file.parent, expected_mount, stage)?;
+    if retained_parent != file.record.parent {
+        return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+    }
+    let retained_leaf = research_leaf_snapshot(
+        &file.file,
+        expected_mount,
+        max_bytes,
+        stage,
+    )?;
+    research_leaf_matches_record(retained_leaf, &file.record, file.leaf_links, stage)?;
+    let mut current = file
+        .root
+        .try_clone()
+        .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
+    for component in &file.components[..file.components.len() - 1] {
+        let next = open_directory_on_mount(&current, component, expected_mount, stage)?;
+        current = next;
+    }
+    let parent_record = research_directory_record_at(&current, expected_mount, stage)?;
+    if parent_record != file.record.parent {
+        return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+    }
+    let leaf = open_research_file_on_mount(&current, &file.leaf_name, expected_mount, stage)?;
+    let snapshot = research_leaf_snapshot(&leaf, expected_mount, max_bytes, stage)?;
+    research_leaf_matches_record(snapshot, &file.record, file.leaf_links, stage)?;
+    let (hashed_bytes, digest) = hash_research_file(&leaf, max_bytes, stage)?;
+    if hashed_bytes != file.record.logical_bytes || digest != file.record.sha256 {
+        return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+    }
+    Ok(leaf)
+}
+
+#[cfg(target_os = "linux")]
+fn open_research_file_on_mount(
+    parent: &File,
+    name: &OsStr,
+    expected_mount: MountIdentity,
+    stage: PolicyViolationStage,
+) -> Result<File, PolicyViolation> {
+    let file = linux_openat2_no_xdev(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )
+    .map_err(|failure| linux_syscall_violation(failure, stage))?;
+    if directory_mount_identity_at(&file, stage)? != expected_mount {
+        return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "macos")]
+fn open_research_file_on_mount(
+    parent: &File,
+    name: &OsStr,
+    expected_mount: MountIdentity,
+    stage: PolicyViolationStage,
+) -> Result<File, PolicyViolation> {
+    use std::{
+        os::fd::{AsRawFd, FromRawFd},
+        os::unix::ffi::OsStrExt,
+    };
+    if entry_mount_identity_at(parent, name, stage)? != expected_mount {
+        return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+    }
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| temp_violation_at(TempUnsafeReason::InvalidEntry, stage))?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    if directory_mount_identity_at(&file, stage)? != expected_mount {
+        return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+    }
+    Ok(file)
+}
 
 /// Metadata-only evidence discovered relative to a retained project-root
 /// descriptor. File contents are deliberately outside this projection.
@@ -3882,15 +4422,28 @@ fn linux_open_directory_no_xdev(
     parent: &File,
     name: &OsStr,
 ) -> Result<File, LinuxSyscallFailure> {
+    linux_openat2_no_xdev(
+        parent,
+        name,
+        libc::O_RDONLY
+            | libc::O_DIRECTORY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_openat2_no_xdev(
+    parent: &File,
+    name: &OsStr,
+    flags: libc::c_int,
+) -> Result<File, LinuxSyscallFailure> {
     use std::{os::fd::{AsRawFd, FromRawFd}, os::unix::ffi::OsStrExt};
     let name = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| LinuxSyscallFailure::IoFailure)?;
     let how = LinuxOpenHow {
-        flags: (libc::O_RDONLY
-            | libc::O_DIRECTORY
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK) as u64,
+        flags: flags as u64,
         mode: 0,
         resolve: LINUX_RESOLVE_NO_XDEV,
     };
@@ -5020,6 +5573,200 @@ mod tests {
             error.detail,
             PolicyViolationDetail::TempUnsafe(TempUnsafeReason::EntryLimit)
         );
+    }
+
+    fn research_policy_fixture() -> (
+        tempfile::TempDir,
+        crate::execution_policy::ResolvedExecutionPolicy,
+        crate::execution_policy::ProjectRootAnchor,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(temporary.path()).unwrap();
+        let state_dir = base.join("state");
+        let project_root = base.join("project");
+        let trusted_bin = base.join("trusted-bin");
+        let codex_home = base.join("codex-home");
+        for directory in [&state_dir, &project_root, &trusted_bin, &codex_home] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for name in ["codex", "pueue", "launcher"] {
+            let path = trusted_bin.join(name);
+            fs::write(&path, b"fixture").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let pueue_config = base.join("pueue.yml");
+        fs::write(&pueue_config, b"fixture: true\n").unwrap();
+        fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+        let input = crate::execution_policy::PolicyLoadInput {
+            state_dir,
+            project_roots: vec![project_root.clone()],
+            inherited_path: trusted_bin.into_os_string(),
+            startup_environment: crate::execution_policy::StartupEnvironment::from_pairs([
+                ("HOME", base.as_os_str()),
+                ("PUEUE_AGENT_STATE_DIR", base.join("state").as_os_str()),
+            ]),
+            codex_home,
+            pueue_config,
+            launcher_path: base.join("trusted-bin/launcher"),
+        };
+        let policy = crate::execution_policy::load_or_create_policy(&input).unwrap();
+        let anchor = policy.project_root_anchor(&project_root).unwrap();
+        (temporary, policy, anchor)
+    }
+
+    #[test]
+    fn verified_research_source_reads_repeatably_with_bounded_hash() {
+        use sha2::{Digest, Sha256};
+
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let path = anchor.canonical_path.join("source.txt");
+        let bytes = b"research source bytes\n";
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let verified = open_verified_research_file(&policy, &anchor, Path::new("source.txt"), bytes.len() as u64)
+            .unwrap();
+        assert_eq!(verified.record().relative_path, "source.txt");
+        assert_eq!(verified.record().logical_bytes, bytes.len() as u64);
+        assert_eq!(verified.record().sha256, format!("{:x}", Sha256::digest(bytes)));
+        let unrelated = anchor.canonical_path.join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(read_verified_research_file(&verified, bytes.len() as u64).unwrap(), bytes);
+        assert_eq!(read_verified_research_file(&verified, bytes.len() as u64).unwrap(), bytes);
+    }
+
+    #[test]
+    fn verified_research_source_enforces_cap_at_open_and_read() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let path = anchor.canonical_path.join("source.txt");
+        fs::write(&path, b"12345").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(open_verified_research_file(&policy, &anchor, Path::new("source.txt"), 4).is_err());
+        let verified = open_verified_research_file(&policy, &anchor, Path::new("source.txt"), 5).unwrap();
+        assert!(read_verified_research_file(&verified, 4).is_err());
+        assert_eq!(read_verified_research_file(&verified, 5).unwrap(), b"12345");
+    }
+
+    #[test]
+    fn verified_research_source_rejects_unsafe_paths_types_links_and_permissions() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let regular = anchor.canonical_path.join("source.txt");
+        fs::write(&regular, b"source").unwrap();
+        fs::set_permissions(&regular, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(open_verified_research_file(&policy, &anchor, Path::new("/source.txt"), 64).is_err());
+        assert!(open_verified_research_file(&policy, &anchor, Path::new("../source.txt"), 64).is_err());
+
+        let symlink_path = anchor.canonical_path.join("symlink");
+        symlink(&regular, &symlink_path).unwrap();
+        assert!(open_verified_research_file(&policy, &anchor, Path::new("symlink"), 64).is_err());
+
+        let hard_link = anchor.canonical_path.join("hard-link");
+        fs::hard_link(&regular, &hard_link).unwrap();
+        assert!(open_verified_research_file(&policy, &anchor, Path::new("source.txt"), 64).is_err());
+        fs::remove_file(&hard_link).unwrap();
+
+        fs::set_permissions(&regular, fs::Permissions::from_mode(0o620)).unwrap();
+        assert!(open_verified_research_file(&policy, &anchor, Path::new("source.txt"), 64).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let fifo = anchor.canonical_path.join("fifo");
+            let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            assert!(open_verified_research_file(&policy, &anchor, Path::new("fifo"), 64).is_err());
+        }
+
+        let outside = tempfile::tempdir().unwrap();
+        fs::set_permissions(outside.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let outside_source = outside.path().join("source.txt");
+        fs::write(&outside_source, b"outside").unwrap();
+        fs::set_permissions(&outside_source, fs::Permissions::from_mode(0o600)).unwrap();
+        let outside_anchor = crate::execution_policy::ProjectRootAnchor::resolve(
+            &fs::canonicalize(outside.path()).unwrap(),
+        )
+        .unwrap();
+        assert!(open_verified_research_file(&policy, &outside_anchor, Path::new("source.txt"), 64).is_err());
+    }
+
+    #[test]
+    fn research_source_records_are_strictly_serialized() {
+        let directory = ResearchDirectoryRecord {
+            device: 1,
+            inode: 2,
+            owner: 3,
+            mode: 0o700,
+            mount_identity: [4, 5],
+        };
+        let record = ResearchFileRecord {
+            relative_path: "source.txt".to_owned(),
+            root: directory.clone(),
+            parent: directory,
+            device: 6,
+            inode: 7,
+            owner: 3,
+            mode: 0o600,
+            mount_identity: [8, 9],
+            logical_bytes: 10,
+            allocated_bytes: 512,
+            sha256: "a".repeat(64),
+        };
+        let mut encoded = serde_json::to_value(&record).unwrap();
+        encoded["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ResearchFileRecord>(encoded).is_err());
+    }
+
+    #[test]
+    fn verified_research_source_rejects_parent_root_leaf_and_same_inode_changes() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let parent = anchor.canonical_path.join("nested");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("source.txt");
+        fs::write(&path, b"source").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let verified = open_verified_research_file(&policy, &anchor, Path::new("nested/source.txt"), 64).unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"mutate").unwrap();
+        file.sync_all().unwrap();
+        assert!(read_verified_research_file(&verified, 64).is_err());
+
+        fs::write(&path, b"source").unwrap();
+        let verified = open_verified_research_file(&policy, &anchor, Path::new("nested/source.txt"), 64).unwrap();
+        let retired_parent = anchor.canonical_path.join("nested.retired");
+        fs::rename(&parent, &retired_parent).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(parent.join("source.txt"), b"replacement").unwrap();
+        fs::set_permissions(parent.join("source.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_verified_research_file(&verified, 64).is_err());
+
+        fs::rename(&parent, anchor.canonical_path.join("nested.replacement")).unwrap();
+        fs::rename(&retired_parent, &parent).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let verified = open_verified_research_file(&policy, &anchor, Path::new("nested/source.txt"), 64).unwrap();
+        let retired_leaf = parent.join("source.retired");
+        fs::rename(&path, &retired_leaf).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_verified_research_file(&verified, 64).is_err());
+
+        fs::remove_file(&path).unwrap();
+        fs::rename(&retired_leaf, &path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let verified = open_verified_research_file(&policy, &anchor, Path::new("nested/source.txt"), 64).unwrap();
+        let retired_root = anchor.canonical_path.with_extension("retired");
+        fs::rename(&anchor.canonical_path, &retired_root).unwrap();
+        fs::create_dir(&anchor.canonical_path).unwrap();
+        fs::set_permissions(&anchor.canonical_path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(read_verified_research_file(&verified, 64).is_err());
     }
 }
 
