@@ -769,12 +769,14 @@ EOF
   # The runner is the verified native executable; it then enters the shell
   # fixture through an absolute path.  This works with /proc/self/fd launch.
   build_native_runner "$BIN/fake-agent" "fake-agent.sh"
+  build_native_runner "$BIN/fake-codex" "fake-codex.sh"
   build_native_runner "$BIN/codex" "codex-wrapper.sh"
   build_pueue_proxy
 
   for command_path in /bin/bash /bin/cat /bin/chmod /bin/date /bin/dirname \
       /bin/find /bin/head /bin/mkdir /bin/rm /bin/sleep /bin/stat /bin/tr \
-      /usr/bin/awk /usr/bin/id /usr/bin/seq /usr/bin/sed; do
+      /usr/bin/awk /usr/bin/basename /usr/bin/id /usr/bin/seq /usr/bin/sed \
+      /usr/bin/sha256sum; do
     [ -x "$command_path" ] || continue
     cp "$command_path" "$BIN/$(basename "$command_path")"
   done
@@ -792,7 +794,7 @@ shared:
   use_unix_socket: true
   unix_socket_path: "$WORK/pueue.socket"
 daemon:
-  callback: "$PA_BIN event callback --task-id '{{ id }}'"
+  callback: "'$PA_BIN' event callback --task-id '{{ id }}'"
   shell_command: ["/bin/sh", "-c", "{{ pueue_command_string }}"]
 EOF
   chmod 600 "$PUEUE_CONFIG"
