@@ -1215,6 +1215,50 @@ await_stop_confirmed() {
   fi
 }
 
+wait_for_skipped_no_metric_successor() {
+  local successor_experiment_id="$1"
+  wait_for_sql "SELECT COUNT(*)
+    FROM campaigns AS campaign
+    JOIN experiments AS source
+      ON source.experiment_id = campaign.baseline_experiment_id
+     AND source.campaign_id = campaign.campaign_id
+    JOIN experiment_metrics AS source_metric
+      ON source_metric.experiment_id = source.experiment_id
+    JOIN experiments AS successor
+      ON successor.experiment_id = '$successor_experiment_id'
+     AND successor.campaign_id = campaign.campaign_id
+     AND successor.parent_experiment_id = source.experiment_id
+    JOIN experiment_metrics AS successor_metric
+      ON successor_metric.experiment_id = successor.experiment_id
+    WHERE campaign.campaign_id = '$CAMPAIGN_ID'
+      AND campaign.project_id = '$PROJECT_ID'
+      AND campaign.baseline_experiment_id = '$SOURCE_EXPERIMENT_ID'
+      AND source.experiment_id = '$SOURCE_EXPERIMENT_ID'
+      AND (SELECT COUNT(*)
+           FROM experiments AS child
+           WHERE child.campaign_id = '$CAMPAIGN_ID'
+      AND child.parent_experiment_id = '$SOURCE_EXPERIMENT_ID') = 1
+      AND source.status IN ('failed', 'cancelled')
+      AND source_metric.primary_metric_name IS NULL
+      AND source_metric.primary_metric_value IS NULL
+      AND source_metric.artifact_defect = 'result_missing'
+      AND source_metric.evaluated_at IS NOT NULL
+      AND successor.status = 'succeeded'
+      AND successor_metric.primary_metric_name = 'loss'
+      AND successor_metric.primary_metric_value IS NOT NULL
+      AND successor_metric.artifact_defect IS NULL
+      AND successor_metric.evaluated_at IS NOT NULL
+      AND campaign.current_best_experiment_id IS NULL
+      AND campaign.plateau_count = 0" \
+    "1" "successor evaluated without promotion" "30"
+  [ "$(readonly_sql "SELECT COUNT(*) FROM events
+      WHERE project_id = '$PROJECT_ID'
+        AND campaign_id = '$CAMPAIGN_ID'
+        AND kind = 'operator_wake'
+        AND dedup_key = 'promotion:v1:$CAMPAIGN_ID:$successor_experiment_id'")" = 0 ] \
+    || die "successor unexpectedly emitted a promotion event"
+}
+
 run_stop_and_next_case() {
   local main_before source_before successor_experiment_id
   local source_checkpoint_line source_checkpoint_path source_checkpoint_step source_checkpoint_weight
@@ -1267,13 +1311,13 @@ run_stop_and_next_case() {
   [ "$successor_checkpoint_step" -ge 1 ] || die "stop-and-next successor checkpoint did not show learning progress"
   record "STOP_SUCCESSOR_CHECKPOINT path=$successor_checkpoint_path step=$successor_checkpoint_step weight=$successor_checkpoint_weight digest=$(checkpoint_digest "$successor_checkpoint_path")"
   wait_for_sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = (SELECT experiment_id FROM experiments WHERE pueue_task_id = $successor_task)" "1" "successor manifest metric" "120"
-  wait_for_sql "SELECT current_best_experiment_id FROM campaigns WHERE campaign_id = '$CAMPAIGN_ID'" "$successor_experiment_id" "successor promotion" "120"
+  wait_for_skipped_no_metric_successor "$successor_experiment_id"
   [ "$(readonly_sql "SELECT COUNT(*) FROM termination_requests WHERE project_id = '$PROJECT_ID' AND status = 'confirmed'")" = 1 ] \
     || die "stop-and-next did not confirm exactly one termination"
   [ "$(readonly_sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_ID' AND source_experiment_id = '$SOURCE_EXPERIMENT_ID'")" = 1 ] \
     || die "stop-and-next did not attach one terminal cycle"
   assert_source_unchanged "$main_before" "$source_before"
-  record "CASE stop_and_next PASS source_terminal=true source_checkpoint_step=$source_checkpoint_step confirmed_kills=1 cycles=1 successor=1 successor_checkpoint_step=$successor_checkpoint_step manifest_metric=true promoted_successor=true"
+  record "CASE stop_and_next PASS source_terminal=true source_checkpoint_step=$source_checkpoint_step confirmed_kills=1 cycles=1 successor=1 successor_checkpoint_step=$successor_checkpoint_step manifest_metric=true promotion=skipped_no_metric promoted_successor=false"
 }
 
 pueue_group_count() {
@@ -1398,9 +1442,9 @@ PY
     || die "source checkpoint bytes changed after resume"
   [ "$(stat -c '%i' "$checkpoint_path" 2>/dev/null || stat -f '%i' "$checkpoint_path")" = "$checkpoint_inode" ] \
     || die "source checkpoint inode changed after resume"
-  wait_for_sql "SELECT current_best_experiment_id FROM campaigns WHERE campaign_id = '$CAMPAIGN_ID'" "$successor_experiment_id" "checkpoint successor promotion" "120"
+  wait_for_skipped_no_metric_successor "$successor_experiment_id"
   assert_source_unchanged "$main_before" "$source_before"
-  record "CASE checkpoint PASS source_checkpoint_step=$checkpoint_step source_digest=$checkpoint_digest_value retained_digest=$retained_digest successor=$successor_experiment_id successor_step=$(printf '%s' "$successor_line" | cut -f2) successor_digest=$successor_digest successor_loss=$successor_loss manifest_loss=$successor_manifest_loss source_killed=true source_terminal_status=$source_terminal_status resume_load=true cold_start=false source_unchanged=true promoted_successor=true"
+  record "CASE checkpoint PASS source_checkpoint_step=$checkpoint_step source_digest=$checkpoint_digest_value retained_digest=$retained_digest successor=$successor_experiment_id successor_step=$(printf '%s' "$successor_line" | cut -f2) successor_digest=$successor_digest successor_loss=$successor_loss manifest_loss=$successor_manifest_loss source_killed=true source_terminal_status=$source_terminal_status resume_load=true cold_start=false source_unchanged=true promotion=skipped_no_metric promoted_successor=false"
 }
 
 run_review_running_restart_case() {
@@ -1542,7 +1586,7 @@ run_stop_confirmed_restart_case() {
     '{invoked_path:$invoked,release_path:$release}' > "$HOME/.pueue-agent/decision-control.json"
   chmod 600 "$HOME/.pueue-agent/decision-control.json"
   start_daemon
-  wait_for_marker "$CONTROL/decision-entered-2" "stop-confirmed fresh decision generation" 120
+  wait_for_marker "$CONTROL/decision-entered-2" "stop-confirmed fresh decision generation" 720
   record_barrier_pid_file "$decision_pid_log"
   fresh_decision_pid="$(sed -n '1p' "$decision_pid_log")"
   require_owned_pid "$fresh_decision_pid"
@@ -1638,6 +1682,7 @@ run_successor_submitting_restart_case() {
 run_add_reconcile_case() {
   local kill_proxy_pid add_proxy_pid successor_task successor_experiment
   local status_before status_after status_after_suppressed successor_task_before
+  local successor_observed_before_restart successor_observed_first
   setup_case
   write_research_scenario stop_and_next bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
   submit_source 240 1
@@ -1668,8 +1713,8 @@ run_add_reconcile_case() {
   add_proxy_pid="$(sed -n '1p' "$CONTROL/add-pids")"
   [ "$add_proxy_pid" -gt 1 ] || die "real add barrier did not publish an owned PID"
   # Resolve the one reserved successor while the external add is still held.
-  # Its task ID must remain NULL until production receives the suppressed
-  # result and later performs exact-task reconciliation.
+  # Its task ID must remain NULL after production receives the suppressed
+  # result; production must retain the conservative unknown-add state.
   successor_experiment="$(readonly_sql "SELECT experiment_id FROM experiments WHERE campaign_id = '$CAMPAIGN_ID' AND parent_experiment_id = '$SOURCE_EXPERIMENT_ID'")"
   [ -n "$successor_experiment" ] || die "result-suppressed add lost the reserved successor identity before delegation"
   successor_task_before="$(readonly_sql "SELECT COALESCE(pueue_task_id, '') FROM experiments WHERE experiment_id = '$successor_experiment'")"
@@ -1684,20 +1729,38 @@ run_add_reconcile_case() {
   [ "$(pueue_group_count)" = 2 ] || die "result-suppressed add did not create exactly one real Pueue task"
   successor_task="$($REAL_PUEUE --config "$PUEUE_CONFIG" status --json \
     | "$REAL_JQ" -er --arg group "$GROUP" --arg source "$SOURCE_TASK_ID" \
-      '[.tasks | to_entries[] | select(.value.group == $group and .key != $source) | .key] | if length == 1 then .[0] else error("expected exactly one reconciled successor task") end')"
+      '[.tasks | to_entries[] | select(.value.group == $group and .key != $source) | .key] | if length == 1 then .[0] else error("expected exactly one external successor task") end')"
   register_task successor "$successor_task"
+  [ "$(readonly_sql "SELECT COUNT(*) FROM experiments WHERE campaign_id = '$CAMPAIGN_ID' AND parent_experiment_id = '$SOURCE_EXPERIMENT_ID'")" = 1 ] \
+    || die "result-suppressed add did not retain exactly one successor experiment"
+  [ "$(grep -c '^ADD_BEGIN$' "$WORK/pueue-add-argv.log")" = 1 ] \
+    || die "result-suppressed add did not capture exactly one external add"
   rm -f -- "$CONTROL/add-arm" "$CONTROL/add-suppress-result"
   crash_daemon_exact
   terminate_exact_pid "$add_proxy_pid"
+  successor_observed_before_restart="$(readonly_sql "SELECT COALESCE(MAX(observed_at), -1) FROM task_observations WHERE project_id = '$PROJECT_ID' AND pueue_task_id = $successor_task AND pueue_group = '$GROUP'")"
+  [ "$successor_observed_before_restart" -ge -1 ] || die "result-suppressed add lacked an observation timestamp floor"
   start_daemon
-  wait_for_sql "SELECT COUNT(*) FROM experiments WHERE experiment_id = '$successor_experiment' AND status = 'accepted' AND pueue_task_id = $successor_task" "1" "result-suppressed exact-task binding" "240"
+  wait_for_sql "SELECT CASE WHEN COALESCE(MAX(observed_at), -1) > $successor_observed_before_restart THEN 1 ELSE 0 END FROM task_observations WHERE project_id = '$PROJECT_ID' AND pueue_task_id = $successor_task AND pueue_group = '$GROUP'" "1" "result-suppressed first post-restart observation" "240"
+  successor_observed_first="$(readonly_sql "SELECT COALESCE(MAX(observed_at), -1) FROM task_observations WHERE project_id = '$PROJECT_ID' AND pueue_task_id = $successor_task AND pueue_group = '$GROUP'")"
+  [ "$successor_observed_first" -gt "$successor_observed_before_restart" ] || die "result-suppressed first post-restart observation did not advance"
   wait_for_task_terminal "$successor_task" 180
-  wait_for_sql "SELECT status FROM experiments WHERE experiment_id = '$successor_experiment'" "succeeded" "result-suppressed successor reconciliation" "240"
+  wait_for_sql "SELECT CASE WHEN COALESCE(MAX(observed_at), -1) > $successor_observed_first THEN 1 ELSE 0 END FROM task_observations WHERE project_id = '$PROJECT_ID' AND pueue_task_id = $successor_task AND pueue_group = '$GROUP'" "1" "result-suppressed completed post-restart reconciliation pass" "240"
+  [ "$(readonly_sql "SELECT COUNT(*) FROM task_observations WHERE project_id = '$PROJECT_ID' AND pueue_task_id = $successor_task AND pueue_group = '$GROUP' AND ended_at IS NOT NULL AND lower(state) = 'done' AND json_valid(result) = 1 AND lower(json_extract(result, '$')) = 'success'")" = 1 ] \
+    || die "result-suppressed add lacked exact terminal external task observation"
   status_after="$(readonly_sql "SELECT status FROM experiments WHERE experiment_id = '$successor_experiment'")"
-  wait_for_sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = '$successor_experiment'" "1" "result-suppressed successor metric" "120"
+  [ "$(readonly_sql "SELECT COUNT(*) FROM experiments AS experiment JOIN submissions AS submission USING (submission_id) WHERE experiment.experiment_id = '$successor_experiment' AND experiment.status = 'unreconciled' AND experiment.failure_code = 'pueue_add_unknown' AND experiment.pueue_task_id IS NULL AND experiment.task_signature IS NULL AND experiment.finished_at IS NULL AND submission.status = 'unreconciled' AND submission.pueue_task_id IS NULL AND submission.task_signature IS NULL")" = 1 ] \
+    || die "result-suppressed add did not retain durable managed unreconciled state"
+  [ "$(readonly_sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = '$successor_experiment'")" = 0 ] \
+    || die "result-suppressed unbound external result was ingested as a successor metric"
+  [ "$(readonly_sql "SELECT COUNT(*) FROM experiments WHERE campaign_id = '$CAMPAIGN_ID' AND parent_experiment_id = '$SOURCE_EXPERIMENT_ID'")" = 1 ] \
+    || die "result-suppressed recovery duplicated the successor experiment"
+  [ "$(experiment_count)" = 2 ] || die "result-suppressed recovery changed experiment cardinality"
   [ "$(pueue_group_count)" = 2 ] || die "result-suppressed recovery re-added the real successor"
   [ "$(submission_count)" = 2 ] || die "result-suppressed recovery created a duplicate submission"
-  record "CASE add_reconcile PASS real_add=true result_suppressed=true pre_delegation_status=$status_before post_add_status=$status_after_suppressed post_restart_status=$status_after successor_task=$successor_task duplicate_add=false"
+  [ "$(grep -c '^ADD_BEGIN$' "$WORK/pueue-add-argv.log")" = 1 ] \
+    || die "result-suppressed recovery attempted a second external add"
+  record "CASE add_reconcile PASS real_add=true result_suppressed=true pre_delegation_status=$status_before post_add_status=$status_after_suppressed post_restart_status=$status_after reconciliation_required=true exact_external_task=$successor_task external_task_terminal=true external_task_observed_after_restart=true successor_metric=false duplicate_add=false experiments=2 submissions=2 add_begin=1"
 }
 
 run_failure_case() {
