@@ -4933,26 +4933,24 @@ pub(crate) fn accept_checkpoint_successor_in_transaction(
         ));
     }
     let successor_id = checkpoint.successor_ids.experiment_id.clone();
-    let successor_witness = if operation_stage.as_deref() == Some("successor_reserved") {
-        super::research::checkpoint_successor_witness(transaction, &successor_id)?
-    } else {
-        None
-    };
-    let dispatch_authority = CheckpointDispatchAuthority {
-        checkpoint: checkpoint.clone(),
-        raw_checkpoint: raw.clone(),
-        project_id: expected.project_id.clone(),
-        campaign_id: expected.campaign_id.clone(),
-        review_id: expected.review_id.clone(),
-        source_experiment_id: expected.source_experiment_id.clone(),
-        proposal_id: checkpoint.successor_ids.proposal_id.clone(),
-        submission_id: checkpoint.successor_ids.submission_id.clone(),
-        successor_experiment_id: successor_id.clone(),
-        successor_attempt: successor_witness.map(|(attempt, _)| attempt),
-        reservation_window_ends_at: successor_witness.map(|(_, window_end)| window_end),
-        termination_request_id,
-    };
     if operation_stage.as_deref() == Some("successor_reserved") {
+        let successor_witness =
+            super::research::checkpoint_successor_witness(transaction, &successor_id)?;
+        let dispatch_authority = CheckpointDispatchAuthority {
+            checkpoint: checkpoint.clone(),
+            raw_checkpoint: raw.clone(),
+            project_id: expected.project_id.clone(),
+            campaign_id: expected.campaign_id.clone(),
+            review_id: expected.review_id.clone(),
+            source_experiment_id: expected.source_experiment_id.clone(),
+            proposal_id: checkpoint.successor_ids.proposal_id.clone(),
+            submission_id: checkpoint.successor_ids.submission_id.clone(),
+            successor_experiment_id: successor_id.clone(),
+            successor_status: None,
+            successor_attempt: successor_witness.map(|(attempt, _)| attempt),
+            reservation_window_ends_at: successor_witness.map(|(_, window_end)| window_end),
+            termination_request_id,
+        };
         let graph_ok = checkpoint_successor_graph_matches_authority(
             transaction,
             &dispatch_authority,

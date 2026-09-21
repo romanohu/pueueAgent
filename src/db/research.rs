@@ -255,6 +255,7 @@ pub(crate) struct CheckpointDispatchAuthority {
     pub(super) proposal_id: String,
     pub(super) submission_id: String,
     pub(super) successor_experiment_id: String,
+    pub(super) successor_status: Option<ExperimentStatus>,
     pub(super) successor_attempt: Option<i64>,
     pub(super) reservation_window_ends_at: Option<i64>,
     pub(super) termination_request_id: Option<i64>,
@@ -267,6 +268,11 @@ impl CheckpointDispatchAuthority {
 
     pub(crate) fn successor_experiment_id(&self) -> &str {
         &self.successor_experiment_id
+    }
+
+    pub(crate) fn successor_status(&self) -> ExperimentStatus {
+        self.successor_status
+            .expect("selected checkpoint dispatch authority must include successor status")
     }
 }
 
@@ -4388,7 +4394,7 @@ impl<'db> ResearchRepository<'db> {
                 |row| row.get(0),
             )
             .map_err(database_error("read checkpoint dispatch termination"))?;
-        let authority = CheckpointDispatchAuthority {
+        let mut authority = CheckpointDispatchAuthority {
             checkpoint,
             raw_checkpoint: raw,
             project_id: project_id.to_owned(),
@@ -4398,6 +4404,7 @@ impl<'db> ResearchRepository<'db> {
             proposal_id,
             submission_id,
             successor_experiment_id: successor_experiment_id.to_owned(),
+            successor_status: None,
             successor_attempt: successor_witness.map(|(attempt, _)| attempt),
             reservation_window_ends_at: successor_witness.map(|(_, window_end)| window_end),
             termination_request_id,
@@ -4428,6 +4435,11 @@ impl<'db> ResearchRepository<'db> {
                 .map_err(database_error("commit partial checkpoint dispatch block"))?;
             return Ok(CheckpointDispatchSelection::Blocked);
         }
+        authority.successor_status = Some(
+            super::campaigns::read_intent_by_experiment(&transaction, successor_experiment_id)?
+                .experiment
+                .status,
+        );
         transaction
             .commit()
             .map_err(database_error("commit checkpoint dispatch authority"))?;
@@ -4678,6 +4690,7 @@ fn checkpoint_ownership_lineage_valid(
         proposal_id: checkpoint.successor_ids.proposal_id.clone(),
         submission_id: checkpoint.successor_ids.submission_id.clone(),
         successor_experiment_id: successor_id.to_owned(),
+        successor_status: None,
         successor_attempt: successor_witness.map(|(attempt, _)| attempt),
         reservation_window_ends_at: successor_witness.map(|(_, window_end)| window_end),
         termination_request_id: candidate.termination_request_id,
@@ -6531,6 +6544,7 @@ pub(crate) fn checkpoint_same_spec_count(
             proposal_id: historical_checkpoint.successor_ids.proposal_id.clone(),
             submission_id: historical_checkpoint.successor_ids.submission_id.clone(),
             successor_experiment_id: historical_checkpoint.successor_ids.experiment_id.clone(),
+            successor_status: None,
             successor_attempt: successor_witness.map(|(attempt, _)| attempt),
             reservation_window_ends_at: successor_witness.map(|(_, window_end)| window_end),
             termination_request_id,
@@ -11152,6 +11166,95 @@ mod tests {
             fixture,
             encoded,
             authority,
+        }
+    }
+
+    #[test]
+    fn checkpoint_dispatch_authority_captures_selected_successor_phase() {
+        let cases: Vec<(&str, ExperimentStatus, fn(&CheckpointDispatchFixture))> = vec![
+            ("reserved", ExperimentStatus::Reserved, |_| {}),
+            ("submitting", ExperimentStatus::Submitting, |fixture| {
+                fixture
+                    .fixture
+                    .db
+                    .connect()
+                    .expect("phase submitting connection")
+                    .execute(
+                        "UPDATE experiments SET status = 'submitting'
+                         WHERE experiment_id = ?1",
+                        [&fixture.authority.successor_experiment_id],
+                    )
+                    .expect("phase submitting update");
+            }),
+            ("unreconciled", ExperimentStatus::Unreconciled, |fixture| {
+                let connection = fixture
+                    .fixture
+                    .db
+                    .connect()
+                    .expect("phase unreconciled connection");
+                connection
+                    .execute(
+                        "UPDATE experiments
+                         SET status = 'unreconciled', failure_code = 'identity-mismatch'
+                         WHERE experiment_id = ?1",
+                        [&fixture.authority.successor_experiment_id],
+                    )
+                    .expect("phase unreconciled experiment update");
+                connection
+                    .execute(
+                        "UPDATE submissions SET status = 'unreconciled'
+                         WHERE submission_id = ?1",
+                        [&fixture.authority.submission_id],
+                    )
+                    .expect("phase unreconciled submission update");
+                connection
+                    .execute(
+                        "UPDATE budget_reservations SET status = 'consumed'
+                         WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                        [&fixture.authority.successor_experiment_id],
+                    )
+                    .expect("phase unreconciled reservation update");
+            }),
+            ("succeeded", ExperimentStatus::Succeeded, |fixture| {
+                let connection = fixture
+                    .fixture
+                    .db
+                    .connect()
+                    .expect("phase succeeded connection");
+                mutate_checkpoint_terminal(fixture, &connection, "succeeded");
+            }),
+            ("failed", ExperimentStatus::Failed, |fixture| {
+                let connection = fixture
+                    .fixture
+                    .db
+                    .connect()
+                    .expect("phase failed connection");
+                mutate_checkpoint_terminal(fixture, &connection, "failed");
+            }),
+            ("cancelled", ExperimentStatus::Cancelled, |fixture| {
+                let connection = fixture
+                    .fixture
+                    .db
+                    .connect()
+                    .expect("phase cancelled connection");
+                mutate_checkpoint_terminal(fixture, &connection, "cancelled");
+            }),
+        ];
+        for (label, expected_status, mutate) in cases {
+            let fixture = checkpoint_dispatch_fixture();
+            mutate(&fixture);
+            let selection = ResearchRepository::new(&fixture.fixture.db)
+                .checkpoint_dispatch_authority(
+                    &fixture.fixture.project_id,
+                    &fixture.authority.successor_experiment_id,
+                    3_104,
+                )
+                .expect("phase dispatch authority");
+            let authority = match selection {
+                CheckpointDispatchSelection::Ready(authority) => authority,
+                other => panic!("{label}: unexpected phase selection: {other:?}"),
+            };
+            assert_eq!(authority.successor_status(), expected_status, "{label}");
         }
     }
 
