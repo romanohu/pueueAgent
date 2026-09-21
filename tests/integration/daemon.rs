@@ -2223,7 +2223,7 @@ async fn second_daemon_defers_research_retry_until_first_cleanup_owner_releases(
         .expect("managed later research task identity");
     harness
         .fake_pueue
-        .set_tasks(vec![running_task(), later_task.clone()]);
+        .set_tasks(vec![task.clone(), later_task.clone()]);
     ExperimentRepository::new(&harness.db)
         .mark_submitting(&later_experiment_id, 202)
         .unwrap();
