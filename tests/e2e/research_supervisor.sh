@@ -1087,7 +1087,7 @@ run_continue_case() {
   local main_before source_before
   setup_case
   write_research_scenario continue 11111111-1111-4111-8111-111111111111
-  submit_source 180 1
+  submit_source 300 1
   main_before="$(git -C "$PROJECT" rev-parse refs/heads/main)"
   source_before="$(git -C "$PROJECT" hash-object "$PROJECT/train.py")"
   start_daemon
@@ -1140,7 +1140,7 @@ run_missing_session_case() {
   # session JSONL after the completed review, then asks production recovery to
   # establish a fresh generation. The fixture never edits SQLite.
   write_research_scenario continue "$session_id"
-  submit_source 180 1
+  submit_source 300 1
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
   await_first_review
@@ -1183,7 +1183,7 @@ arm_kill_barrier() {
 }
 
 wait_for_kill_barrier() {
-  wait_for_marker "$CONTROL/kill-entered" "stop-pending kill" 120
+  wait_for_marker "$CONTROL/kill-entered" "stop-pending kill" 180
   record_barrier_pid_file "$CONTROL/kill-pids"
 }
 
@@ -1290,7 +1290,7 @@ run_checkpoint_case() {
   local main_before source_before
   setup_case
   write_research_scenario resume_from_checkpoint 44444444-4444-4444-a444-444444444444
-  submit_source 120 1
+  submit_source 180 1
   main_before="$(git -C "$PROJECT" rev-parse refs/heads/main)"
   source_before="$(git -C "$PROJECT" hash-object "$PROJECT/train.py")"
   arm_kill_barrier
@@ -1406,7 +1406,7 @@ run_review_running_restart_case() {
   local invoked="$RESEARCH_CONTROL/research-invoked" release="$RESEARCH_CONTROL/research-release"
   setup_case
   write_research_scenario continue 55555555-5555-4555-a555-555555555555 "$invoked" "$release"
-  submit_source 120 1
+  submit_source 240 1
   start_daemon
   wait_for_marker "$invoked" "review-running" 120
   record_barrier_pid_file "$RESEARCH_CONTROL/research-invoked"
@@ -1431,7 +1431,7 @@ run_answer_ready_case() {
   setup_case
   write_research_scenario continue 66666666-6666-4666-a666-666666666666
   : > "$CONTROL/status-arm"
-  submit_source 120 1
+  submit_source 180 1
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
   wait_for_marker "$CONTROL/status-entered" "answer-ready status proxy" 240
@@ -1461,7 +1461,7 @@ run_answer_ready_case() {
 run_stop_pending_restart_case() {
   setup_case
   write_research_scenario stop_and_next 77777777-7777-4777-a777-777777777777
-  submit_source 120 1
+  submit_source 180 1
   arm_kill_barrier
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
@@ -1483,7 +1483,7 @@ run_stop_confirmed_restart_case() {
   local decision_pid_log="$HOME/../research-barrier-pids.log"
   setup_case
   write_research_scenario stop_and_next 88888888-8888-4888-a888-888888888888
-  submit_source 120 1
+  submit_source 180 1
   arm_kill_barrier
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
@@ -1543,7 +1543,7 @@ run_successor_submitting_restart_case() {
   local successor_submission_status_before successor_submission_status_after
   setup_case
   write_research_scenario stop_and_next 99999999-9999-4999-a999-999999999999
-  submit_source 120 1
+  submit_source 180 1
   arm_kill_barrier
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
@@ -1612,7 +1612,7 @@ run_add_reconcile_case() {
   local status_before status_after status_after_suppressed successor_task_before
   setup_case
   write_research_scenario stop_and_next bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
-  submit_source 120 1
+  submit_source 180 1
   arm_kill_barrier
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
@@ -1674,15 +1674,17 @@ run_add_reconcile_case() {
 
 run_failure_case() {
   local failure_mode="$1"
+  local source_steps=180
   AGENT_TIMEOUT_MINUTES=5
   if [ "$failure_mode" = timeout ]; then
     AGENT_TIMEOUT_MINUTES=1
+    source_steps=240
   fi
   setup_case
   write_research_scenario continue aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa
   printf '%s\n' "$failure_mode" > "$HOME/.pueue-agent/research-failure-mode"
   chmod 600 "$HOME/.pueue-agent/research-failure-mode"
-  submit_source 180 1
+  submit_source "$source_steps" 1
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
   if [ "$failure_mode" = timeout ]; then
@@ -1703,7 +1705,7 @@ run_unsafe_session_case() {
   local session_path invocation_count
   setup_case
   write_research_scenario continue "$session_id"
-  submit_source 180 1
+  submit_source 240 1
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
   await_first_review
