@@ -3563,6 +3563,17 @@ async fn research_replacement_daemon_retires_ready_response_after_terminal_failu
         .find_by_id(claimed.event_id)
         .unwrap()
         .expect("the retired research event must remain durable");
+    let preserved_answer =
+        pueue_agent::research_protocol::parse_research_answer(before_response.as_bytes())
+            .expect("the preserved response must remain schema-valid");
+    let mut expected_notes = before_notes.clone();
+    expected_notes
+        .as_object_mut()
+        .expect("the recovery notes must remain an object")
+        .insert(
+            "saved_advice".to_owned(),
+            serde_json::json!(preserved_answer.notes),
+        );
     assert_eq!(after.state, "completed");
     assert_eq!(after.response_json.as_deref(), Some(before_response.as_str()));
     assert_eq!(after.attempt, before.attempt);
@@ -3580,7 +3591,7 @@ async fn research_replacement_daemon_retires_ready_response_after_terminal_failu
     assert_eq!(harness.reservation_status(&reservation_id), "consumed");
     assert_eq!(
         ResearchHarness::notes_without_cleanup(&after_notes),
-        ResearchHarness::notes_without_cleanup(&before_notes)
+        ResearchHarness::notes_without_cleanup(&expected_notes)
     );
     assert_eq!(
         after_notes["native_recovery"]["cleanup"]["phase"],
@@ -4836,7 +4847,7 @@ async fn research_policy_evidence_prunes_whole_candidates_at_the_final_native_ca
         .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
         .collect::<Vec<_>>();
     let source = "\"\"\"\"\"\"\n".repeat(4096).into_bytes();
-    harness.rewrite_target_command(&[source_relative_path], ".");
+    harness.rewrite_target_command(&["python", source_relative_path], ".");
     harness.write_checkpoint_fixture(source_relative_path, &source, &candidate_refs);
 
     let (started, review) = harness.run_policy_evidence_attempt().await;
@@ -4844,6 +4855,7 @@ async fn research_policy_evidence_prunes_whole_candidates_at_the_final_native_ca
     let context = ResearchHarness::context_value(&review);
     let support = &context["operations"]["checkpoint_support"];
     assert_eq!(support["status"], "available");
+    assert_eq!(support["candidate_limit"], 4);
     assert_eq!(support["loader_support"].as_array().unwrap().len(), 1);
     assert_eq!(support["loader_support"][0]["content"].as_str().unwrap().len(), source.len());
     let candidates = support["checkpoint_candidates"].as_array().unwrap();
@@ -4851,6 +4863,16 @@ async fn research_policy_evidence_prunes_whole_candidates_at_the_final_native_ca
     assert!(candidates.len() < 4);
     assert_eq!(support["candidates_complete"], false);
     assert!(support["candidates_omitted_at_least"].as_u64().unwrap() >= 1);
+    let context_json = review
+        .context_json
+        .as_deref()
+        .expect("the cap fixture must persist bounded context");
+    assert!(
+        context_json.len() <= pueue_agent::research_evidence::MAX_RESEARCH_NATIVE_EVIDENCE_BYTES,
+        "serialized context must stay within the native evidence cap"
+    );
+    let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+    assert_eq!(review.context_digest.as_deref(), Some(context_digest.as_str()));
     let mut references = std::collections::BTreeSet::new();
     for (ordinal, candidate) in candidates.iter().enumerate() {
         assert!(references.insert(candidate["reference"].as_str().unwrap()));
