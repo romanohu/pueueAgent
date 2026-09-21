@@ -714,6 +714,7 @@ build_fixture_tools() {
   cat > "$BIN/codex-wrapper.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+fake_codex="${BASH_SOURCE[0]%/*}/fake-codex"
 output=""
 research=0
 decision=0
@@ -751,7 +752,7 @@ if [ "$research" -eq 1 ] && [ -f "$HOME/.pueue-agent/research-failure-mode" ]; t
       exit 75
       ;;
     *)
-      "$HOME/../bin/fake-codex" "$@"
+      "$fake_codex" "$@"
       status=$?
       if [ "$status" -eq 0 ]; then
         case "$failure_mode" in
@@ -763,7 +764,7 @@ if [ "$research" -eq 1 ] && [ -f "$HOME/.pueue-agent/research-failure-mode" ]; t
       ;;
   esac
 fi
-exec "$HOME/../bin/fake-codex" "$@"
+exec "$fake_codex" "$@"
 EOF
   chmod 700 "$BIN/codex-wrapper.sh"
   # The runner is the verified native executable; it then enters the shell
