@@ -31,8 +31,8 @@ use crate::{
     },
     research_checkpoint::{
         checkpoint_source_layout, checkpoint_support_from_persisted_context,
-        parse_prepared_checkpoint, select_checkpoint_support, CheckpointSupportEvidenceV1,
-        PreparedCheckpoint,
+        checkpoint_learning_spec_digest, parse_prepared_checkpoint, select_checkpoint_support,
+        CheckpointSupportEvidenceV1, PreparedCheckpoint,
     },
     research_protocol::{parse_research_answer, CheckpointRequest, ResearchAnswer},
     AppError,
@@ -50,6 +50,20 @@ const RESEARCH_RETRY_FAILURE_POLICY: &str = "research_policy_blocked";
 const MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES: usize =
     crate::research_checkpoint::MAX_PREPARED_CHECKPOINT_BYTES;
 const _: () = assert!(MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES == 131_072);
+
+/// Rows that claim a checkpoint successor either carry a non-null checkpoint
+/// marker or retain the checkpoint-only successor stage.  A completed row
+/// with the same successor shape and no decision-cycle link is also retained
+/// as checkpoint history, even if its marker was lost.
+pub(super) const CHECKPOINT_INCOMING_CLAIM_PREDICATE: &str =
+    "(review.checkpoint_json IS NOT NULL
+      OR (review.successor_experiment_id IS NOT NULL
+          AND (review.operation_stage = 'successor_reserved'
+               OR (review.decision_cycle_id IS NULL
+                   AND review.state = 'completed'
+                   AND review.operation_stage IS NULL))))";
+pub(super) const CHECKPOINT_PRE_ADD_FAILURE_CODE: &str =
+    "research_checkpoint_verification_failed";
 
 #[derive(Debug)]
 struct RunningResearchCandidate {
@@ -212,6 +226,91 @@ pub(crate) struct CheckpointSourceAuthority {
 pub(crate) enum CheckpointSourceAuthorityRead {
     Supported(CheckpointSourceAuthority),
     Unsupported { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckpointSuccessorPreflight {
+    Available,
+    Deferred,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckpointSuccessorAdmission {
+    Ready(super::campaigns::ManagedSubmissionIntent),
+    Deferred,
+    Blocked,
+}
+
+/// A dispatch witness contains the exact values rechecked by the later
+/// reserved-to-submitting CAS.  The fields remain private so callers cannot
+/// manufacture authority from an experiment id or pathname.
+#[derive(Debug)]
+pub(crate) struct CheckpointDispatchAuthority {
+    pub(super) checkpoint: PreparedCheckpoint,
+    pub(super) raw_checkpoint: String,
+    pub(super) project_id: String,
+    pub(super) campaign_id: String,
+    pub(super) review_id: String,
+    pub(super) source_experiment_id: String,
+    pub(super) proposal_id: String,
+    pub(super) submission_id: String,
+    pub(super) successor_experiment_id: String,
+    pub(super) successor_attempt: Option<i64>,
+    pub(super) reservation_window_ends_at: Option<i64>,
+    pub(super) termination_request_id: Option<i64>,
+}
+
+impl CheckpointDispatchAuthority {
+    pub(crate) fn checkpoint(&self) -> &PreparedCheckpoint {
+        &self.checkpoint
+    }
+
+    pub(crate) fn successor_experiment_id(&self) -> &str {
+        &self.successor_experiment_id
+    }
+}
+
+pub(super) fn checkpoint_successor_witness(
+    transaction: &Transaction<'_>,
+    successor_experiment_id: &str,
+) -> Result<Option<(i64, i64)>, AppError> {
+    if checkpoint_successor_reservation_count(transaction, successor_experiment_id)? != 1 {
+        return Ok(None);
+    }
+    transaction
+        .query_row(
+            "SELECT experiment.attempt, reservation.window_ends_at
+             FROM experiments AS experiment
+             JOIN budget_reservations AS reservation
+               ON reservation.experiment_id = experiment.experiment_id
+              AND reservation.dimension = 'experiment'
+             WHERE experiment.experiment_id = ?1",
+            [successor_experiment_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(database_error("read checkpoint successor witness"))
+}
+
+pub(super) fn checkpoint_successor_reservation_count(
+    transaction: &Transaction<'_>,
+    successor_experiment_id: &str,
+) -> Result<i64, AppError> {
+    transaction
+        .query_row(
+            "SELECT COUNT(*) FROM budget_reservations
+             WHERE experiment_id = ?1 AND dimension = 'experiment'",
+            [successor_experiment_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("count checkpoint successor reservations"))
+}
+
+#[derive(Debug)]
+pub(crate) enum CheckpointDispatchSelection {
+    NotCheckpoint,
+    Ready(CheckpointDispatchAuthority),
+    Blocked,
 }
 
 enum SourceAuthorityExpectation<'a> {
@@ -4060,6 +4159,281 @@ impl<'db> ResearchRepository<'db> {
             .map_err(database_error("read open research actions"))
     }
 
+    pub(crate) fn checkpoint_dispatch_authority(
+        &self,
+        project_id: &str,
+        successor_experiment_id: &str,
+        now: i64,
+    ) -> Result<CheckpointDispatchSelection, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin checkpoint dispatch authority"))?;
+        let mut claims = transaction
+            .prepare(&format!(
+                "SELECT review.review_id, campaign.project_id, review.campaign_id,
+                        review.experiment_id, review.task_signature, review.attempt,
+                        review.successor_experiment_id, review.operation_stage,
+                        CASE
+                          WHEN typeof(review.checkpoint_json) = 'text'
+                           AND length(CAST(review.checkpoint_json AS BLOB)) BETWEEN 1 AND 131072
+                          THEN review.checkpoint_json
+                        END,
+                        typeof(review.checkpoint_json),
+                        length(CAST(review.checkpoint_json AS BLOB))
+                 FROM research_reviews AS review
+                 LEFT JOIN campaigns AS campaign ON campaign.campaign_id = review.campaign_id
+                 WHERE review.successor_experiment_id = ?1
+                   AND {CHECKPOINT_INCOMING_CLAIM_PREDICATE}
+                 ORDER BY review.review_id LIMIT 2"
+            ))
+            .map_err(database_error("prepare checkpoint dispatch claims"))?;
+        let rows = claims
+            .query_map([successor_experiment_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                ))
+            })
+            .map_err(database_error("query checkpoint dispatch claims"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read checkpoint dispatch claims"))?;
+        drop(claims);
+        if rows.is_empty() {
+            transaction
+                .commit()
+                .map_err(database_error("commit ordinary dispatch classification"))?;
+            return Ok(CheckpointDispatchSelection::NotCheckpoint);
+        }
+        if rows.len() != 1 {
+            return Err(validation_error(
+                "research.checkpoint",
+                "successor has ambiguous incoming checkpoint claims",
+            ));
+        }
+        let (
+            review_id,
+            claim_project_id,
+            campaign_id,
+            source_experiment_id,
+            task_signature,
+            attempt,
+            linked_successor_id,
+            operation_stage,
+            raw,
+            storage,
+            byte_len,
+        ) = rows.into_iter().next().expect("one checkpoint claim");
+        let Some(claim_project_id) = claim_project_id else {
+            return Err(validation_error(
+                "research.checkpoint",
+                "checkpoint claim has no provable campaign project",
+            ));
+        };
+        if claim_project_id != project_id || linked_successor_id.as_deref() != Some(successor_experiment_id) {
+            return Err(validation_error(
+                "research.checkpoint",
+                "checkpoint claim cannot be attributed to the requested project",
+            ));
+        }
+        let Some(raw) = raw else {
+            if storage == "null"
+                && byte_len.is_none()
+                && operation_stage.as_deref() == Some("successor_reserved")
+            {
+                if claim_project_id != project_id {
+                    return Err(validation_error(
+                        "research.checkpoint",
+                        "checkpoint claim cannot be attributed to the requested project",
+                    ));
+                }
+                let changed = block_missing_checkpoint_dispatch_review(
+                    &transaction,
+                    &review_id,
+                    &campaign_id,
+                    &source_experiment_id,
+                    &task_signature,
+                    attempt,
+                    linked_successor_id.as_deref().unwrap_or_default(),
+                    now,
+                )?;
+                if !changed {
+                    return Err(validation_error(
+                        "research.checkpoint",
+                        "missing checkpoint review changed before blocking",
+                    ));
+                }
+                transaction
+                    .commit()
+                    .map_err(database_error("commit missing checkpoint dispatch block"))?;
+                return Ok(CheckpointDispatchSelection::Blocked);
+            }
+            let changed = block_checkpoint_dispatch_review(
+                &transaction,
+                &review_id,
+                &campaign_id,
+                &source_experiment_id,
+                &task_signature,
+                attempt,
+                now,
+            )?;
+            if !changed {
+                return Err(validation_error(
+                    "research.checkpoint",
+                    "invalid checkpoint review changed before blocking",
+                ));
+            }
+            transaction
+                .commit()
+                .map_err(database_error("commit invalid checkpoint dispatch block"))?;
+            return Ok(CheckpointDispatchSelection::Blocked);
+        };
+        if storage != "text"
+            || !byte_len.is_some_and(|len| (1..=MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES as i64).contains(&len))
+        {
+            return Err(validation_error(
+                "research.checkpoint",
+                "checkpoint claim has invalid bounded storage",
+            ));
+        }
+        let checkpoint = match parse_prepared_checkpoint(&raw) {
+            Ok(checkpoint) => checkpoint,
+            Err(_) => {
+                let changed = block_checkpoint_dispatch_review(
+                    &transaction,
+                    &review_id,
+                    &campaign_id,
+                    &source_experiment_id,
+                    &task_signature,
+                    attempt,
+                    now,
+                )?;
+                if !changed {
+                    return Err(validation_error(
+                        "research.checkpoint",
+                        "invalid checkpoint review changed before blocking",
+                    ));
+                }
+                transaction
+                    .commit()
+                    .map_err(database_error("commit invalid checkpoint dispatch block"))?;
+                return Ok(CheckpointDispatchSelection::Blocked);
+            }
+        };
+        if checkpoint.project_id != project_id
+            || checkpoint.campaign_id != campaign_id
+            || checkpoint.source_experiment_id != source_experiment_id
+            || checkpoint.successor_ids.experiment_id != successor_experiment_id
+        {
+            let changed = block_checkpoint_dispatch_review(
+                &transaction,
+                &review_id,
+                &campaign_id,
+                &source_experiment_id,
+                &task_signature,
+                attempt,
+                now,
+            )?;
+            if !changed {
+                return Err(validation_error(
+                    "research.checkpoint",
+                    "inconsistent checkpoint review changed before blocking",
+                ));
+            }
+            transaction
+                .commit()
+                .map_err(database_error("commit inconsistent checkpoint dispatch block"))?;
+            return Ok(CheckpointDispatchSelection::Blocked);
+        }
+        if prepared_checkpoint_source_authority_in_connection(&transaction, &checkpoint).is_err() {
+            let changed = block_checkpoint_dispatch_review(
+                &transaction,
+                &review_id,
+                &campaign_id,
+                &source_experiment_id,
+                &task_signature,
+                attempt,
+                now,
+            )?;
+            if !changed {
+                return Err(validation_error(
+                    "research.checkpoint",
+                    "checkpoint authority changed before blocking",
+                ));
+            }
+            transaction
+                .commit()
+                .map_err(database_error("commit unsupported checkpoint dispatch block"))?;
+            return Ok(CheckpointDispatchSelection::Blocked);
+        }
+        let proposal_id = checkpoint.successor_ids.proposal_id.clone();
+        let submission_id = checkpoint.successor_ids.submission_id.clone();
+        let successor_witness = super::research::checkpoint_successor_witness(
+            &transaction,
+            successor_experiment_id,
+        )?;
+        let termination_request_id: Option<i64> = transaction
+            .query_row(
+                "SELECT termination_request_id FROM research_reviews WHERE review_id = ?1",
+                [&review_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("read checkpoint dispatch termination"))?;
+        let authority = CheckpointDispatchAuthority {
+            checkpoint,
+            raw_checkpoint: raw,
+            project_id: project_id.to_owned(),
+            campaign_id,
+            review_id,
+            source_experiment_id,
+            proposal_id,
+            submission_id,
+            successor_experiment_id: successor_experiment_id.to_owned(),
+            successor_attempt: successor_witness.map(|(attempt, _)| attempt),
+            reservation_window_ends_at: successor_witness.map(|(_, window_end)| window_end),
+            termination_request_id,
+        };
+        if !super::campaigns::checkpoint_successor_graph_matches_authority(
+            &transaction,
+            &authority,
+            None,
+            None,
+        )? {
+            let changed = block_checkpoint_dispatch_review(
+                &transaction,
+                &authority.review_id,
+                &authority.campaign_id,
+                &authority.source_experiment_id,
+                &task_signature,
+                attempt,
+                now,
+            )?;
+            if !changed {
+                return Err(validation_error(
+                    "research.checkpoint",
+                    "checkpoint graph changed before blocking",
+                ));
+            }
+            transaction
+                .commit()
+                .map_err(database_error("commit partial checkpoint dispatch block"))?;
+            return Ok(CheckpointDispatchSelection::Blocked);
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit checkpoint dispatch authority"))?;
+        Ok(CheckpointDispatchSelection::Ready(authority))
+    }
+
     pub(crate) fn rotate_open_action_review(
         &self,
         review_id: &str,
@@ -4178,6 +4552,209 @@ fn research_ownership_candidate_from_row(
 /// transaction.  Candidate filtering intentionally precedes cardinality and
 /// lineage validation: a malformed owner must block discovery instead of
 /// disappearing from the owner set.
+fn checkpoint_ownership_lineage_valid(
+    transaction: &Transaction<'_>,
+    candidate: &ResearchOwnershipCandidate,
+    project_id: &str,
+    campaign_id: &str,
+    source_experiment_id: &str,
+) -> Result<bool, AppError> {
+    let Some(successor_id) = candidate.successor_experiment_id.as_deref() else {
+        return Ok(candidate.operation_stage.as_deref() != Some("successor_reserved"));
+    };
+    let row = transaction
+        .query_row(
+            "SELECT review.state, review.operation_stage,
+                    CASE
+                      WHEN typeof(review.checkpoint_json) = 'text'
+                       AND length(CAST(review.checkpoint_json AS BLOB)) BETWEEN 1 AND 131072
+                      THEN review.checkpoint_json
+                    END,
+                    typeof(review.checkpoint_json),
+                    length(CAST(review.checkpoint_json AS BLOB)),
+                    experiment.proposal_id, experiment.submission_id,
+                    experiment.parent_experiment_id, experiment.resume_of_experiment_id,
+                    experiment.status, experiment.pueue_task_id,
+                    experiment.task_signature, experiment.failure_code,
+                    experiment.failure_fingerprint, submission.status,
+                    submission.project_id, submission.pueue_task_id,
+                    submission.task_signature, reservation.status,
+                    (SELECT COUNT(*) FROM budget_reservations AS r2
+                     WHERE r2.experiment_id = experiment.experiment_id
+                       AND r2.dimension = 'experiment')
+             FROM research_reviews AS review
+             LEFT JOIN experiments AS experiment
+               ON experiment.experiment_id = review.successor_experiment_id
+             LEFT JOIN submissions AS submission
+               ON submission.submission_id = experiment.submission_id
+             LEFT JOIN budget_reservations AS reservation
+               ON reservation.experiment_id = experiment.experiment_id
+              AND reservation.dimension = 'experiment'
+             WHERE review.review_id = ?1 AND review.experiment_id = ?2
+               AND review.successor_experiment_id = ?3",
+            params![candidate.review_id, source_experiment_id, successor_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<i64>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, i64>(19)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read checkpoint ownership graph"))?;
+    let Some((
+        review_state,
+        operation_stage,
+        raw,
+        storage,
+        byte_len,
+        proposal_id,
+        submission_id,
+        parent_id,
+        resume_id,
+        experiment_status,
+        experiment_task_id,
+        experiment_signature,
+        failure_code,
+        failure_fingerprint,
+        submission_status,
+        submission_project,
+        submission_task_id,
+        submission_signature,
+        reservation_status,
+        reservation_count,
+    )) = row
+    else {
+        return Ok(false);
+    };
+    if storage == "null" && byte_len.is_none() && raw.is_none() {
+        return Ok(operation_stage.as_deref() != Some("successor_reserved"));
+    }
+    if storage != "text"
+        || !byte_len.is_some_and(|len| (1..=MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES as i64).contains(&len))
+    {
+        return Ok(false);
+    }
+    let Some(raw) = raw else {
+        return Ok(false);
+    };
+    let checkpoint = match parse_prepared_checkpoint(&raw) {
+        Ok(checkpoint) => checkpoint,
+        Err(_) => return Ok(false),
+    };
+    if checkpoint.project_id != project_id
+        || checkpoint.campaign_id != campaign_id
+        || checkpoint.source_experiment_id != source_experiment_id
+        || checkpoint.successor_ids.experiment_id != successor_id
+    {
+        return Ok(false);
+    }
+    let successor_witness = checkpoint_successor_witness(transaction, successor_id)?;
+    let authority = CheckpointDispatchAuthority {
+        checkpoint: checkpoint.clone(),
+        raw_checkpoint: raw.clone(),
+        project_id: project_id.to_owned(),
+        campaign_id: campaign_id.to_owned(),
+        review_id: candidate.review_id.clone(),
+        source_experiment_id: source_experiment_id.to_owned(),
+        proposal_id: checkpoint.successor_ids.proposal_id.clone(),
+        submission_id: checkpoint.successor_ids.submission_id.clone(),
+        successor_experiment_id: successor_id.to_owned(),
+        successor_attempt: successor_witness.map(|(attempt, _)| attempt),
+        reservation_window_ends_at: successor_witness.map(|(_, window_end)| window_end),
+        termination_request_id: candidate.termination_request_id,
+    };
+    if !super::campaigns::checkpoint_successor_graph_matches_authority(
+        transaction,
+        &authority,
+        None,
+        None,
+    )? {
+        return Ok(false);
+    }
+    let exact_lineage = parent_id.as_deref() == Some(source_experiment_id)
+        && resume_id.as_deref() == Some(source_experiment_id)
+        && proposal_id.as_deref() == Some(checkpoint.successor_ids.proposal_id.as_str())
+        && submission_id.as_deref() == Some(checkpoint.successor_ids.submission_id.as_str())
+        && submission_project.as_deref() == Some(project_id)
+        && reservation_count == 1;
+    if !exact_lineage {
+        return Ok(false);
+    }
+    let active = operation_stage.as_deref() == Some("successor_reserved")
+        && review_state == "ready"
+        && matches!(
+            experiment_status.as_deref(),
+            Some("reserved" | "submitting" | "accepted" | "unreconciled")
+        )
+        && matches!(
+            submission_status.as_deref(),
+            Some("pending" | "accepted" | "unreconciled")
+        )
+        && matches!(reservation_status.as_deref(), Some("reserved" | "consumed"));
+    let settled_task_failure = experiment_status.as_deref() == Some("failed")
+        && submission_status.as_deref() == Some("accepted")
+        && experiment_task_id.is_some()
+        && experiment_signature.is_some()
+        && submission_task_id == experiment_task_id
+        && submission_signature == experiment_signature
+        && failure_code.is_some()
+        && failure_code.as_deref() != Some(CHECKPOINT_PRE_ADD_FAILURE_CODE)
+        && failure_fingerprint.is_some();
+    let settled = review_state == "completed"
+        && operation_stage.is_none()
+        && matches!(experiment_status.as_deref(), Some("succeeded" | "failed" | "cancelled"))
+        && submission_status.as_deref() == Some("accepted")
+        && experiment_task_id.is_some()
+        && experiment_signature.is_some()
+        && submission_task_id == experiment_task_id
+        && submission_signature == experiment_signature
+        && reservation_status.as_deref() == Some("consumed")
+        && (matches!(experiment_status.as_deref(), Some("succeeded" | "cancelled"))
+            && failure_code.is_none()
+            && failure_fingerprint.is_none()
+            || settled_task_failure);
+    let expected_pre_add_fingerprint = {
+        let mut digest = Sha256::new();
+        digest.update(CHECKPOINT_PRE_ADD_FAILURE_CODE.as_bytes());
+        digest.update([0]);
+        digest.update(raw.as_bytes());
+        format!("research-checkpoint-pre-add:{:x}", digest.finalize())
+    };
+    let pre_add_failed = matches!(
+        (review_state.as_str(), operation_stage.as_deref()),
+        ("blocked", Some("successor_reserved")) | ("completed", None)
+    )
+        && experiment_status.as_deref() == Some("failed")
+        && failure_code.as_deref() == Some(CHECKPOINT_PRE_ADD_FAILURE_CODE)
+        && failure_fingerprint.as_deref() == Some(expected_pre_add_fingerprint.as_str())
+        && experiment_task_id.is_none()
+        && experiment_signature.is_none()
+        && submission_status.as_deref() == Some("failed")
+        && submission_task_id.is_none()
+        && submission_signature.is_none()
+        && reservation_status.as_deref() == Some("consumed");
+    Ok(active || settled || pre_add_failed)
+}
+
 pub(crate) fn research_ownership_in_transaction(
     transaction: &Transaction<'_>,
     project_id: &str,
@@ -4231,6 +4808,10 @@ pub(crate) fn research_ownership_in_transaction(
                        AND (review.decision_cycle_id IS NOT NULL
                             OR review.successor_experiment_id IS NOT NULL)
                    )
+                   OR (
+                       review.checkpoint_json IS NOT NULL
+                       AND review.successor_experiment_id IS NOT NULL
+                   )
                )
              ORDER BY review.review_id
              LIMIT 2",
@@ -4248,6 +4829,13 @@ pub(crate) fn research_ownership_in_transaction(
         return Ok(ResearchOwnership::Open(None));
     }
     let candidate = candidates.into_iter().next().expect("one candidate");
+    let checkpoint_lineage_valid = checkpoint_ownership_lineage_valid(
+        transaction,
+        &candidate,
+        project_id,
+        campaign_id,
+        source_experiment_id,
+    )?;
     let snapshot = ResearchOwnershipSnapshot {
         review_id: candidate.review_id.clone(),
         project_id: project_id.to_owned(),
@@ -4284,6 +4872,7 @@ pub(crate) fn research_ownership_in_transaction(
         || candidate.event_status.as_deref() != Some("completed")
         || (!completed_handoff
             && candidate.campaign_generation != Some(candidate.session_generation));
+    recovery_required |= !checkpoint_lineage_valid;
 
     if let Some(run_id) = candidate.agent_run_id {
         let run_ready = if completed_handoff {
@@ -4420,7 +5009,15 @@ pub(crate) fn research_ownership_in_transaction(
             && candidate.decision_cycle_id.is_none()
             && candidate.successor_parent_experiment_id.as_deref() == Some(source_experiment_id)
             && candidate.successor_source_experiment_id.as_deref() == Some(source_experiment_id);
-        let successor_lineage_matches = ordinary_successor || checkpoint_successor;
+        let checkpoint_settled_successor = successor_identity_matches
+            && candidate.state == "completed"
+            && candidate.operation_stage.is_none()
+            && candidate.decision_cycle_id.is_none()
+            && candidate.successor_parent_experiment_id.as_deref() == Some(source_experiment_id)
+            && candidate.successor_source_experiment_id.as_deref() == Some(source_experiment_id)
+            && checkpoint_lineage_valid;
+        let successor_lineage_matches =
+            ordinary_successor || checkpoint_successor || checkpoint_settled_successor;
         recovery_required |= successor_id.is_empty() || !successor_lineage_matches;
     }
 
@@ -5017,7 +5614,7 @@ pub(super) fn checkpoint_source_authority_for_ready_in_connection(
     )
 }
 
-pub(super) fn prepared_checkpoint_source_authority_in_connection(
+pub(crate) fn prepared_checkpoint_source_authority_in_connection(
     connection: &Connection,
     checkpoint: &PreparedCheckpoint,
 ) -> Result<CheckpointSourceAuthority, AppError> {
@@ -5282,11 +5879,14 @@ fn checkpoint_source_authority_in_connection(
         .map_err(database_error("read source checkpoint lineage"))?;
     let incoming_checkpoint_successor: bool = connection
         .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM research_reviews
-                 WHERE successor_experiment_id = ?1
-                   AND checkpoint_json IS NOT NULL
-             )",
+            &format!(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM research_reviews AS review
+                     WHERE review.successor_experiment_id = ?1
+                       AND {CHECKPOINT_INCOMING_CLAIM_PREDICATE}
+                 )"
+            ),
             [&source.experiment.experiment_id],
             |row| row.get(0),
         )
@@ -5658,6 +6258,682 @@ fn checkpoint_source_authority_in_connection(
             support,
         },
     ))
+}
+
+fn checkpoint_matches_fresh_authority(
+    checkpoint: &PreparedCheckpoint,
+    expected: &ReadyResearchAction,
+    authority: &CheckpointSourceAuthority,
+    request: &CheckpointRequest,
+) -> Result<(), AppError> {
+    let source_task_id = expected.owner.source_task_id.ok_or_else(|| {
+        validation_error("checkpoint.source_task_id", "is missing from the ready owner")
+    })?;
+    let agent_run_id = expected.owner.agent_run_id.ok_or_else(|| {
+        validation_error("checkpoint.agent_run_id", "is missing from the ready owner")
+    })?;
+    let event_id = expected.owner.event_id.ok_or_else(|| {
+        validation_error("checkpoint.event_id", "is missing from the ready owner")
+    })?;
+    if checkpoint.project_id != expected.owner.project_id
+        || checkpoint.campaign_id != expected.owner.campaign_id
+        || checkpoint.review_id != expected.owner.review_id
+        || checkpoint.review_attempt != expected.owner.attempt
+        || checkpoint.review_session_generation != expected.owner.session_generation
+        || checkpoint.review_agent_run_id != agent_run_id
+        || checkpoint.review_event_id != event_id
+        || checkpoint.source_experiment_id != expected.owner.source_experiment_id
+        || checkpoint.source_proposal_id != authority.source.proposal.proposal_id
+        || checkpoint.source_submission_id != authority.source.submission.submission_id
+        || checkpoint.source_task_id != source_task_id
+        || checkpoint.source_managed_task_signature != expected.owner.managed_task_signature
+        || checkpoint.source_raw_task_signature != authority.observation.task_signature
+        || checkpoint.context_digest != expected.context_digest
+        || checkpoint.response_digest
+            != format!("{:x}", Sha256::digest(expected.response_json.as_bytes()))
+        || checkpoint.campaign_objective_digest != expected.campaign_objective_digest
+        || checkpoint.source_proposal_canonical_digest
+            != authority.source.proposal.canonical_digest
+        || checkpoint.source_argv != authority.source.proposal.argv
+        || checkpoint.source_working_directory != authority.source.proposal.working_directory
+        || checkpoint.request != *request
+        || checkpoint.source_root_canonical_path
+            != authority.project.root_path.to_string_lossy().as_ref()
+        || checkpoint.learning_spec_digest
+            != checkpoint_learning_spec_digest(
+                &authority.source.proposal.argv,
+                &authority.source.proposal.working_directory,
+            )?
+        || checkpoint.successor_ids
+            != crate::research_checkpoint::checkpoint_successor_ids(
+                &checkpoint.review_id,
+                checkpoint.review_attempt,
+            )?
+    {
+        return Err(validation_error(
+            "checkpoint.source",
+            "does not match the current ready source authority",
+        ));
+    }
+    let CheckpointSupportEvidenceV1::Available {
+        support_version,
+        normalized_working_directory,
+        working_directory_record,
+        loader_support,
+        checkpoint_candidates,
+        ..
+    } = &authority.support
+    else {
+        return Err(validation_error(
+            "checkpoint_support",
+            "is unavailable for the current source",
+        ));
+    };
+    let selected = select_checkpoint_support(&authority.support, request)?;
+    if checkpoint.support_version != *support_version
+        || checkpoint.support_version
+            != crate::research_checkpoint::CHECKPOINT_SUPPORT_VERSION
+        || loader_support.len() != 1
+        || checkpoint_candidates.is_empty()
+        || checkpoint.source_working_directory_record != *working_directory_record
+        || checkpoint.source_working_directory != *normalized_working_directory
+        || checkpoint.loader != *selected.loader
+        || checkpoint.source_checkpoint != *selected.candidate
+        || checkpoint.source_checkpoint.argv_path != request.path
+        || checkpoint.retained_checkpoint.logical_bytes != checkpoint.source_checkpoint.length
+        || checkpoint.retained_checkpoint.sha256 != checkpoint.source_checkpoint.sha256
+    {
+        return Err(validation_error(
+            "checkpoint_support",
+            "does not match the persisted source support packet",
+        ));
+    }
+    if checkpoint.retained_checkpoint.relative_path
+        != format!(
+            "research-checkpoints/{}/{}/checkpoint",
+            checkpoint.campaign_id, checkpoint.review_id
+        )
+    {
+        return Err(validation_error(
+            "checkpoint.retained_checkpoint",
+            "has an unexpected durable path",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn checkpoint_retry_admission_available_for_campaign(
+    transaction: &Transaction<'_>,
+    checkpoint: &PreparedCheckpoint,
+    limits: &crate::execution_policy::CampaignLimits,
+    now: i64,
+) -> Result<bool, AppError> {
+    Ok(checkpoint_retry_admission_count(transaction, checkpoint, limits, now)?.is_some())
+}
+
+pub(crate) fn checkpoint_retry_admission_count(
+    transaction: &Transaction<'_>,
+    checkpoint: &PreparedCheckpoint,
+    limits: &crate::execution_policy::CampaignLimits,
+    now: i64,
+) -> Result<Option<i64>, AppError> {
+    if !super::campaigns::replacement_admission_available_in_transaction(
+        transaction,
+        &checkpoint.campaign_id,
+        &checkpoint.source_experiment_id,
+        limits,
+        now,
+    )? {
+        return Ok(None);
+    }
+    let live_repairs = super::campaigns::count_live_repair_descendants(
+        transaction,
+        &checkpoint.source_experiment_id,
+    )
+    .map_err(database_error("count checkpoint repair descendants"))?;
+    if live_repairs >= i64::from(limits.max_live_repairs) {
+        return Ok(None);
+    }
+
+    let same_spec_count = checkpoint_same_spec_count(transaction, checkpoint)?;
+    Ok((same_spec_count <= i64::from(limits.max_same_spec_retries))
+        .then_some(same_spec_count))
+}
+
+pub(crate) fn checkpoint_same_spec_count(
+    transaction: &Transaction<'_>,
+    checkpoint: &PreparedCheckpoint,
+) -> Result<i64, AppError> {
+    let source_argv_json = serde_json::to_string(&checkpoint.source_argv).map_err(|source| {
+        AppError::Serialization {
+            operation: "serialize checkpoint learning argv",
+            source,
+        }
+    })?;
+    let mut same_spec_ids = BTreeSet::new();
+    let mut ordinary = transaction
+        .prepare(
+            "SELECT experiment.experiment_id
+             FROM experiments AS experiment
+             JOIN proposals AS proposal ON proposal.proposal_id = experiment.proposal_id
+             WHERE experiment.campaign_id = ?1
+               AND proposal.argv_json = ?2
+               AND proposal.working_directory = ?3
+             ORDER BY experiment.experiment_id",
+        )
+        .map_err(database_error("prepare checkpoint learning-spec query"))?;
+    for row in ordinary
+        .query_map(
+            params![
+                checkpoint.campaign_id,
+                source_argv_json,
+                checkpoint.source_working_directory,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(database_error("query checkpoint learning-spec history"))?
+    {
+        same_spec_ids.insert(row.map_err(database_error("read checkpoint learning-spec history"))?);
+    }
+
+    let mut historical = transaction
+        .prepare(&format!(
+            "SELECT review.review_id, review.successor_experiment_id,
+                    CASE
+                      WHEN typeof(review.checkpoint_json) = 'text'
+                       AND length(CAST(review.checkpoint_json AS BLOB)) BETWEEN 1 AND 131072
+                      THEN review.checkpoint_json
+                    END,
+                    typeof(review.checkpoint_json), length(CAST(review.checkpoint_json AS BLOB))
+             FROM research_reviews AS review
+             LEFT JOIN experiments AS successor
+               ON successor.experiment_id = review.successor_experiment_id
+             WHERE (review.campaign_id = ?1 OR successor.campaign_id = ?1)
+               AND review.successor_experiment_id IS NOT NULL
+               AND {CHECKPOINT_INCOMING_CLAIM_PREDICATE}
+             ORDER BY review.successor_experiment_id, review.review_id"
+        ))
+        .map_err(database_error("prepare checkpoint history query"))?;
+    let rows = historical
+        .query_map([checkpoint.campaign_id.as_str()], |row| {
+            let review_id: String = row.get(0)?;
+            let successor: String = row.get(1)?;
+            let storage: String = row.get(3)?;
+            let byte_len: Option<i64> = row.get(4)?;
+            let raw = if storage == "text"
+                && byte_len.is_some_and(|len| (1..=MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES as i64).contains(&len))
+            {
+                match row.get_ref(2)? {
+                    ValueRef::Text(bytes) => Some(
+                        String::from_utf8(bytes.to_vec()).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                    ),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            Ok((review_id, successor, storage, byte_len, raw))
+        })
+        .map_err(database_error("query checkpoint learning-spec history"))?;
+    let mut seen_successors = BTreeSet::new();
+    for row in rows {
+        let (review_id, successor, storage, byte_len, raw) = row
+            .map_err(database_error("read checkpoint learning-spec history"))?;
+        if !seen_successors.insert(successor.clone()) {
+            return Err(validation_error(
+                "research.checkpoint",
+                "historical successor link is duplicated",
+            ));
+        }
+        if storage != "text"
+            || !byte_len.is_some_and(|len| (1..=MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES as i64).contains(&len))
+        {
+            return Err(validation_error(
+                "research.checkpoint",
+                "historical checkpoint is not bounded text",
+            ));
+        }
+        let raw = raw.ok_or_else(|| {
+            validation_error("research.checkpoint", "historical checkpoint is not valid UTF-8")
+        })?;
+        let historical_checkpoint = parse_prepared_checkpoint(&raw)?;
+        if historical_checkpoint.review_id != review_id
+            || historical_checkpoint.campaign_id != checkpoint.campaign_id
+            || historical_checkpoint.successor_ids.experiment_id != successor
+        {
+            return Err(validation_error(
+                "research.checkpoint",
+                "historical successor link does not match the checkpoint",
+            ));
+        }
+        let successor_witness = checkpoint_successor_witness(transaction, &successor)?;
+        let termination_request_id: Option<i64> = transaction
+            .query_row(
+                "SELECT termination_request_id FROM research_reviews WHERE review_id = ?1",
+                [&review_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read historical checkpoint termination"))?;
+        let historical_authority = CheckpointDispatchAuthority {
+            checkpoint: historical_checkpoint.clone(),
+            raw_checkpoint: raw,
+            project_id: historical_checkpoint.project_id.clone(),
+            campaign_id: historical_checkpoint.campaign_id.clone(),
+            review_id: review_id.clone(),
+            source_experiment_id: historical_checkpoint.source_experiment_id.clone(),
+            proposal_id: historical_checkpoint.successor_ids.proposal_id.clone(),
+            submission_id: historical_checkpoint.successor_ids.submission_id.clone(),
+            successor_experiment_id: historical_checkpoint.successor_ids.experiment_id.clone(),
+            successor_attempt: successor_witness.map(|(attempt, _)| attempt),
+            reservation_window_ends_at: successor_witness.map(|(_, window_end)| window_end),
+            termination_request_id,
+        };
+        if !super::campaigns::checkpoint_successor_graph_matches_authority(
+            transaction,
+            &historical_authority,
+            None,
+            None,
+        )? {
+            return Err(validation_error(
+                "research.checkpoint",
+                "historical successor graph is not exact",
+            ));
+        }
+        if historical_checkpoint.learning_spec_digest
+            == checkpoint.learning_spec_digest
+        {
+            same_spec_ids.insert(successor);
+        }
+    }
+    Ok(same_spec_ids.len() as i64)
+}
+
+pub(crate) fn checkpoint_successor_preflight_in_transaction(
+    transaction: &Transaction<'_>,
+    expected: &ReadyResearchAction,
+    checkpoint: &PreparedCheckpoint,
+    limits: &crate::execution_policy::CampaignLimits,
+    now: i64,
+) -> Result<CheckpointSuccessorPreflight, AppError> {
+    let request = expected.answer.checkpoint.as_ref().ok_or_else(|| {
+        validation_error("research.checkpoint", "ready answer has no checkpoint request")
+    })?;
+    let authority = match checkpoint_source_authority_for_ready_in_connection(
+        transaction,
+        expected,
+        request,
+    )? {
+        CheckpointSourceAuthorityRead::Supported(authority) => authority,
+        CheckpointSourceAuthorityRead::Unsupported { .. } => {
+            return Err(validation_error(
+                "checkpoint.source",
+                "is unsupported for checkpoint admission",
+            ));
+        }
+    };
+    checkpoint_matches_fresh_authority(checkpoint, expected, &authority, request)?;
+    if checkpoint_retry_admission_available_for_campaign(transaction, checkpoint, limits, now)? {
+        Ok(CheckpointSuccessorPreflight::Available)
+    } else {
+        Ok(CheckpointSuccessorPreflight::Deferred)
+    }
+}
+
+pub(crate) fn bind_checkpoint_termination_intent_in_transaction(
+    transaction: &Transaction<'_>,
+    expected: &ReadyResearchAction,
+    checkpoint_json: &str,
+    incident: &Incident,
+    request: &TerminationRequest,
+    now: i64,
+) -> Result<bool, AppError> {
+    if checkpoint_json.as_bytes().is_empty()
+        || checkpoint_json.as_bytes().len() > MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES
+    {
+        return Err(validation_error(
+            "research.checkpoint_json",
+            "must be 1 to 131072 bytes",
+        ));
+    }
+    if incident.project_id != expected.owner.project_id
+        || request.incident_id != incident.incident_id
+        || request.project_id != expected.owner.project_id
+        || request.task_signature != expected.raw_task_signature
+        || !request
+            .reason
+            .starts_with(format!("research_action:{}:", expected.owner.review_id).as_str())
+    {
+        return Err(validation_error(
+            "research.termination",
+            "incident and request do not match the ready research owner",
+        ));
+    }
+    let checkpoint = parse_prepared_checkpoint(checkpoint_json)?;
+    let request_checkpoint = expected.answer.checkpoint.as_ref().ok_or_else(|| {
+        validation_error(
+            "research.checkpoint",
+            "ready answer does not request a checkpoint",
+        )
+    })?;
+    if expected.answer.action != "resume_from_checkpoint" || checkpoint.request != *request_checkpoint {
+        return Err(validation_error(
+            "research.checkpoint",
+            "does not match the ready answer request",
+        ));
+    }
+    let authority = match checkpoint_source_authority_for_ready_in_connection(
+        transaction,
+        expected,
+        request_checkpoint,
+    )? {
+        CheckpointSourceAuthorityRead::Supported(authority) => authority,
+        CheckpointSourceAuthorityRead::Unsupported { .. } => {
+            return Err(validation_error(
+                "checkpoint.source",
+                "is unsupported for checkpoint intent",
+            ));
+        }
+    };
+    checkpoint_matches_fresh_authority(&checkpoint, expected, &authority, request_checkpoint)?;
+    let event_id = expected.owner.event_id.ok_or_else(|| {
+        validation_error("research.event_id", "is missing from the ready owner")
+    })?;
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET checkpoint_json = ?1, operation_stage = 'intent',
+                 termination_request_id = ?2, updated_at = ?3
+             WHERE review_id = ?4 AND campaign_id = ?5
+               AND experiment_id = ?6 AND task_signature = ?7
+               AND attempt = ?8 AND session_generation = ?9
+               AND agent_run_id = ?10 AND context_digest = ?11
+               AND event_id = ?12 AND state = 'ready'
+               AND operation_stage IS NULL AND termination_request_id IS NULL
+               AND checkpoint_json IS NULL AND decision_cycle_id IS NULL
+               AND successor_experiment_id IS NULL",
+            params![
+                checkpoint_json,
+                request.request_id,
+                now,
+                expected.owner.review_id,
+                expected.owner.campaign_id,
+                expected.owner.source_experiment_id,
+                expected.owner.managed_task_signature,
+                expected.owner.attempt,
+                expected.owner.session_generation,
+                expected.owner.agent_run_id,
+                expected.context_digest,
+                event_id,
+            ],
+        )
+        .map_err(database_error("bind checkpoint research termination intent"))?;
+    Ok(changed == 1)
+}
+
+pub(crate) fn block_checkpoint_orphan_in_transaction(
+    transaction: &Transaction<'_>,
+    expected: &ReadyResearchAction,
+    now: i64,
+) -> Result<bool, AppError> {
+    let event_id = expected.owner.event_id.ok_or_else(|| {
+        validation_error("research.event_id", "is missing from the ready owner")
+    })?;
+    let current = transaction
+        .query_row(
+            "SELECT campaign.project_id, campaign.objective_digest,
+                    review.campaign_id, review.experiment_id, review.task_signature,
+                    review.attempt, review.state, review.operation_stage,
+                    review.agent_run_id, review.context_json, review.context_digest,
+                    review.response_json, review.termination_request_id,
+                    review.successor_experiment_id, review.session_generation,
+                    review.event_id, COALESCE(review.notes_json, '{}'),
+                    review.failure_code, review.decision_cycle_id
+             FROM research_reviews AS review
+             JOIN campaigns AS campaign ON campaign.campaign_id = review.campaign_id
+             WHERE review.review_id = ?1 AND review.checkpoint_json IS NULL",
+            [&expected.owner.review_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
+                    row.get::<_, String>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read orphan checkpoint authority"))?;
+    let Some((
+        project_id,
+        objective_digest,
+        campaign_id,
+        source_experiment_id,
+        task_signature,
+        attempt,
+        state,
+        operation_stage,
+        agent_run_id,
+        context_json,
+        context_digest,
+        response_json,
+        termination_request_id,
+        successor_experiment_id,
+        session_generation,
+        persisted_event_id,
+        notes_json,
+        failure_code,
+        decision_cycle_id,
+    )) = current
+    else {
+        return Ok(false);
+    };
+    if project_id != expected.owner.project_id
+        || objective_digest != expected.campaign_objective_digest
+        || campaign_id != expected.owner.campaign_id
+        || source_experiment_id != expected.owner.source_experiment_id
+        || task_signature != expected.owner.managed_task_signature
+        || attempt != expected.owner.attempt
+        || state != "ready"
+        || operation_stage != expected.owner.operation_stage
+        || agent_run_id != expected.owner.agent_run_id
+        || context_json.as_deref() != Some(expected.context_json.as_str())
+        || context_digest != Some(expected.context_digest.clone())
+        || response_json.as_deref() != Some(expected.response_json.as_str())
+        || termination_request_id != expected.owner.termination_request_id
+        || successor_experiment_id != expected.owner.successor_experiment_id
+        || session_generation != expected.owner.session_generation
+        || persisted_event_id != Some(event_id)
+        || notes_json != expected.notes_json
+        || failure_code.is_some()
+        || decision_cycle_id != expected.owner.decision_cycle_id
+        || expected.owner.recovery_required
+    {
+        return Ok(false);
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'blocked', failure_code = 'research_checkpoint_orphaned',
+                 finished_at = ?1, not_before = ?1, updated_at = ?1
+             WHERE review_id = ?2 AND campaign_id = ?3
+               AND experiment_id = ?4 AND task_signature = ?5
+               AND attempt = ?6 AND session_generation = ?7
+               AND agent_run_id = ?8 AND event_id = ?9
+               AND context_json = ?10 AND context_digest IS ?11
+               AND response_json = ?12 AND COALESCE(notes_json, '{}') = ?13
+               AND state = 'ready' AND operation_stage IS NULL
+               AND termination_request_id IS NULL AND checkpoint_json IS NULL
+               AND decision_cycle_id IS NULL AND successor_experiment_id IS NULL
+               AND failure_code IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM campaigns
+                   WHERE campaign_id = research_reviews.campaign_id
+                     AND project_id = ?14
+                     AND objective_digest = ?15
+               )",
+            params![
+                now,
+                expected.owner.review_id,
+                expected.owner.campaign_id,
+                expected.owner.source_experiment_id,
+                expected.owner.managed_task_signature,
+                expected.owner.attempt,
+                expected.owner.session_generation,
+                expected.owner.agent_run_id,
+                event_id,
+                expected.context_json,
+                Some(expected.context_digest.as_str()),
+                expected.response_json,
+                expected.notes_json,
+                expected.owner.project_id,
+                expected.campaign_objective_digest,
+            ],
+        )
+        .map_err(database_error("block orphaned checkpoint review"))?;
+    Ok(changed == 1)
+}
+
+pub(crate) fn block_invalid_checkpoint_review_in_transaction(
+    transaction: &Transaction<'_>,
+    expected: &ResearchReview,
+    now: i64,
+) -> Result<bool, AppError> {
+    let current = transaction
+        .query_row(
+            "SELECT campaign_id, experiment_id, task_signature, attempt,
+                    state, operation_stage, agent_run_id, context_digest,
+                    termination_request_id, successor_experiment_id,
+                    session_generation,
+                    CASE
+                      WHEN typeof(checkpoint_json) = 'text'
+                       AND length(CAST(checkpoint_json AS BLOB)) BETWEEN 1 AND 131072
+                      THEN checkpoint_json
+                    END,
+                    typeof(checkpoint_json), length(CAST(checkpoint_json AS BLOB))
+             FROM research_reviews WHERE review_id = ?1",
+            [&expected.review_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read invalid checkpoint authority"))?;
+    let Some((
+        campaign_id,
+        experiment_id,
+        task_signature,
+        attempt,
+        state,
+        operation_stage,
+        agent_run_id,
+        context_digest,
+        termination_request_id,
+        successor_experiment_id,
+        session_generation,
+        raw,
+        storage,
+        byte_len,
+    )) = current
+    else {
+        return Ok(false);
+    };
+    let storage_class = checkpoint_sqlite_storage_class(&storage, 12)
+        .map_err(database_error("classify invalid checkpoint storage"))?;
+    let observed_state = match storage_class {
+        CheckpointSqliteStorageClass::Text
+            if byte_len.is_some_and(|len| (1..=MAX_RESEARCH_CHECKPOINT_COLUMN_BYTES as i64).contains(&len)) =>
+        {
+            if raw.as_deref() != expected.checkpoint_json.as_deref() {
+                return Ok(false);
+            }
+            CheckpointJsonState::BoundedText
+        }
+        CheckpointSqliteStorageClass::Null if byte_len.is_none() => CheckpointJsonState::Missing,
+        storage_class => CheckpointJsonState::Invalid {
+            storage_class,
+            byte_len,
+        },
+    };
+    if campaign_id != expected.campaign_id
+        || experiment_id != expected.experiment_id
+        || task_signature != expected.task_signature
+        || attempt != expected.attempt
+        || state != "ready"
+        || operation_stage.as_deref() != Some("successor_reserved")
+        || agent_run_id != expected.agent_run_id
+        || context_digest != expected.context_digest
+        || termination_request_id != expected.termination_request_id
+        || successor_experiment_id != expected.successor_experiment_id
+        || session_generation != expected.session_generation
+        || observed_state != expected.checkpoint_json_state
+    {
+        return Ok(false);
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'blocked', failure_code = 'research_checkpoint_authority_corrupt',
+                 finished_at = ?1, not_before = ?1, updated_at = ?1
+             WHERE review_id = ?2 AND campaign_id = ?3 AND experiment_id = ?4
+               AND task_signature = ?5 AND attempt = ?6
+               AND session_generation = ?7 AND agent_run_id IS ?8
+               AND context_digest IS ?9 AND termination_request_id IS ?10
+               AND successor_experiment_id IS ?11
+               AND state = 'ready' AND operation_stage = 'successor_reserved'
+               AND decision_cycle_id IS NULL",
+            params![
+                now,
+                expected.review_id,
+                expected.campaign_id,
+                expected.experiment_id,
+                expected.task_signature,
+                expected.attempt,
+                expected.session_generation,
+                expected.agent_run_id,
+                expected.context_digest,
+                expected.termination_request_id,
+                expected.successor_experiment_id,
+            ],
+        )
+        .map_err(database_error("block invalid checkpoint review"))?;
+    Ok(changed == 1)
 }
 
 fn source_authority_require_submission_metadata(
@@ -7036,6 +8312,24 @@ fn native_research_owner_is_complete(row: &NativeResearchOwnerRow) -> bool {
         .is_some_and(|authority| authority.cleanup_complete)
 }
 
+pub(super) fn checkpoint_native_research_owner_complete(
+    connection: &Connection,
+    authority: &CheckpointDispatchAuthority,
+) -> Result<bool, AppError> {
+    let Some(row) = native_research_owner_rows(connection, Some(&authority.project_id))?
+        .into_iter()
+        .find(|row| {
+            row.review_id == authority.review_id
+                && row.campaign_id == authority.campaign_id
+                && row.experiment_id == authority.source_experiment_id
+                && row.agent_run_id == authority.checkpoint.review_agent_run_id
+        })
+    else {
+        return Ok(false);
+    };
+    Ok(native_research_owner_is_complete(&row))
+}
+
 fn native_research_historical_authority_complete(row: &NativeResearchOwnerRow) -> bool {
     let Some(notes_json) = row.notes_json.as_deref() else {
         return false;
@@ -7233,6 +8527,62 @@ fn block_review_in_transaction(
         )
         .map_err(database_error("block research campaign"))?;
     Ok(())
+}
+
+fn block_checkpoint_dispatch_review(
+    transaction: &Transaction<'_>,
+    review_id: &str,
+    campaign_id: &str,
+    source_experiment_id: &str,
+    task_signature: &str,
+    attempt: i64,
+    now: i64,
+) -> Result<bool, AppError> {
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'blocked', failure_code = 'research_checkpoint_authority_corrupt',
+                 finished_at = ?1, not_before = ?1, updated_at = ?1
+             WHERE review_id = ?2 AND campaign_id = ?3 AND experiment_id = ?4
+               AND task_signature = ?5 AND attempt = ?6
+               AND state = 'ready' AND successor_experiment_id IS NOT NULL",
+            params![now, review_id, campaign_id, source_experiment_id, task_signature, attempt],
+        )
+        .map_err(database_error("block checkpoint dispatch review"))?;
+    Ok(changed == 1)
+}
+
+fn block_missing_checkpoint_dispatch_review(
+    transaction: &Transaction<'_>,
+    review_id: &str,
+    campaign_id: &str,
+    source_experiment_id: &str,
+    task_signature: &str,
+    attempt: i64,
+    successor_experiment_id: &str,
+    now: i64,
+) -> Result<bool, AppError> {
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET state = 'blocked', failure_code = 'research_checkpoint_authority_corrupt',
+                 finished_at = ?1, not_before = ?1, updated_at = ?1
+             WHERE review_id = ?2 AND campaign_id = ?3 AND experiment_id = ?4
+               AND task_signature = ?5 AND attempt = ?6
+               AND state = 'ready' AND operation_stage = 'successor_reserved'
+               AND successor_experiment_id = ?7 AND checkpoint_json IS NULL",
+            params![
+                now,
+                review_id,
+                campaign_id,
+                source_experiment_id,
+                task_signature,
+                attempt,
+                successor_experiment_id,
+            ],
+        )
+        .map_err(database_error("block missing checkpoint dispatch review"))?;
+    Ok(changed == 1)
 }
 
 pub fn next_research_due(start: i64, interval_minutes: u32) -> Result<Option<i64>, AppError> {
@@ -7516,7 +8866,7 @@ mod tests {
         execution_policy::CampaignLimits,
         models::{
             AgentContextMode, AgentRunStatus, ExecutionProjection, NewAgentRun, NewProject,
-            NewTaskObservation, ProposalKind,
+            NewTaskObservation, ProposalKind, IncidentStatus, TerminationRequestStatus,
         },
         proposals::{self, ProposalInput},
         pueue::PueueTask,
@@ -9645,6 +10995,738 @@ mod tests {
         }
     }
 
+    struct CheckpointDispatchFixture {
+        fixture: SourceAuthorityFixture,
+        encoded: String,
+        authority: CheckpointDispatchAuthority,
+    }
+
+    fn checkpoint_confirmed_fixture() -> (
+        SourceAuthorityFixture,
+        String,
+        ResearchOwnershipSnapshot,
+    ) {
+        confirm_checkpoint_fixture(source_authority_fixture())
+    }
+
+    fn confirm_checkpoint_fixture(
+        fixture: SourceAuthorityFixture,
+    ) -> (
+        SourceAuthorityFixture,
+        String,
+        ResearchOwnershipSnapshot,
+    ) {
+        let incident = Incident {
+            incident_id: 81,
+            project_id: fixture.project_id.clone(),
+            kind: "research_checkpoint".to_owned(),
+            task_key: Some(fixture.expected.owner.source_experiment_id.clone()),
+            fingerprint: "checkpoint-fingerprint-2".to_owned(),
+            status: IncidentStatus::Open,
+            first_seen_at: 3_100,
+            last_seen_at: 3_100,
+            acknowledged_at: None,
+            resolved_at: None,
+        };
+        let request = TerminationRequest {
+            request_id: 82,
+            incident_id: incident.incident_id,
+            project_id: fixture.project_id.clone(),
+            task_signature: fixture.expected.raw_task_signature.clone(),
+            reason: format!("research_action:{}:checkpoint", fixture.review_id),
+            status: TerminationRequestStatus::Confirmed,
+            requested_at: 3_100,
+            dispatch_lease_until: None,
+            grace_until: None,
+            confirmed_at: Some(3_101),
+            last_error: None,
+        };
+        let connection = fixture.db.connect().expect("checkpoint dispatch setup connection");
+        connection
+            .execute(
+                "INSERT INTO incidents (
+                    incident_id, project_id, kind, task_key, fingerprint, status,
+                    first_seen_at, last_seen_at, acknowledged_at, resolved_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL, NULL)",
+                rusqlite::params![
+                    incident.incident_id,
+                    incident.project_id,
+                    incident.kind,
+                    incident.task_key,
+                    incident.fingerprint,
+                    incident.status,
+                    incident.first_seen_at,
+                ],
+            )
+            .expect("checkpoint dispatch incident");
+        connection
+            .execute(
+                "INSERT INTO termination_requests (
+                    request_id, incident_id, project_id, task_signature, reason,
+                    status, requested_at, dispatch_lease_until, grace_until,
+                    confirmed_at, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL)",
+                rusqlite::params![
+                    request.request_id,
+                    request.incident_id,
+                    request.project_id,
+                    request.task_signature,
+                    request.reason,
+                    request.status,
+                    request.requested_at,
+                    request.confirmed_at,
+                ],
+            )
+            .expect("checkpoint dispatch termination");
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint)
+            .expect("checkpoint dispatch encoding");
+        let mut connection = connection;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("checkpoint dispatch intent transaction");
+        assert!(bind_checkpoint_termination_intent_in_transaction(
+            &transaction,
+            &fixture.expected,
+            &encoded,
+            &incident,
+            &request,
+            3_100,
+        )
+        .expect("checkpoint dispatch intent bind"));
+        transaction
+            .commit()
+            .expect("checkpoint dispatch intent commit");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET operation_stage = 'stop_confirmed', updated_at = ?1
+                 WHERE review_id = ?2 AND operation_stage = 'intent'
+                   AND termination_request_id = ?3",
+                rusqlite::params![3_101, fixture.review_id, request.request_id],
+            )
+            .expect("checkpoint dispatch confirmed review");
+
+        let mut owner = fixture.expected.owner.clone();
+        owner.operation_stage = Some("stop_confirmed".to_owned());
+        owner.termination_request_id = Some(request.request_id);
+        (fixture, encoded, owner)
+    }
+
+    fn checkpoint_dispatch_fixture() -> CheckpointDispatchFixture {
+        let (fixture, encoded, owner) = checkpoint_confirmed_fixture();
+        let mut connection = fixture.db.connect().expect("checkpoint dispatch transaction connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("checkpoint dispatch transaction");
+        let admission = super::super::campaigns::accept_checkpoint_successor_in_transaction(
+            &transaction,
+            &owner,
+            &CampaignLimits::default(),
+            3_102,
+        )
+        .expect("checkpoint dispatch admission");
+        let successor = match admission {
+            CheckpointSuccessorAdmission::Ready(intent) => intent,
+            other => panic!("unexpected checkpoint dispatch admission: {other:?}"),
+        };
+        assert_eq!(
+            successor.experiment.experiment_id,
+            fixture.checkpoint.successor_ids.experiment_id
+        );
+        transaction.commit().expect("checkpoint dispatch commit");
+
+        let repository = ResearchRepository::new(&fixture.db);
+        let selection = repository
+            .checkpoint_dispatch_authority(
+                &fixture.project_id,
+                &fixture.checkpoint.successor_ids.experiment_id,
+                3_103,
+            )
+            .expect("checkpoint dispatch authority");
+        let authority = match selection {
+            CheckpointDispatchSelection::Ready(authority) => authority,
+            other => panic!("unexpected checkpoint dispatch selection: {other:?}"),
+        };
+
+        CheckpointDispatchFixture {
+            fixture,
+            encoded,
+            authority,
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CheckpointGraphSnapshot {
+        review: Vec<rusqlite::types::Value>,
+        proposal: Vec<rusqlite::types::Value>,
+        submission: Vec<rusqlite::types::Value>,
+        experiment: Vec<rusqlite::types::Value>,
+        reservation: Vec<rusqlite::types::Value>,
+        termination: Vec<rusqlite::types::Value>,
+        resource_counts: Vec<rusqlite::types::Value>,
+    }
+
+    fn snapshot_sql_row<P: rusqlite::Params>(
+        connection: &Connection,
+        sql: &str,
+        params: P,
+    ) -> Vec<rusqlite::types::Value> {
+        connection
+            .query_row(sql, params, |row| {
+                (0..row.as_ref().column_count())
+                    .map(|index| row.get(index))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("checkpoint graph snapshot row")
+    }
+
+    fn checkpoint_limit_snapshot(fixture: &SourceAuthorityFixture) -> Vec<rusqlite::types::Value> {
+        let connection = fixture.db.connect().expect("checkpoint limit snapshot connection");
+        snapshot_sql_row(
+            &connection,
+            "SELECT
+                (SELECT state FROM research_reviews WHERE review_id = ?1),
+                (SELECT operation_stage FROM research_reviews WHERE review_id = ?1),
+                (SELECT checkpoint_json FROM research_reviews WHERE review_id = ?1),
+                (SELECT termination_request_id FROM research_reviews WHERE review_id = ?1),
+                (SELECT successor_experiment_id FROM research_reviews WHERE review_id = ?1),
+                (SELECT status FROM experiments WHERE experiment_id = ?2),
+                (SELECT pueue_task_id FROM experiments WHERE experiment_id = ?2),
+                (SELECT task_signature FROM experiments WHERE experiment_id = ?2),
+                (SELECT state FROM campaigns WHERE campaign_id = ?3),
+                (SELECT state_reason FROM campaigns WHERE campaign_id = ?3),
+                (SELECT next_eligible_at FROM campaigns WHERE campaign_id = ?3),
+                (SELECT session_id FROM campaign_research WHERE campaign_id = ?3),
+                (SELECT session_generation FROM campaign_research WHERE campaign_id = ?3),
+                (SELECT next_due_at FROM campaign_research WHERE campaign_id = ?3),
+                (SELECT blocked_reason FROM campaign_research WHERE campaign_id = ?3),
+                (SELECT last_review_id FROM campaign_research WHERE campaign_id = ?3),
+                (SELECT COUNT(*) FROM proposals WHERE campaign_id = ?3),
+                (SELECT COUNT(*) FROM submissions WHERE project_id = ?4),
+                (SELECT COUNT(*) FROM experiments WHERE campaign_id = ?3),
+                (SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = ?3),
+                (SELECT COUNT(*) FROM incidents WHERE project_id = ?4),
+                (SELECT COUNT(*) FROM termination_requests WHERE project_id = ?4)",
+            rusqlite::params![fixture.review_id, fixture.experiment_id, fixture.campaign_id, fixture.project_id],
+        )
+    }
+
+    fn insert_limit_experiment(
+        fixture: &SourceAuthorityFixture,
+        suffix: &str,
+        argv: Vec<String>,
+        working_directory: &str,
+        resume_of_experiment_id: Option<&str>,
+        now: i64,
+    ) {
+        let proposal_id = format!("limits-proposal-{suffix}");
+        let submission_id = format!("limits-submission-{suffix}");
+        let experiment_id = format!("limits-experiment-{suffix}");
+        let proposal = proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: format!("limits fixture {suffix}"),
+                source_experiment_id: resume_of_experiment_id.map(str::to_owned),
+                argv,
+                working_directory: working_directory.to_owned(),
+                expected_evidence: vec!["loss".to_owned()],
+            },
+            &"a".repeat(64),
+        )
+        .expect("limits fixture proposal");
+        let argv_json = serde_json::to_string(proposal.argv()).expect("limits fixture argv");
+        let evidence_json = serde_json::to_string(proposal.expected_evidence())
+            .expect("limits fixture evidence");
+        let mut connection = fixture.db.connect().expect("limits fixture connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("limits fixture transaction");
+        super::super::campaigns::insert_proposal(
+            &transaction,
+            &proposal_id,
+            &fixture.campaign_id,
+            &proposal,
+            ProposalStatus::Accepted,
+            &argv_json,
+            &evidence_json,
+            now,
+        )
+        .expect("limits fixture proposal insert");
+        super::super::campaigns::insert_submission(
+            &transaction,
+            &submission_id,
+            &fixture.project_id,
+            &argv_json,
+            "{}",
+            None,
+            now,
+        )
+        .expect("limits fixture submission insert");
+        super::super::campaigns::insert_experiment(
+            &transaction,
+            &experiment_id,
+            &fixture.campaign_id,
+            &proposal_id,
+            &submission_id,
+            resume_of_experiment_id,
+            1,
+            resume_of_experiment_id,
+            None,
+            None,
+            None,
+            now,
+        )
+        .expect("limits fixture experiment insert");
+        super::super::campaigns::insert_experiment_reservation(
+            &transaction,
+            &fixture.campaign_id,
+            &experiment_id,
+            now,
+            now + 3_600,
+        )
+        .expect("limits fixture experiment reservation");
+        transaction.commit().expect("limits fixture commit");
+    }
+
+    fn insert_limit_agent_reservation(
+        fixture: &SourceAuthorityFixture,
+        suffix: &str,
+        now: i64,
+    ) {
+        let connection = fixture.db.connect().expect("agent budget fixture connection");
+        connection
+            .execute(
+                "INSERT INTO budget_reservations (
+                    reservation_id, campaign_id, experiment_id, dimension, subject_key,
+                    status, window_started_at, window_ends_at, created_at, updated_at
+                 ) VALUES (?1, ?2, NULL, 'agent_run', ?3, 'reserved', ?4, ?5, ?4, ?4)",
+                rusqlite::params![
+                    format!("limits-agent:{suffix}"),
+                    fixture.campaign_id,
+                    format!("limits-agent-subject:{suffix}"),
+                    now,
+                    now + 3_600,
+                ],
+            )
+            .expect("agent budget fixture reservation");
+    }
+
+    fn checkpoint_preflight(
+        fixture: &SourceAuthorityFixture,
+        limits: &CampaignLimits,
+        now: i64,
+    ) -> CheckpointSuccessorPreflight {
+        let mut connection = fixture.db.connect().expect("checkpoint limit preflight connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("checkpoint limit preflight transaction");
+        let result = checkpoint_successor_preflight_in_transaction(
+            &transaction,
+            &fixture.expected,
+            &fixture.checkpoint,
+            limits,
+            now,
+        )
+        .expect("checkpoint limit preflight");
+        transaction.commit().expect("checkpoint limit preflight commit");
+        result
+    }
+
+    fn assert_checkpoint_limit_deferred_after_intent<F>(
+        fixture: SourceAuthorityFixture,
+        limits: &CampaignLimits,
+        insert_competitor: F,
+        label: &str,
+    ) where
+        F: FnOnce(&SourceAuthorityFixture),
+    {
+        assert_eq!(
+            checkpoint_preflight(&fixture, limits, 3_100),
+            CheckpointSuccessorPreflight::Available,
+            "{label}: preflight should be available before intent"
+        );
+        let (fixture, _encoded, owner) = confirm_checkpoint_fixture(fixture);
+        insert_competitor(&fixture);
+        let final_snapshot = checkpoint_limit_snapshot(&fixture);
+        let mut connection = fixture
+            .db
+            .connect()
+            .expect("post-intent final connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("post-intent final transaction");
+        assert_eq!(
+            super::super::campaigns::accept_checkpoint_successor_in_transaction(
+                &transaction,
+                &owner,
+                limits,
+                3_101,
+            )
+            .expect("post-intent final admission"),
+            CheckpointSuccessorAdmission::Deferred,
+            "{label}: final admission should defer after intent contention"
+        );
+        transaction
+            .commit()
+            .expect("post-intent final commit");
+        assert_eq!(
+            checkpoint_limit_snapshot(&fixture),
+            final_snapshot,
+            "{label}: deferred final admission mutated checkpoint resources"
+        );
+    }
+
+    fn rewrite_checkpoint_retained_path(
+        fixture: &CheckpointDispatchFixture,
+        retained_path: &str,
+    ) {
+        let mut checkpoint = fixture.fixture.checkpoint.clone();
+        let path_index = checkpoint
+            .request
+            .argv
+            .iter()
+            .zip(&checkpoint.retained_argv)
+            .position(|(requested, retained)| requested != retained)
+            .expect("checkpoint retained path index");
+        if let Some((flag, _)) = checkpoint.retained_argv[path_index].split_once('=') {
+            checkpoint.retained_argv[path_index] = format!("{flag}={retained_path}");
+        } else {
+            checkpoint.retained_argv[path_index] = retained_path.to_owned();
+        }
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(&checkpoint)
+            .expect("rewritten checkpoint encoding");
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("rewritten checkpoint connection");
+        let expected_evidence: Vec<String> = connection
+            .query_row(
+                "SELECT expected_evidence_json FROM proposals WHERE proposal_id = ?1",
+                [&fixture.fixture.proposal_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|json| serde_json::from_str(&json).expect("rewritten checkpoint evidence"))
+            .expect("rewritten checkpoint source evidence");
+        let objective_digest: String = connection
+            .query_row(
+                "SELECT objective_digest FROM campaigns WHERE campaign_id = ?1",
+                [&fixture.fixture.campaign_id],
+                |row| row.get(0),
+            )
+            .expect("rewritten checkpoint objective");
+        let proposal = proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: format!(
+                    "Resume {} from its verified checkpoint",
+                    fixture.fixture.experiment_id
+                ),
+                source_experiment_id: Some(fixture.fixture.experiment_id.clone()),
+                argv: checkpoint.retained_argv.clone(),
+                working_directory: checkpoint.source_working_directory.clone(),
+                expected_evidence,
+            },
+            &objective_digest,
+        )
+        .expect("rewritten checkpoint proposal");
+        let argv_json = serde_json::to_string(proposal.argv()).expect("rewritten checkpoint argv");
+        let checkpoint_note = format!(
+            "research-checkpoint:{:x}",
+            Sha256::digest(encoded.as_bytes())
+        );
+        connection
+            .execute(
+                "UPDATE proposals
+                 SET argv_json = ?1, canonical_digest = ?2
+                 WHERE proposal_id = ?3",
+                rusqlite::params![argv_json, proposal.canonical_digest(), fixture.authority.proposal_id],
+            )
+            .expect("rewritten checkpoint proposal row");
+        connection
+            .execute(
+                "UPDATE submissions SET argv_json = ?1 WHERE submission_id = ?2",
+                rusqlite::params![argv_json, fixture.authority.submission_id],
+            )
+            .expect("rewritten checkpoint submission row");
+        connection
+            .execute(
+                "UPDATE experiments SET checkpoint_note = ?1 WHERE experiment_id = ?2",
+                rusqlite::params![checkpoint_note, fixture.authority.successor_experiment_id],
+            )
+            .expect("rewritten checkpoint experiment row");
+        connection
+            .execute(
+                "UPDATE research_reviews SET checkpoint_json = ?1 WHERE review_id = ?2",
+                rusqlite::params![encoded, fixture.fixture.review_id],
+            )
+            .expect("rewritten checkpoint review row");
+    }
+
+    fn settle_checkpoint_history(fixture: &CheckpointDispatchFixture) {
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history completion connection");
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET status = 'succeeded', pueue_task_id = 501,
+                     task_signature = 'history-terminal-task',
+                     finished_at = 4_000, updated_at = 4_000
+                 WHERE experiment_id = ?1",
+                [&fixture.authority.successor_experiment_id],
+            )
+            .expect("history completed experiment");
+        connection
+            .execute(
+                "UPDATE submissions
+                 SET status = 'accepted', pueue_task_id = 501,
+                     task_signature = 'history-terminal-task'
+                 WHERE submission_id = ?1",
+                [&fixture.authority.submission_id],
+            )
+            .expect("history completed submission");
+        connection
+            .execute(
+                "UPDATE budget_reservations SET status = 'consumed', updated_at = 4_000
+                 WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                [&fixture.authority.successor_experiment_id],
+            )
+            .expect("history completed reservation");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', operation_stage = NULL,
+                     finished_at = 4_000, updated_at = 4_000
+                 WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+            )
+            .expect("history completed review");
+    }
+
+    fn assert_checkpoint_history_count(fixture: &CheckpointDispatchFixture, expected: i64) {
+        let mut connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history count connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("history count transaction");
+        assert_eq!(
+            checkpoint_same_spec_count(&transaction, &fixture.fixture.checkpoint)
+                .expect("history count"),
+            expected
+        );
+        transaction.commit().expect("history count commit");
+    }
+
+    fn checkpoint_graph_snapshot(fixture: &CheckpointDispatchFixture) -> CheckpointGraphSnapshot {
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("checkpoint graph snapshot connection");
+        let review = snapshot_sql_row(
+            &connection,
+            "SELECT state, attempt, operation_stage, checkpoint_json,
+                    termination_request_id, successor_experiment_id, failure_code,
+                    finished_at, updated_at, notes_json
+             FROM research_reviews WHERE review_id = ?1",
+            [&fixture.fixture.review_id],
+        );
+        let proposal = snapshot_sql_row(
+            &connection,
+            "SELECT proposal_id, campaign_id, kind, status, hypothesis,
+                    source_experiment_id, argv_json, working_directory,
+                    expected_evidence_json, canonical_digest, reject_reason,
+                    created_at, updated_at
+             FROM proposals WHERE proposal_id = ?1",
+            [&fixture.authority.proposal_id],
+        );
+        let submission = snapshot_sql_row(
+            &connection,
+            "SELECT submission_id, project_id, argv_json, created_at,
+                    pueue_task_id, task_signature, status, kind, metadata_json,
+                    origin_agent_run_id
+             FROM submissions WHERE submission_id = ?1",
+            [&fixture.authority.submission_id],
+        );
+        let experiment = snapshot_sql_row(
+            &connection,
+            "SELECT experiment_id, campaign_id, proposal_id, submission_id,
+                    parent_experiment_id, attempt, status, pueue_task_id,
+                    task_signature, failure_code, failure_fingerprint, created_at,
+                    updated_at, finished_at, resume_of_experiment_id,
+                    checkpoint_note, code_change_run_id, code_revision_sha
+             FROM experiments WHERE experiment_id = ?1",
+            [&fixture.authority.successor_experiment_id],
+        );
+        let reservation = snapshot_sql_row(
+            &connection,
+            "SELECT reservation_id, campaign_id, experiment_id, dimension,
+                    subject_key, status, window_started_at, window_ends_at,
+                    created_at, updated_at
+             FROM budget_reservations
+             WHERE experiment_id = ?1 AND dimension = 'experiment'",
+            [&fixture.authority.successor_experiment_id],
+        );
+        let termination = snapshot_sql_row(
+            &connection,
+            "SELECT request_id, incident_id, project_id, task_signature, reason,
+                    status, requested_at, dispatch_lease_until, grace_until,
+                    confirmed_at, last_error
+             FROM termination_requests
+             WHERE request_id = (
+                 SELECT termination_request_id FROM research_reviews WHERE review_id = ?1
+             )",
+            [&fixture.fixture.review_id],
+        );
+        let resource_counts = snapshot_sql_row(
+            &connection,
+            "SELECT
+                    (SELECT COUNT(*) FROM projects),
+                    (SELECT COUNT(*) FROM campaigns),
+                    (SELECT COUNT(*) FROM proposals),
+                    (SELECT COUNT(*) FROM submissions),
+                    (SELECT COUNT(*) FROM experiments),
+                    (SELECT COUNT(*) FROM budget_reservations),
+                    (SELECT COUNT(*) FROM incidents),
+                    (SELECT COUNT(*) FROM termination_requests)",
+            [],
+        );
+        CheckpointGraphSnapshot {
+            review,
+            proposal,
+            submission,
+            experiment,
+            reservation,
+            termination,
+            resource_counts,
+        }
+    }
+
+    fn run_stale_dispatch_case<F>(label: &str, mutate: F) -> Result<(), String>
+    where
+        F: FnOnce(&CheckpointDispatchFixture, &Connection),
+    {
+        let fixture = checkpoint_dispatch_fixture();
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("stale dispatch foreign setup connection");
+        insert_foreign_campaign(&fixture, &connection);
+        drop(connection);
+        let baseline = checkpoint_graph_snapshot(&fixture);
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("stale dispatch mutation connection");
+        mutate(&fixture, &connection);
+        drop(connection);
+        let mutated = checkpoint_graph_snapshot(&fixture);
+        assert_ne!(baseline, mutated, "{label}: mutation did not change setup");
+
+        let result = ExperimentRepository::new(&fixture.fixture.db)
+            .begin_checkpoint_submitting_or_defer(&fixture.authority, 3_104);
+        if result.is_ok() {
+            return Err(format!("{label}: stale authority was accepted: {result:?}"));
+        }
+        if checkpoint_graph_snapshot(&fixture) != mutated {
+            return Err(format!(
+                "{label}: rejected stale authority mutated unrelated resources"
+            ));
+        }
+        Ok(())
+    }
+
+    fn insert_foreign_campaign(
+        fixture: &CheckpointDispatchFixture,
+        connection: &Connection,
+    ) {
+        let project_id = "checkpoint-foreign-project";
+        let campaign_id = "checkpoint-foreign-campaign";
+        connection
+            .execute(
+                "INSERT INTO projects (
+                    project_id, root_path, pueue_group, config_path,
+                    enabled, paused, halted_reason, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, 1, 0, NULL, 900, 900)",
+                rusqlite::params![
+                    project_id,
+                    format!("/private/checkpoint-foreign-root/{}", fixture.fixture.review_id),
+                    format!("checkpoint-foreign-group-{}", fixture.fixture.review_id),
+                    format!("/private/checkpoint-foreign-config/{}", fixture.fixture.review_id),
+                ],
+            )
+            .expect("checkpoint foreign project");
+        connection
+            .execute(
+                "INSERT INTO campaigns (
+                    campaign_id, project_id, objective_text, objective_digest,
+                    initial_argv_json, state, state_reason, baseline_experiment_id,
+                    next_eligible_at, created_at, updated_at
+                 ) VALUES (?1, ?2, 'foreign', ?3, '[]', 'active', NULL, NULL, NULL, 900, 900)",
+                rusqlite::params![campaign_id, project_id, "f".repeat(64)],
+            )
+            .expect("checkpoint foreign campaign");
+    }
+
+    fn attach_checkpoint_decision_cycle(
+        fixture: &CheckpointDispatchFixture,
+        connection: &Connection,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO decision_cycles (
+                    cycle_id, campaign_id, source_experiment_id, state,
+                    next_wake_at, consecutive_failed_attempts, last_decision_kind,
+                    last_failure_code, last_failure_summary, created_at, updated_at,
+                    source_terminal_at
+                 ) VALUES (?1, ?2, ?3, 'pending', NULL, 0, NULL, NULL, NULL, 3_100, 3_100, 1)",
+                rusqlite::params![
+                    "checkpoint-hybrid-cycle",
+                    fixture.fixture.campaign_id,
+                    fixture.fixture.experiment_id,
+                ],
+            )
+            .expect("checkpoint hybrid decision cycle");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET decision_cycle_id = ?1
+                 WHERE review_id = ?2",
+                rusqlite::params!["checkpoint-hybrid-cycle", fixture.fixture.review_id],
+            )
+            .expect("checkpoint hybrid review cycle");
+    }
+
+    fn mutate_review_notes<F: FnOnce(&mut Value)>(
+        fixture: &CheckpointDispatchFixture,
+        connection: &Connection,
+        mutate: F,
+    ) {
+        let notes_json: String = connection
+            .query_row(
+                "SELECT notes_json FROM research_reviews WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+                |row| row.get(0),
+            )
+            .expect("checkpoint review notes");
+        let mut notes: Value = serde_json::from_str(&notes_json).expect("checkpoint notes JSON");
+        mutate(&mut notes);
+        connection
+            .execute(
+                "UPDATE research_reviews SET notes_json = ?1 WHERE review_id = ?2",
+                rusqlite::params![notes.to_string(), fixture.fixture.review_id],
+            )
+            .expect("checkpoint mutated review notes");
+    }
+
     fn assert_source_authority_fresh_error<F>(label: &str, mutate: F)
     where
         F: FnOnce(&mut SourceAuthorityFixture, &Connection),
@@ -9720,6 +11802,3640 @@ mod tests {
             caller,
             CheckpointSourceAuthorityRead::Supported(_)
         ));
+    }
+
+    #[test]
+    fn checkpoint_preflight_proves_capacity_and_learning_spec_in_one_transaction() {
+        let fixture = source_authority_fixture();
+        let mut connection = fixture.db.connect().expect("checkpoint preflight connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("checkpoint preflight transaction");
+        assert_eq!(
+            checkpoint_successor_preflight_in_transaction(
+                &transaction,
+                &fixture.expected,
+                &fixture.checkpoint,
+                &CampaignLimits::default(),
+                3_100,
+            )
+            .expect("checkpoint preflight"),
+            CheckpointSuccessorPreflight::Available
+        );
+        transaction.commit().expect("checkpoint preflight commit");
+    }
+
+    #[test]
+    fn checkpoint_limits_defer_parallel_capacity_before_and_after_confirmation() {
+        let fixture = source_authority_fixture();
+        let mut limits = CampaignLimits::default();
+        limits.max_parallel_experiments = 1;
+        limits.max_new_experiments_per_24h = 10;
+        limits.max_agent_runs_per_hour = 10;
+        limits.max_same_spec_retries = 10;
+        limits.max_live_repairs = 10;
+        let baseline = checkpoint_limit_snapshot(&fixture);
+        assert_eq!(
+            checkpoint_preflight(&fixture, &limits, 3_100),
+            CheckpointSuccessorPreflight::Available
+        );
+        assert_eq!(checkpoint_limit_snapshot(&fixture), baseline);
+
+        insert_limit_experiment(
+            &fixture,
+            "parallel",
+            vec!["python".to_owned(), "other.py".to_owned()],
+            ".",
+            None,
+            3_100,
+        );
+        let saturated = checkpoint_limit_snapshot(&fixture);
+        assert_eq!(
+            checkpoint_preflight(&fixture, &limits, 3_100),
+            CheckpointSuccessorPreflight::Deferred
+        );
+        assert_eq!(checkpoint_limit_snapshot(&fixture), saturated);
+
+        assert_checkpoint_limit_deferred_after_intent(
+            source_authority_fixture(),
+            &limits,
+            |fixture| {
+                insert_limit_experiment(
+                    fixture,
+                    "parallel-post-intent",
+                    vec!["python".to_owned(), "other.py".to_owned()],
+                    ".",
+                    None,
+                    3_100,
+                );
+            },
+            "parallel",
+        );
+    }
+
+    #[test]
+    fn checkpoint_limits_defer_rolling_experiment_budget_before_and_after_confirmation() {
+        let fixture = source_authority_fixture();
+        let mut limits = CampaignLimits::default();
+        limits.max_parallel_experiments = 10;
+        limits.max_new_experiments_per_24h = 2;
+        limits.max_agent_runs_per_hour = 10;
+        limits.max_same_spec_retries = 10;
+        limits.max_live_repairs = 10;
+        assert_eq!(
+            checkpoint_preflight(&fixture, &limits, 3_100),
+            CheckpointSuccessorPreflight::Available
+        );
+        insert_limit_experiment(
+            &fixture,
+            "experiment-budget",
+            vec!["python".to_owned(), "other.py".to_owned()],
+            ".",
+            None,
+            3_100,
+        );
+        let saturated = checkpoint_limit_snapshot(&fixture);
+        assert_eq!(
+            checkpoint_preflight(&fixture, &limits, 3_100),
+            CheckpointSuccessorPreflight::Deferred
+        );
+        assert_eq!(checkpoint_limit_snapshot(&fixture), saturated);
+
+        assert_checkpoint_limit_deferred_after_intent(
+            source_authority_fixture(),
+            &limits,
+            |fixture| {
+                insert_limit_experiment(
+                    fixture,
+                    "experiment-budget-post-intent",
+                    vec!["python".to_owned(), "other.py".to_owned()],
+                    ".",
+                    None,
+                    3_100,
+                );
+            },
+            "experiment budget",
+        );
+    }
+
+    #[test]
+    fn checkpoint_limits_defer_rolling_agent_budget_before_and_after_confirmation() {
+        let fixture = source_authority_fixture();
+        let mut limits = CampaignLimits::default();
+        limits.max_parallel_experiments = 10;
+        limits.max_new_experiments_per_24h = 10;
+        limits.max_agent_runs_per_hour = 1;
+        limits.max_same_spec_retries = 10;
+        limits.max_live_repairs = 10;
+        assert_eq!(
+            checkpoint_preflight(&fixture, &limits, 3_100),
+            CheckpointSuccessorPreflight::Available
+        );
+        insert_limit_agent_reservation(&fixture, "agent-budget", 3_100);
+        let saturated = checkpoint_limit_snapshot(&fixture);
+        assert_eq!(
+            checkpoint_preflight(&fixture, &limits, 3_100),
+            CheckpointSuccessorPreflight::Deferred
+        );
+        assert_eq!(checkpoint_limit_snapshot(&fixture), saturated);
+
+        assert_checkpoint_limit_deferred_after_intent(
+            source_authority_fixture(),
+            &limits,
+            |fixture| insert_limit_agent_reservation(fixture, "agent-budget-post-intent", 3_100),
+            "agent budget",
+        );
+    }
+
+    #[test]
+    fn checkpoint_limits_defer_same_spec_retries_at_exact_greater_boundary() {
+        let fixture = source_authority_fixture();
+        let mut limits = CampaignLimits::default();
+        limits.max_parallel_experiments = 10;
+        limits.max_new_experiments_per_24h = 10;
+        limits.max_agent_runs_per_hour = 10;
+        limits.max_same_spec_retries = 1;
+        limits.max_live_repairs = 10;
+        assert_eq!(
+            checkpoint_preflight(&fixture, &limits, 3_100),
+            CheckpointSuccessorPreflight::Available
+        );
+        insert_limit_experiment(
+            &fixture,
+            "same-spec",
+            vec!["python".to_owned(), "train.py".to_owned()],
+            ".",
+            None,
+            3_100,
+        );
+        let saturated = checkpoint_limit_snapshot(&fixture);
+        assert_eq!(
+            checkpoint_preflight(&fixture, &limits, 3_100),
+            CheckpointSuccessorPreflight::Deferred
+        );
+        assert_eq!(checkpoint_limit_snapshot(&fixture), saturated);
+
+        assert_checkpoint_limit_deferred_after_intent(
+            source_authority_fixture(),
+            &limits,
+            |fixture| {
+                insert_limit_experiment(
+                    fixture,
+                    "same-spec-post-intent",
+                    vec!["python".to_owned(), "train.py".to_owned()],
+                    ".",
+                    None,
+                    3_100,
+                );
+            },
+            "same spec",
+        );
+    }
+
+    #[test]
+    fn checkpoint_limits_defer_live_repairs_at_exact_greater_or_equal_boundary() {
+        let fixture = source_authority_fixture();
+        let mut limits = CampaignLimits::default();
+        limits.max_parallel_experiments = 10;
+        limits.max_new_experiments_per_24h = 10;
+        limits.max_agent_runs_per_hour = 10;
+        limits.max_same_spec_retries = 10;
+        limits.max_live_repairs = 1;
+        assert_eq!(
+            checkpoint_preflight(&fixture, &limits, 3_100),
+            CheckpointSuccessorPreflight::Available
+        );
+        insert_limit_experiment(
+            &fixture,
+            "live-repair",
+            vec!["python".to_owned(), "repair.py".to_owned()],
+            ".",
+            Some(&fixture.experiment_id),
+            3_100,
+        );
+        let saturated = checkpoint_limit_snapshot(&fixture);
+        assert_eq!(
+            checkpoint_preflight(&fixture, &limits, 3_100),
+            CheckpointSuccessorPreflight::Deferred
+        );
+        assert_eq!(checkpoint_limit_snapshot(&fixture), saturated);
+
+        assert_checkpoint_limit_deferred_after_intent(
+            source_authority_fixture(),
+            &limits,
+            |fixture| {
+                insert_limit_experiment(
+                    fixture,
+                    "live-repair-post-intent",
+                    vec!["python".to_owned(), "repair.py".to_owned()],
+                    ".",
+                    Some(&fixture.experiment_id),
+                    3_100,
+                );
+            },
+            "live repair",
+        );
+    }
+
+    #[test]
+    fn checkpoint_retry_history_counts_completed_same_spec_and_distinct_learning_specs() {
+        let fixture = checkpoint_dispatch_fixture();
+        assert_checkpoint_history_count(&fixture, 2);
+        rewrite_checkpoint_retained_path(
+            &fixture,
+            "/private/state/research-checkpoints/source-authority-campaign/source-authority-review/alternate",
+        );
+        insert_limit_experiment(
+            &fixture.fixture,
+            "different-learning-argv",
+            vec!["python".to_owned(), "different.py".to_owned()],
+            ".",
+            None,
+            3_104,
+        );
+        insert_limit_experiment(
+            &fixture.fixture,
+            "different-learning-cwd",
+            vec!["python".to_owned(), "train.py".to_owned()],
+            "different",
+            None,
+            3_104,
+        );
+        assert_checkpoint_history_count(&fixture, 2);
+        settle_checkpoint_history(&fixture);
+        assert_checkpoint_history_count(&fixture, 2);
+    }
+
+    #[test]
+    fn checkpoint_retry_history_rejects_malformed_oversized_and_duplicate_links() {
+        for (label, raw) in [
+            ("malformed", "{".to_owned()),
+            (
+                "oversized",
+                "x".repeat(crate::research_checkpoint::MAX_PREPARED_CHECKPOINT_BYTES + 1),
+            ),
+        ] {
+            let fixture = checkpoint_dispatch_fixture();
+            settle_checkpoint_history(&fixture);
+            assert_checkpoint_history_count(&fixture, 2);
+            fixture
+                .fixture
+                .db
+                .connect()
+                .expect("history corrupt connection")
+                .execute(
+                    "UPDATE research_reviews SET checkpoint_json = ?1 WHERE review_id = ?2",
+                    rusqlite::params![raw, fixture.fixture.review_id],
+                )
+                .expect("history corrupt row");
+            let mut connection = fixture
+                .fixture
+                .db
+                .connect()
+                .expect("history corrupt count connection");
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("history corrupt count transaction");
+            assert!(
+                checkpoint_same_spec_count(&transaction, &fixture.fixture.checkpoint).is_err(),
+                "{label} history must fail closed"
+            );
+            transaction.commit().expect("history corrupt count commit");
+        }
+
+        let fixture = checkpoint_dispatch_fixture();
+        settle_checkpoint_history(&fixture);
+        assert_checkpoint_history_count(&fixture, 2);
+        fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history duplicate connection")
+            .execute(
+                "INSERT INTO research_reviews (
+                    review_id, campaign_id, experiment_id, task_signature, attempt,
+                    state, operation_stage, agent_run_id, context_json, context_digest,
+                    response_json, termination_request_id, successor_experiment_id,
+                    evidence_schema_version, session_generation, event_id, not_before,
+                    notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                    created_at, started_at, finished_at, updated_at
+                 )
+                 SELECT 'duplicate-history-review', campaign_id, experiment_id,
+                    task_signature, attempt, 'completed', NULL, agent_run_id,
+                    context_json, context_digest, response_json, termination_request_id,
+                    successor_experiment_id, evidence_schema_version, session_generation,
+                    event_id, not_before, notes_json, NULL, decision_cycle_id,
+                    checkpoint_json, created_at, started_at, 4_000, 4_000
+                 FROM research_reviews WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+            )
+            .expect("history duplicate row");
+        let mut connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history duplicate count connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("history duplicate count transaction");
+        assert!(checkpoint_same_spec_count(&transaction, &fixture.fixture.checkpoint).is_err());
+        transaction.commit().expect("history duplicate count commit");
+    }
+
+    #[test]
+    fn checkpoint_retry_history_rejects_missing_linked_checkpoint() {
+        let fixture = checkpoint_dispatch_fixture();
+        settle_checkpoint_history(&fixture);
+        assert_checkpoint_history_count(&fixture, 2);
+        fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history missing checkpoint connection")
+            .execute(
+                "UPDATE research_reviews SET checkpoint_json = NULL WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+            )
+            .expect("history missing checkpoint row");
+        let mut connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history missing checkpoint count connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("history missing checkpoint count transaction");
+        assert!(
+            checkpoint_same_spec_count(&transaction, &fixture.fixture.checkpoint).is_err(),
+            "missing linked checkpoint must fail closed"
+        );
+        transaction
+            .commit()
+            .expect("history missing checkpoint count commit");
+    }
+
+    #[test]
+    fn checkpoint_retry_history_rejects_foreign_campaign_link_instead_of_disappearing() {
+        let fixture = checkpoint_dispatch_fixture();
+        settle_checkpoint_history(&fixture);
+        assert_checkpoint_history_count(&fixture, 2);
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history foreign setup connection");
+        insert_foreign_campaign(&fixture, &connection);
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET campaign_id = 'checkpoint-foreign-campaign'
+                 WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+            )
+            .expect("history foreign review campaign");
+        drop(connection);
+        let mut connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("history foreign count connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("history foreign count transaction");
+        assert!(
+            checkpoint_same_spec_count(&transaction, &fixture.fixture.checkpoint).is_err(),
+            "foreign linked history must fail closed"
+        );
+        transaction.commit().expect("history foreign count commit");
+    }
+
+    #[test]
+    fn checkpoint_retry_insertion_attempt_stays_stable_after_later_same_spec_admission() {
+        let (fixture, _encoded, owner) = checkpoint_confirmed_fixture();
+        let limits = CampaignLimits::default();
+        let mut connection = fixture.db.connect().expect("attempt admission connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("attempt admission transaction");
+        let successor = match super::super::campaigns::accept_checkpoint_successor_in_transaction(
+            &transaction,
+            &owner,
+            &limits,
+            3_101,
+        )
+        .expect("attempt admission")
+        {
+            CheckpointSuccessorAdmission::Ready(intent) => intent,
+            other => panic!("unexpected attempt admission: {other:?}"),
+        };
+        let inserted_attempt = successor.experiment.attempt;
+        transaction.commit().expect("attempt admission commit");
+        assert_eq!(inserted_attempt, 1);
+
+        insert_limit_experiment(
+            &fixture,
+            "later-same-spec",
+            vec!["python".to_owned(), "train.py".to_owned()],
+            ".",
+            None,
+            3_102,
+        );
+        let mut connection = fixture.db.connect().expect("attempt replay connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("attempt replay transaction");
+        let replay_owner = match research_ownership_in_transaction(
+            &transaction,
+            &fixture.project_id,
+            &fixture.campaign_id,
+            &fixture.experiment_id,
+        )
+        .expect("attempt replay owner")
+        {
+            ResearchOwnership::Open(Some(owner)) => owner,
+            other => panic!("unexpected attempt replay owner: {other:?}"),
+        };
+        let replay = match super::super::campaigns::accept_checkpoint_successor_in_transaction(
+            &transaction,
+            &replay_owner,
+            &limits,
+            3_103,
+        )
+        .expect("attempt replay")
+        {
+            CheckpointSuccessorAdmission::Ready(intent) => intent,
+            other => panic!("unexpected attempt replay result: {other:?}"),
+        };
+        assert_eq!(replay.experiment.attempt, inserted_attempt);
+        transaction.commit().expect("attempt replay commit");
+    }
+
+    #[test]
+    fn checkpoint_intent_binds_checkpoint_and_termination_atomically() {
+        let fixture = source_authority_fixture();
+        let incident = Incident {
+            incident_id: 71,
+            project_id: fixture.project_id.clone(),
+            kind: "research_checkpoint".to_owned(),
+            task_key: Some(fixture.expected.owner.source_experiment_id.clone()),
+            fingerprint: "checkpoint-fingerprint".to_owned(),
+            status: IncidentStatus::Open,
+            first_seen_at: 3_100,
+            last_seen_at: 3_100,
+            acknowledged_at: None,
+            resolved_at: None,
+        };
+        let request = TerminationRequest {
+            request_id: 72,
+            incident_id: incident.incident_id,
+            project_id: fixture.project_id.clone(),
+            task_signature: fixture.expected.raw_task_signature.clone(),
+            reason: format!("research_action:{}:checkpoint", fixture.review_id),
+            status: TerminationRequestStatus::Confirmed,
+            requested_at: 3_100,
+            dispatch_lease_until: None,
+            grace_until: None,
+            confirmed_at: Some(3_101),
+            last_error: None,
+        };
+        let connection = fixture.db.connect().expect("checkpoint intent setup connection");
+        connection
+            .execute(
+                "INSERT INTO incidents (
+                    incident_id, project_id, kind, task_key, fingerprint, status,
+                    first_seen_at, last_seen_at, acknowledged_at, resolved_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL, NULL)",
+                rusqlite::params![
+                    incident.incident_id,
+                    incident.project_id,
+                    incident.kind,
+                    incident.task_key,
+                    incident.fingerprint,
+                    incident.status,
+                    incident.first_seen_at,
+                ],
+            )
+            .expect("checkpoint incident row");
+        connection
+            .execute(
+                "INSERT INTO termination_requests (
+                    request_id, incident_id, project_id, task_signature, reason,
+                    status, requested_at, dispatch_lease_until, grace_until,
+                    confirmed_at, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL)",
+                rusqlite::params![
+                    request.request_id,
+                    request.incident_id,
+                    request.project_id,
+                    request.task_signature,
+                    request.reason,
+                    request.status,
+                    request.requested_at,
+                    request.confirmed_at,
+                ],
+            )
+            .expect("checkpoint termination row");
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint)
+            .expect("checkpoint intent encoding");
+        let mut connection = connection;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("checkpoint intent transaction");
+        assert!(bind_checkpoint_termination_intent_in_transaction(
+            &transaction,
+            &fixture.expected,
+            &encoded,
+            &incident,
+            &request,
+            3_102,
+        )
+        .expect("checkpoint intent bind"));
+        transaction.commit().expect("checkpoint intent commit");
+        let stored: (String, String, i64) = connection
+            .query_row(
+                "SELECT operation_stage, checkpoint_json, termination_request_id
+                 FROM research_reviews WHERE review_id = ?1",
+                [&fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("checkpoint intent persisted row");
+        assert_eq!(stored.0, "intent");
+        assert_eq!(stored.1, encoded);
+        assert_eq!(stored.2, request.request_id);
+    }
+
+    #[test]
+    fn checkpoint_orphan_block_is_review_only_and_exact() {
+        let fixture = source_authority_fixture();
+        let mut connection = fixture.db.connect().expect("checkpoint orphan connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("checkpoint orphan transaction");
+        assert!(block_checkpoint_orphan_in_transaction(
+            &transaction,
+            &fixture.expected,
+            3_102,
+        )
+        .expect("checkpoint orphan block"));
+        let stored: (String, Option<String>, Option<String>) = transaction
+            .query_row(
+                "SELECT state, failure_code, checkpoint_json
+                 FROM research_reviews WHERE review_id = ?1",
+                [&fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("checkpoint orphan review");
+        assert_eq!(
+            stored,
+            (
+                "blocked".to_owned(),
+                Some("research_checkpoint_orphaned".to_owned()),
+                None,
+            )
+        );
+        let campaign_research_blocked: Option<String> = transaction
+            .query_row(
+                "SELECT blocked_reason FROM campaign_research WHERE campaign_id = ?1",
+                [&fixture.campaign_id],
+                |row| row.get(0),
+            )
+            .expect("checkpoint orphan campaign research");
+        assert!(campaign_research_blocked.is_none());
+        transaction.commit().expect("checkpoint orphan commit");
+    }
+
+    #[test]
+    fn invalid_checkpoint_review_block_preserves_corrupt_bytes() {
+        let fixture = source_authority_fixture();
+        let corrupt = b"checkpoint-corrupt-bytes".to_vec();
+        fixture
+            .db
+            .connect()
+            .expect("invalid checkpoint setup connection")
+            .execute(
+                "UPDATE research_reviews
+                 SET operation_stage = 'successor_reserved',
+                     successor_experiment_id = ?2,
+                     checkpoint_json = ?1
+                 WHERE review_id = ?3",
+                rusqlite::params![corrupt.clone(), fixture.experiment_id, fixture.review_id],
+            )
+            .expect("invalid checkpoint setup");
+        let review = ResearchRepository::new(&fixture.db)
+            .open_action_reviews(1)
+            .expect("invalid checkpoint open review")
+            .into_iter()
+            .next()
+            .expect("invalid checkpoint review");
+        let mut connection = fixture.db.connect().expect("invalid checkpoint connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("invalid checkpoint transaction");
+        assert!(block_invalid_checkpoint_review_in_transaction(
+            &transaction,
+            &review,
+            3_102,
+        )
+        .expect("invalid checkpoint block"));
+        transaction.commit().expect("invalid checkpoint commit");
+        let stored: (String, String, Vec<u8>) = fixture
+            .db
+            .connect()
+            .expect("invalid checkpoint final connection")
+            .query_row(
+                "SELECT state, typeof(checkpoint_json), CAST(checkpoint_json AS BLOB)
+                 FROM research_reviews WHERE review_id = ?1",
+                [&fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("invalid checkpoint final review");
+        assert_eq!(stored, ("blocked".to_owned(), "blob".to_owned(), corrupt));
+    }
+
+    #[test]
+    fn invalid_checkpoint_review_cas_rejects_stale_value_storage_and_identity() {
+        let fixture = source_authority_fixture();
+        let corrupt = "corrupt".to_owned();
+        fixture
+            .db
+            .connect()
+            .expect("bounded checkpoint setup connection")
+            .execute(
+                "UPDATE research_reviews
+                 SET operation_stage = 'successor_reserved',
+                     successor_experiment_id = ?2,
+                     checkpoint_json = ?1
+                 WHERE review_id = ?3",
+                rusqlite::params![corrupt, fixture.experiment_id, fixture.review_id],
+            )
+            .expect("bounded checkpoint setup");
+        let review = ResearchRepository::new(&fixture.db)
+            .open_action_reviews(1)
+            .expect("bounded checkpoint review list")
+            .into_iter()
+            .next()
+            .expect("bounded checkpoint review");
+        assert_eq!(review.checkpoint_json.as_deref(), Some("corrupt"));
+        let mut connection = fixture.db.connect().expect("bounded checkpoint CAS connection");
+        connection
+            .execute(
+                "UPDATE research_reviews SET checkpoint_json = 'changed'
+                 WHERE review_id = ?1",
+                [&fixture.review_id],
+            )
+            .expect("bounded checkpoint stale value");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("bounded checkpoint CAS transaction");
+        assert!(!block_invalid_checkpoint_review_in_transaction(
+            &transaction,
+            &review,
+            3_102,
+        )
+        .expect("bounded checkpoint stale CAS"));
+        let stored: (String, String) = transaction
+            .query_row(
+                "SELECT state, checkpoint_json FROM research_reviews WHERE review_id = ?1",
+                [&fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("bounded checkpoint stale result");
+        assert_eq!(stored, ("ready".to_owned(), "changed".to_owned()));
+        transaction.commit().expect("bounded checkpoint stale commit");
+
+        let fixture = source_authority_fixture();
+        let corrupt = vec![1_u8, 2, 3];
+        fixture
+            .db
+            .connect()
+            .expect("invalid storage setup connection")
+            .execute(
+                "UPDATE research_reviews
+                 SET operation_stage = 'successor_reserved',
+                     successor_experiment_id = ?2,
+                     checkpoint_json = ?1
+                 WHERE review_id = ?3",
+                rusqlite::params![corrupt, fixture.experiment_id, fixture.review_id],
+            )
+            .expect("invalid storage setup");
+        let review = ResearchRepository::new(&fixture.db)
+            .open_action_reviews(1)
+            .expect("invalid storage review list")
+            .into_iter()
+            .next()
+            .expect("invalid storage review");
+        assert_eq!(
+            review.checkpoint_json_state,
+            CheckpointJsonState::Invalid {
+                storage_class: CheckpointSqliteStorageClass::Blob,
+                byte_len: Some(3),
+            }
+        );
+        let mut connection = fixture.db.connect().expect("invalid storage CAS connection");
+        connection
+            .execute(
+                "UPDATE research_reviews SET checkpoint_json = zeroblob(4)
+                 WHERE review_id = ?1",
+                [&fixture.review_id],
+            )
+            .expect("invalid storage stale value");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("invalid storage CAS transaction");
+        assert!(!block_invalid_checkpoint_review_in_transaction(
+            &transaction,
+            &review,
+            3_102,
+        )
+        .expect("invalid storage stale CAS"));
+        let stored: (String, String, i64) = transaction
+            .query_row(
+                "SELECT state, typeof(checkpoint_json), length(CAST(checkpoint_json AS BLOB))
+                 FROM research_reviews WHERE review_id = ?1",
+                [&fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("invalid storage stale result");
+        assert_eq!(stored, ("ready".to_owned(), "blob".to_owned(), 4));
+        transaction.commit().expect("invalid storage stale commit");
+
+        let fixture = source_authority_fixture();
+        fixture
+            .db
+            .connect()
+            .expect("identity setup connection")
+            .execute(
+                "UPDATE research_reviews
+                 SET operation_stage = 'successor_reserved',
+                     successor_experiment_id = ?2,
+                     checkpoint_json = X'0102'
+                 WHERE review_id = ?3",
+                rusqlite::params![fixture.experiment_id, fixture.experiment_id, fixture.review_id],
+            )
+            .expect("identity setup");
+        let review = ResearchRepository::new(&fixture.db)
+            .open_action_reviews(1)
+            .expect("identity review list")
+            .into_iter()
+            .next()
+            .expect("identity review");
+        let mut connection = fixture.db.connect().expect("identity CAS connection");
+        connection
+            .execute(
+                "UPDATE research_reviews SET session_generation = session_generation + 1
+                 WHERE review_id = ?1",
+                [&fixture.review_id],
+            )
+            .expect("identity stale generation");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("identity CAS transaction");
+        assert!(!block_invalid_checkpoint_review_in_transaction(
+            &transaction,
+            &review,
+            3_102,
+        )
+        .expect("identity stale CAS"));
+        let state: String = transaction
+            .query_row(
+                "SELECT state FROM research_reviews WHERE review_id = ?1",
+                [&fixture.review_id],
+                |row| row.get(0),
+            )
+            .expect("identity stale result");
+        assert_eq!(state, "ready");
+        transaction.commit().expect("identity stale commit");
+    }
+
+    #[test]
+    fn checkpoint_orphan_cas_rejects_changed_action_authority_without_mutation() {
+        let fixture = source_authority_fixture();
+        let mut connection = fixture.db.connect().expect("orphan stale connection");
+        connection
+            .execute(
+                "UPDATE research_reviews SET notes_json = '{\"stale\":true}'
+                 WHERE review_id = ?1",
+                [&fixture.review_id],
+            )
+            .expect("orphan stale notes");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("orphan stale transaction");
+        assert!(!block_checkpoint_orphan_in_transaction(
+            &transaction,
+            &fixture.expected,
+            3_102,
+        )
+        .expect("orphan stale CAS"));
+        let stored: (String, String) = transaction
+            .query_row(
+                "SELECT state, notes_json FROM research_reviews WHERE review_id = ?1",
+                [&fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("orphan stale result");
+        assert_eq!(stored, ("ready".to_owned(), "{\"stale\":true}".to_owned()));
+        transaction.commit().expect("orphan stale commit");
+    }
+
+    #[test]
+    fn checkpoint_dispatch_partial_successor_graph_blocks_only_review() {
+        let fixture = checkpoint_dispatch_fixture();
+        fixture
+            .fixture
+            .db
+            .connect()
+            .expect("partial graph connection")
+            .execute(
+                "DELETE FROM budget_reservations
+                 WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                [&fixture.authority.successor_experiment_id],
+            )
+            .expect("partial graph reservation removal");
+        let selection = ResearchRepository::new(&fixture.fixture.db)
+            .checkpoint_dispatch_authority(
+                &fixture.fixture.project_id,
+                &fixture.authority.successor_experiment_id,
+                3_104,
+            )
+            .expect("partial graph dispatch classification");
+        assert!(matches!(selection, CheckpointDispatchSelection::Blocked));
+        let stored: (String, String, i64) = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("partial graph result connection")
+            .query_row(
+                "SELECT state, failure_code,
+                        (SELECT COUNT(*) FROM budget_reservations
+                         WHERE experiment_id = ?2 AND dimension = 'experiment')
+                 FROM research_reviews WHERE review_id = ?1",
+                rusqlite::params![fixture.fixture.review_id, fixture.authority.successor_experiment_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("partial graph result");
+        assert_eq!(
+            stored,
+            (
+                "blocked".to_owned(),
+                "research_checkpoint_authority_corrupt".to_owned(),
+                0,
+            )
+        );
+    }
+
+    #[test]
+    fn checkpoint_dispatch_duplicate_global_reservation_blocks_only_review() {
+        let fixture = checkpoint_dispatch_fixture();
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("duplicate reservation connection");
+        insert_foreign_campaign(&fixture, &connection);
+        connection
+            .execute(
+                "INSERT INTO budget_reservations (
+                    reservation_id, campaign_id, experiment_id, dimension,
+                    subject_key, status, window_started_at, window_ends_at,
+                    created_at, updated_at
+                 ) VALUES (?1, 'checkpoint-foreign-campaign',
+                           ?2, 'experiment', ?2,
+                           'reserved', 3_102, 3_202, 3_102, 3_102)",
+                rusqlite::params![
+                    format!("duplicate:{}", fixture.authority.successor_experiment_id),
+                    fixture.authority.successor_experiment_id,
+                ],
+            )
+            .expect("duplicate global reservation");
+        drop(connection);
+        let selection = ResearchRepository::new(&fixture.fixture.db)
+            .checkpoint_dispatch_authority(
+                &fixture.fixture.project_id,
+                &fixture.authority.successor_experiment_id,
+                3_104,
+            )
+            .expect("duplicate graph dispatch classification");
+        assert!(matches!(selection, CheckpointDispatchSelection::Blocked));
+        let state: String = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("duplicate graph result connection")
+            .query_row(
+                "SELECT state FROM research_reviews WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+                |row| row.get(0),
+            )
+            .expect("duplicate graph result");
+        assert_eq!(state, "blocked");
+    }
+
+    #[test]
+    fn checkpoint_dispatch_ignores_malformed_foreign_native_owner() {
+        let fixture = checkpoint_dispatch_fixture();
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("foreign native owner connection");
+        insert_foreign_campaign(&fixture, &connection);
+        connection
+            .execute(
+                "INSERT INTO events (
+                    event_id, project_id, kind, dedup_key, payload_json, status,
+                    attempts, not_before, lease_until, created_at,
+                    completed_at, last_error
+                 ) VALUES (?1, 'checkpoint-foreign-project', 'operator_wake',
+                           'foreign-native-owner', '{}', 'pending', 0, 900, NULL,
+                           900, NULL, NULL)",
+                [99_001_i64],
+            )
+            .expect("foreign native owner event");
+        connection
+            .execute(
+                "INSERT INTO agent_runs (
+                    run_id, project_id, primary_event_id, pid, status, started_at,
+                    finished_at, exit_code, log_path, last_error, launch_gate_state,
+                    context_mode, context_session_id, context_lineage_json,
+                    execution_kind, executable_path, executable_identity,
+                    policy_code, failure_stage
+                 ) VALUES (99_001, 'checkpoint-foreign-project', 99_001, NULL, 1,
+                           900, NULL, NULL, '/tmp/foreign-native-owner.log', NULL,
+                           'released', 'fresh', NULL, '[]', 'campaign_research',
+                           '/bin/sh', 'malformed', NULL, NULL)",
+                [],
+            )
+            .expect("foreign malformed native owner");
+        drop(connection);
+
+        let selection = ResearchRepository::new(&fixture.fixture.db)
+            .checkpoint_dispatch_authority(
+                &fixture.fixture.project_id,
+                &fixture.authority.successor_experiment_id,
+                3_104,
+            )
+            .expect("target dispatch must ignore foreign malformed owner");
+        assert!(matches!(selection, CheckpointDispatchSelection::Ready(_)));
+    }
+
+    #[test]
+    fn checkpoint_dispatch_claim_cardinality_and_list_before_block_are_fail_closed() {
+        let fixture = checkpoint_dispatch_fixture();
+        fixture
+            .fixture
+            .db
+            .connect()
+            .expect("zero claim connection")
+            .execute(
+                "UPDATE research_reviews
+                 SET checkpoint_json = NULL, operation_stage = NULL,
+                     successor_experiment_id = NULL
+                 WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+            )
+            .expect("zero claim mutation");
+        assert!(matches!(
+            ResearchRepository::new(&fixture.fixture.db)
+                .checkpoint_dispatch_authority(
+                    &fixture.fixture.project_id,
+                    &fixture.authority.successor_experiment_id,
+                    3_104,
+                )
+                .expect("zero claim selection"),
+            CheckpointDispatchSelection::NotCheckpoint
+        ));
+
+        let fixture = checkpoint_dispatch_fixture();
+        fixture
+            .fixture
+            .db
+            .connect()
+            .expect("missing marker connection")
+            .execute(
+                "UPDATE research_reviews SET checkpoint_json = NULL
+                 WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+            )
+            .expect("missing marker mutation");
+        assert!(matches!(
+            ResearchRepository::new(&fixture.fixture.db)
+                .checkpoint_dispatch_authority(
+                    &fixture.fixture.project_id,
+                    &fixture.authority.successor_experiment_id,
+                    3_104,
+                )
+                .expect("missing marker selection"),
+            CheckpointDispatchSelection::Blocked
+        ));
+        assert!(ExperimentRepository::new(&fixture.fixture.db)
+            .begin_submitting_or_defer(&fixture.authority.successor_experiment_id, 3_105)
+            .is_err());
+        let missing_marker_state: String = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("missing marker result connection")
+            .query_row(
+                "SELECT state FROM research_reviews WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+                |row| row.get(0),
+            )
+            .expect("missing marker result");
+        assert_eq!(missing_marker_state, "blocked");
+
+        let fixture = checkpoint_dispatch_fixture();
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("missing marker hybrid connection");
+        connection
+            .execute(
+                "INSERT INTO decision_cycles (
+                    cycle_id, campaign_id, source_experiment_id, state,
+                    next_wake_at, consecutive_failed_attempts, last_decision_kind,
+                    last_failure_code, last_failure_summary, created_at, updated_at,
+                    source_terminal_at
+                 ) VALUES (?1, ?2, ?3, 'pending', NULL, 0, NULL, NULL, NULL, 3_100, 3_100, 1)",
+                rusqlite::params![
+                    "checkpoint-hybrid-cycle",
+                    fixture.fixture.campaign_id,
+                    fixture.fixture.experiment_id,
+                ],
+            )
+            .expect("missing marker hybrid decision cycle");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET checkpoint_json = NULL, decision_cycle_id = ?1
+                 WHERE review_id = ?2",
+                rusqlite::params!["checkpoint-hybrid-cycle", fixture.fixture.review_id],
+            )
+            .expect("missing marker hybrid mutation");
+        assert!(matches!(
+            ResearchRepository::new(&fixture.fixture.db)
+                .checkpoint_dispatch_authority(
+                    &fixture.fixture.project_id,
+                    &fixture.authority.successor_experiment_id,
+                    3_104,
+                )
+                .expect("missing marker hybrid selection"),
+            CheckpointDispatchSelection::Blocked
+        ));
+
+        let fixture = checkpoint_dispatch_fixture();
+        fixture
+            .fixture
+            .db
+            .connect()
+            .expect("completed missing marker connection")
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', operation_stage = NULL,
+                     checkpoint_json = NULL, decision_cycle_id = NULL
+                 WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+            )
+            .expect("completed missing marker mutation");
+        assert!(ResearchRepository::new(&fixture.fixture.db)
+            .checkpoint_dispatch_authority(
+                &fixture.fixture.project_id,
+                &fixture.authority.successor_experiment_id,
+                3_104,
+            )
+            .is_err());
+
+        let fixture = checkpoint_dispatch_fixture();
+        let one = ResearchRepository::new(&fixture.fixture.db)
+            .checkpoint_dispatch_authority(
+                &fixture.fixture.project_id,
+                &fixture.authority.successor_experiment_id,
+                3_104,
+            )
+            .expect("one claim selection");
+        assert!(matches!(one, CheckpointDispatchSelection::Ready(_)));
+
+        let fixture = checkpoint_dispatch_fixture();
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("two claim connection");
+        connection
+            .execute(
+                "INSERT INTO research_reviews (
+                    review_id, campaign_id, experiment_id, task_signature, attempt,
+                    state, operation_stage, agent_run_id, context_json, context_digest,
+                    response_json, termination_request_id, successor_experiment_id,
+                    evidence_schema_version, session_generation, event_id, not_before,
+                    notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                    created_at, started_at, finished_at, updated_at
+                 )
+                 SELECT 'checkpoint-duplicate-claim', campaign_id, experiment_id,
+                        task_signature, attempt, 'completed', NULL, agent_run_id,
+                        context_json, context_digest, response_json,
+                        termination_request_id, successor_experiment_id,
+                        evidence_schema_version, session_generation, event_id,
+                        not_before, notes_json, failure_code, decision_cycle_id,
+                        checkpoint_json, created_at, started_at, finished_at, updated_at
+                 FROM research_reviews WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+            )
+            .expect("two claims mutation");
+        drop(connection);
+        let before: String = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("two claims before connection")
+            .query_row(
+                "SELECT state FROM research_reviews WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+                |row| row.get(0),
+            )
+            .expect("two claims before state");
+        assert!(ResearchRepository::new(&fixture.fixture.db)
+            .checkpoint_dispatch_authority(
+                &fixture.fixture.project_id,
+                &fixture.authority.successor_experiment_id,
+                3_104,
+            )
+            .is_err());
+        let after: String = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("two claims after connection")
+            .query_row(
+                "SELECT state FROM research_reviews WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+                |row| row.get(0),
+            )
+            .expect("two claims after state");
+        assert_eq!(after, before);
+
+        let fixture = checkpoint_dispatch_fixture();
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("foreign claim connection");
+        insert_foreign_campaign(&fixture, &connection);
+        connection
+            .execute(
+                "UPDATE research_reviews SET campaign_id = 'checkpoint-foreign-campaign'
+                 WHERE review_id = ?1",
+                [&fixture.fixture.review_id],
+            )
+            .expect("foreign claim mutation");
+        drop(connection);
+        assert!(ResearchRepository::new(&fixture.fixture.db)
+            .checkpoint_dispatch_authority(
+                &fixture.fixture.project_id,
+                &fixture.authority.successor_experiment_id,
+                3_104,
+            )
+            .is_err());
+
+        let fixture = checkpoint_dispatch_fixture();
+        let authority = match ResearchRepository::new(&fixture.fixture.db)
+            .checkpoint_dispatch_authority(
+                &fixture.fixture.project_id,
+                &fixture.authority.successor_experiment_id,
+                3_104,
+            )
+            .expect("list-before-block selection")
+        {
+            CheckpointDispatchSelection::Ready(authority) => authority,
+            other => panic!("unexpected list-before-block selection: {other:?}"),
+        };
+        let mut connection = fixture.fixture.db.connect().expect("list-before-block mutation");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("list-before-block transaction");
+        assert!(block_checkpoint_dispatch_review(
+            &transaction,
+            &fixture.fixture.review_id,
+            &fixture.fixture.campaign_id,
+            &fixture.fixture.experiment_id,
+            &fixture.fixture.expected.owner.managed_task_signature,
+            fixture.fixture.expected.owner.attempt,
+            3_105,
+        )
+        .expect("list-before-block mutation"));
+        transaction.commit().expect("list-before-block commit");
+        assert!(ExperimentRepository::new(&fixture.fixture.db)
+            .begin_checkpoint_submitting_or_defer(&authority, 3_106)
+            .is_err());
+    }
+
+    #[test]
+    fn checkpoint_dispatch_rejects_decision_cycle_hybrid_and_stale_cas() {
+        let fixture = checkpoint_dispatch_fixture();
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("checkpoint cycle hybrid connection");
+        attach_checkpoint_decision_cycle(&fixture, &connection);
+        drop(connection);
+        let before = checkpoint_graph_snapshot(&fixture);
+        assert!(matches!(
+            ResearchRepository::new(&fixture.fixture.db)
+                .checkpoint_dispatch_authority(
+                    &fixture.fixture.project_id,
+                    &fixture.authority.successor_experiment_id,
+                    3_104,
+                )
+                .expect("checkpoint cycle hybrid dispatch"),
+            CheckpointDispatchSelection::Blocked
+        ));
+        let after = checkpoint_graph_snapshot(&fixture);
+        assert_eq!(after.proposal, before.proposal);
+        assert_eq!(after.submission, before.submission);
+        assert_eq!(after.experiment, before.experiment);
+        assert_eq!(after.reservation, before.reservation);
+        assert_eq!(after.termination, before.termination);
+        assert_eq!(after.resource_counts, before.resource_counts);
+        assert_eq!(after.review[0], rusqlite::types::Value::Text("blocked".to_owned()));
+        assert_eq!(after.review[3], before.review[3]);
+        assert_eq!(after.review[5], before.review[5]);
+
+        let fixture = checkpoint_dispatch_fixture();
+        let authority = match ResearchRepository::new(&fixture.fixture.db)
+            .checkpoint_dispatch_authority(
+                &fixture.fixture.project_id,
+                &fixture.authority.successor_experiment_id,
+                3_104,
+            )
+            .expect("checkpoint cycle stale authority selection")
+        {
+            CheckpointDispatchSelection::Ready(authority) => authority,
+            other => panic!("unexpected checkpoint cycle authority: {other:?}"),
+        };
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("checkpoint cycle stale connection");
+        attach_checkpoint_decision_cycle(&fixture, &connection);
+        drop(connection);
+        let before = checkpoint_graph_snapshot(&fixture);
+        assert!(ExperimentRepository::new(&fixture.fixture.db)
+            .begin_checkpoint_submitting_or_defer(&authority, 3_105)
+            .is_err());
+        let after = checkpoint_graph_snapshot(&fixture);
+        assert_eq!(after.proposal, before.proposal);
+        assert_eq!(after.submission, before.submission);
+        assert_eq!(after.experiment, before.experiment);
+        assert_eq!(after.reservation, before.reservation);
+        assert_eq!(after.termination, before.termination);
+        assert_eq!(after.resource_counts, before.resource_counts);
+        assert_eq!(after.review, before.review);
+
+        let fixture = checkpoint_dispatch_fixture();
+        let connection = fixture
+            .fixture
+            .db
+            .connect()
+            .expect("checkpoint cycle history connection");
+        attach_checkpoint_decision_cycle(&fixture, &connection);
+        drop(connection);
+        let mut connection = fixture.fixture.db.connect().expect("checkpoint cycle history read");
+        let transaction = connection
+            .transaction()
+            .expect("checkpoint cycle history transaction");
+        assert!(checkpoint_same_spec_count(&transaction, &fixture.fixture.checkpoint).is_err());
+    }
+
+    #[test]
+    fn checkpoint_prepared_intent_caller_rollback_removes_rows_after_authority_mutation() {
+        let fixture = source_authority_fixture();
+        let incident = Incident {
+            incident_id: 171,
+            project_id: fixture.project_id.clone(),
+            kind: "research_checkpoint".to_owned(),
+            task_key: Some(fixture.expected.owner.source_experiment_id.clone()),
+            fingerprint: "checkpoint-rollback-fingerprint".to_owned(),
+            status: IncidentStatus::Open,
+            first_seen_at: 3_100,
+            last_seen_at: 3_100,
+            acknowledged_at: None,
+            resolved_at: None,
+        };
+        let request = TerminationRequest {
+            request_id: 172,
+            incident_id: incident.incident_id,
+            project_id: fixture.project_id.clone(),
+            task_signature: fixture.expected.raw_task_signature.clone(),
+            reason: format!("research_action:{}:checkpoint", fixture.review_id),
+            status: TerminationRequestStatus::Confirmed,
+            requested_at: 3_100,
+            dispatch_lease_until: None,
+            grace_until: None,
+            confirmed_at: Some(3_101),
+            last_error: None,
+        };
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint)
+            .expect("checkpoint rollback encoding");
+        let mut connection = fixture.db.connect().expect("checkpoint rollback connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("checkpoint rollback transaction");
+        transaction
+            .execute(
+                "INSERT INTO incidents (
+                    incident_id, project_id, kind, task_key, fingerprint, status,
+                    first_seen_at, last_seen_at, acknowledged_at, resolved_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL, NULL)",
+                rusqlite::params![
+                    incident.incident_id,
+                    incident.project_id,
+                    incident.kind,
+                    incident.task_key,
+                    incident.fingerprint,
+                    incident.status,
+                    incident.first_seen_at,
+                ],
+            )
+            .expect("checkpoint rollback incident");
+        transaction
+            .execute(
+                "INSERT INTO termination_requests (
+                    request_id, incident_id, project_id, task_signature, reason,
+                    status, requested_at, dispatch_lease_until, grace_until,
+                    confirmed_at, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL)",
+                rusqlite::params![
+                    request.request_id,
+                    request.incident_id,
+                    request.project_id,
+                    request.task_signature,
+                    request.reason,
+                    request.status,
+                    request.requested_at,
+                    request.confirmed_at,
+                ],
+            )
+            .expect("checkpoint rollback request");
+        assert!(bind_checkpoint_termination_intent_in_transaction(
+            &transaction,
+            &fixture.expected,
+            &encoded,
+            &incident,
+            &request,
+            3_102,
+        )
+        .expect("checkpoint rollback bind"));
+        transaction
+            .execute(
+                "UPDATE research_reviews SET response_json = ?1 WHERE review_id = ?2",
+                rusqlite::params!["{\"mutated_after_bind\":true}", fixture.review_id],
+            )
+            .expect("checkpoint rollback authority mutation");
+        transaction.rollback().expect("checkpoint rollback transaction rollback");
+
+        let connection = fixture.db.connect().expect("checkpoint rollback result connection");
+        let counts: (i64, i64) = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM incidents WHERE incident_id = ?1),
+                    (SELECT COUNT(*) FROM termination_requests WHERE request_id = ?2)",
+                rusqlite::params![incident.incident_id, request.request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("checkpoint rollback counts");
+        assert_eq!(counts, (0, 0));
+        let review: (Option<String>, Option<String>, Option<i64>) = connection
+            .query_row(
+                "SELECT operation_stage, checkpoint_json, termination_request_id
+                 FROM research_reviews WHERE review_id = ?1",
+                [&fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("checkpoint rollback review");
+        assert_eq!(review, (None, None, None));
+    }
+
+    #[test]
+    fn checkpoint_successor_reserve_dispatch_and_pre_add_failure_are_atomic() {
+        let fixture = source_authority_fixture();
+        let incident = Incident {
+            incident_id: 81,
+            project_id: fixture.project_id.clone(),
+            kind: "research_checkpoint".to_owned(),
+            task_key: Some(fixture.expected.owner.source_experiment_id.clone()),
+            fingerprint: "checkpoint-fingerprint-2".to_owned(),
+            status: IncidentStatus::Open,
+            first_seen_at: 3_100,
+            last_seen_at: 3_100,
+            acknowledged_at: None,
+            resolved_at: None,
+        };
+        let request = TerminationRequest {
+            request_id: 82,
+            incident_id: incident.incident_id,
+            project_id: fixture.project_id.clone(),
+            task_signature: fixture.expected.raw_task_signature.clone(),
+            reason: format!("research_action:{}:checkpoint", fixture.review_id),
+            status: TerminationRequestStatus::Confirmed,
+            requested_at: 3_100,
+            dispatch_lease_until: None,
+            grace_until: None,
+            confirmed_at: Some(3_101),
+            last_error: None,
+        };
+        let connection = fixture.db.connect().expect("checkpoint successor setup connection");
+        connection
+            .execute(
+                "INSERT INTO incidents (
+                    incident_id, project_id, kind, task_key, fingerprint, status,
+                    first_seen_at, last_seen_at, acknowledged_at, resolved_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL, NULL)",
+                rusqlite::params![
+                    incident.incident_id,
+                    incident.project_id,
+                    incident.kind,
+                    incident.task_key,
+                    incident.fingerprint,
+                    incident.status,
+                    incident.first_seen_at,
+                ],
+            )
+            .expect("checkpoint successor incident");
+        connection
+            .execute(
+                "INSERT INTO termination_requests (
+                    request_id, incident_id, project_id, task_signature, reason,
+                    status, requested_at, dispatch_lease_until, grace_until,
+                    confirmed_at, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL)",
+                rusqlite::params![
+                    request.request_id,
+                    request.incident_id,
+                    request.project_id,
+                    request.task_signature,
+                    request.reason,
+                    request.status,
+                    request.requested_at,
+                    request.confirmed_at,
+                ],
+            )
+            .expect("checkpoint successor termination");
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint)
+            .expect("checkpoint successor encoding");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET checkpoint_json = ?1, operation_stage = 'stop_confirmed',
+                     termination_request_id = ?2
+                 WHERE review_id = ?3",
+                rusqlite::params![encoded, request.request_id, fixture.review_id],
+            )
+            .expect("checkpoint successor confirmed review");
+        drop(connection);
+
+        let mut owner = fixture.expected.owner.clone();
+        owner.operation_stage = Some("stop_confirmed".to_owned());
+        owner.termination_request_id = Some(request.request_id);
+        fixture
+            .db
+            .connect()
+            .expect("checkpoint paused campaign connection")
+            .execute(
+                "UPDATE campaigns SET state = 'paused' WHERE campaign_id = ?1",
+                [&fixture.campaign_id],
+            )
+            .expect("checkpoint pause campaign");
+        let mut connection = fixture
+            .db
+            .connect()
+            .expect("checkpoint paused admission connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("checkpoint paused admission transaction");
+        assert_eq!(
+            super::super::campaigns::accept_checkpoint_successor_in_transaction(
+                &transaction,
+                &owner,
+                &CampaignLimits::default(),
+                3_101,
+            )
+            .expect("checkpoint paused admission"),
+            CheckpointSuccessorAdmission::Deferred
+        );
+        transaction.commit().expect("checkpoint paused admission commit");
+        let successor_count: i64 = fixture
+            .db
+            .connect()
+            .expect("checkpoint paused count connection")
+            .query_row(
+                "SELECT COUNT(*) FROM experiments WHERE experiment_id = ?1",
+                [&fixture.checkpoint.successor_ids.experiment_id],
+                |row| row.get(0),
+            )
+            .expect("checkpoint paused successor count");
+        assert_eq!(successor_count, 0);
+        fixture
+            .db
+            .connect()
+            .expect("checkpoint resume campaign connection")
+            .execute(
+                "UPDATE campaigns SET state = 'active' WHERE campaign_id = ?1",
+                [&fixture.campaign_id],
+            )
+            .expect("checkpoint resume campaign");
+        let mut connection = fixture.db.connect().expect("checkpoint successor transaction connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("checkpoint successor transaction");
+        let admission = super::super::campaigns::accept_checkpoint_successor_in_transaction(
+            &transaction,
+            &owner,
+            &CampaignLimits::default(),
+            3_102,
+        )
+        .expect("checkpoint successor admission");
+        let successor = match admission {
+            CheckpointSuccessorAdmission::Ready(intent) => intent,
+            other => panic!("unexpected checkpoint successor admission: {other:?}"),
+        };
+        transaction.commit().expect("checkpoint successor commit");
+        assert_eq!(
+            successor.experiment.experiment_id,
+            fixture.checkpoint.successor_ids.experiment_id
+        );
+        let original_proposal: (String, String) = fixture
+            .db
+            .connect()
+            .expect("checkpoint proposal snapshot connection")
+            .query_row(
+                "SELECT hypothesis, canonical_digest FROM proposals WHERE proposal_id = ?1",
+                [&fixture.checkpoint.successor_ids.proposal_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("checkpoint proposal snapshot");
+
+        let mut connection = fixture
+            .db
+            .connect()
+            .expect("checkpoint successor replay connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("checkpoint successor replay transaction");
+        let replay_owner = match research_ownership_in_transaction(
+            &transaction,
+            &fixture.project_id,
+            &fixture.campaign_id,
+            &fixture.experiment_id,
+        )
+        .expect("checkpoint successor replay owner")
+        {
+            ResearchOwnership::Open(Some(owner)) => owner,
+            other => panic!("unexpected checkpoint successor replay owner: {other:?}"),
+        };
+        assert_eq!(
+            replay_owner.operation_stage.as_deref(),
+            Some("successor_reserved")
+        );
+        assert!(matches!(
+            super::super::campaigns::accept_checkpoint_successor_in_transaction(
+                &transaction,
+                &replay_owner,
+                &CampaignLimits::default(),
+                3_103,
+            )
+            .expect("checkpoint successor replay"),
+            CheckpointSuccessorAdmission::Ready(_)
+        ));
+        transaction.commit().expect("checkpoint successor replay commit");
+
+        fixture
+            .db
+            .connect()
+            .expect("checkpoint partial replay mutation connection")
+            .execute(
+                "UPDATE proposals SET hypothesis = ?1 WHERE proposal_id = ?2",
+                rusqlite::params![
+                    "partial replay mutation",
+                    fixture.checkpoint.successor_ids.proposal_id,
+                ],
+            )
+            .expect("checkpoint partial replay mutation");
+        let mut connection = fixture
+            .db
+            .connect()
+            .expect("checkpoint partial replay transaction connection");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("checkpoint partial replay transaction");
+        assert!(matches!(
+            super::super::campaigns::accept_checkpoint_successor_in_transaction(
+                &transaction,
+                &replay_owner,
+                &CampaignLimits::default(),
+                3_104,
+            )
+            .expect("checkpoint partial replay classification"),
+            CheckpointSuccessorAdmission::Blocked
+        ));
+        transaction.commit().expect("checkpoint partial replay commit");
+        let blocked_replay: String = fixture
+            .db
+            .connect()
+            .expect("checkpoint partial replay review connection")
+            .query_row(
+                "SELECT failure_code FROM research_reviews WHERE review_id = ?1",
+                [&fixture.review_id],
+                |row| row.get(0),
+            )
+            .expect("checkpoint partial replay review");
+        assert_eq!(blocked_replay, "research_checkpoint_authority_corrupt");
+        fixture
+            .db
+            .connect()
+            .expect("checkpoint partial replay restore connection")
+            .execute(
+                "UPDATE proposals SET hypothesis = ?1, canonical_digest = ?2
+                 WHERE proposal_id = ?3",
+                rusqlite::params![
+                    original_proposal.0,
+                    original_proposal.1,
+                    fixture.checkpoint.successor_ids.proposal_id,
+                ],
+            )
+            .expect("checkpoint partial replay proposal restore");
+        fixture
+            .db
+            .connect()
+            .expect("checkpoint partial replay review restore connection")
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'ready', failure_code = NULL,
+                     finished_at = NULL, not_before = ?1
+                 WHERE review_id = ?2",
+                rusqlite::params![3_104, fixture.review_id],
+            )
+            .expect("checkpoint partial replay review restore");
+
+        let repository = ResearchRepository::new(&fixture.db);
+        let selection = repository
+            .checkpoint_dispatch_authority(
+                &fixture.project_id,
+                &fixture.checkpoint.successor_ids.experiment_id,
+                3_103,
+            )
+            .expect("checkpoint dispatch authority");
+        let authority = match selection {
+            CheckpointDispatchSelection::Ready(authority) => authority,
+            other => panic!("unexpected checkpoint dispatch selection: {other:?}"),
+        };
+        let experiment_repository = ExperimentRepository::new(&fixture.db);
+        fixture
+            .db
+            .connect()
+            .expect("checkpoint proposal mutation connection")
+            .execute(
+                "UPDATE proposals SET hypothesis = ?1 WHERE proposal_id = ?2",
+                rusqlite::params![
+                    "mutated after checkpoint dispatch witness",
+                    fixture.checkpoint.successor_ids.proposal_id,
+                ],
+            )
+            .expect("checkpoint proposal mutation");
+        assert!(experiment_repository
+            .begin_checkpoint_submitting_or_defer(&authority, 3_104)
+            .is_err());
+        let connection = fixture
+            .db
+            .connect()
+            .expect("checkpoint proposal restore connection");
+        connection
+            .execute(
+                "UPDATE proposals SET hypothesis = ?1, canonical_digest = ?2
+                 WHERE proposal_id = ?3",
+                rusqlite::params![
+                    original_proposal.0,
+                    original_proposal.1,
+                    fixture.checkpoint.successor_ids.proposal_id,
+                ],
+            )
+            .expect("checkpoint proposal restore");
+        let submitting = experiment_repository
+            .begin_checkpoint_submitting_or_defer(&authority, 3_104)
+            .expect("checkpoint submitting CAS")
+            .expect("checkpoint submitting transition");
+        assert_eq!(submitting.status, ExperimentStatus::Submitting);
+        experiment_repository
+            .fail_checkpoint_before_add(
+                &authority,
+                "research_checkpoint_verification_failed",
+                3_105,
+            )
+            .expect("checkpoint pre-add failure");
+        experiment_repository
+            .fail_checkpoint_before_add(
+                &authority,
+                "research_checkpoint_verification_failed",
+                3_106,
+            )
+            .expect("checkpoint pre-add idempotence");
+        let connection = fixture.db.connect().expect("checkpoint successor final connection");
+        let final_state: (String, String, String, String, String) = connection
+            .query_row(
+                "SELECT review.state, experiment.status, submission.status,
+                        reservation.status, review.checkpoint_json
+                 FROM research_reviews AS review
+                 JOIN experiments AS experiment
+                   ON experiment.experiment_id = review.successor_experiment_id
+                 JOIN submissions AS submission
+                   ON submission.submission_id = experiment.submission_id
+                 JOIN budget_reservations AS reservation
+                   ON reservation.experiment_id = experiment.experiment_id
+                  AND reservation.dimension = 'experiment'
+                 WHERE review.review_id = ?1",
+                [&fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("checkpoint successor final graph");
+        assert_eq!(final_state.0, "blocked");
+        assert_eq!(final_state.1, "failed");
+        assert_eq!(final_state.2, "failed");
+        assert_eq!(final_state.3, "consumed");
+        assert_eq!(final_state.4, encoded);
+    }
+
+    fn assert_checkpoint_pre_add_failure_shape(label: &str, begin_submitting: bool) {
+        let prepared = checkpoint_dispatch_fixture();
+        let fixture = &prepared.fixture;
+        let experiment_repository = ExperimentRepository::new(&fixture.db);
+        if begin_submitting {
+            let submitting = experiment_repository
+                .begin_checkpoint_submitting_or_defer(&prepared.authority, 3_104)
+                .expect("checkpoint submitting CAS")
+                .expect("checkpoint submitting transition");
+            assert_eq!(submitting.status, ExperimentStatus::Submitting);
+        }
+        experiment_repository
+            .fail_checkpoint_before_add(
+                &prepared.authority,
+                "research_checkpoint_verification_failed",
+                3_105,
+            )
+            .expect("checkpoint pre-add failure");
+        let settled = checkpoint_graph_snapshot(&prepared);
+        let final_state: (String, String, String, String, String, Option<i64>, Option<String>) =
+            fixture
+                .db
+                .connect()
+                .expect("checkpoint pre-add settled connection")
+                .query_row(
+                    "SELECT review.state, experiment.status, submission.status,
+                            reservation.status, review.checkpoint_json,
+                            experiment.pueue_task_id, experiment.task_signature
+                     FROM research_reviews AS review
+                     JOIN experiments AS experiment
+                       ON experiment.experiment_id = review.successor_experiment_id
+                     JOIN submissions AS submission
+                       ON submission.submission_id = experiment.submission_id
+                     JOIN budget_reservations AS reservation
+                       ON reservation.experiment_id = experiment.experiment_id
+                      AND reservation.dimension = 'experiment'
+                     WHERE review.review_id = ?1",
+                    [&fixture.review_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .expect("checkpoint pre-add settled graph");
+        assert_eq!(final_state.0, "blocked", "{label}");
+        assert_eq!(final_state.1, "failed", "{label}");
+        assert_eq!(final_state.2, "failed", "{label}");
+        assert_eq!(final_state.3, "consumed", "{label}");
+        assert_eq!(final_state.4, prepared.encoded, "{label}");
+        assert_eq!(final_state.5, None, "{label}");
+        assert_eq!(final_state.6, None, "{label}");
+
+        experiment_repository
+            .fail_checkpoint_before_add(
+                &prepared.authority,
+                "research_checkpoint_verification_failed",
+                3_106,
+            )
+            .expect("exact settled checkpoint pre-add replay");
+        assert_eq!(checkpoint_graph_snapshot(&prepared), settled, "{label}: replay mutated graph");
+    }
+
+    #[test]
+    fn checkpoint_pre_add_failure_covers_reserved_and_submitting_idempotence() {
+        assert_checkpoint_pre_add_failure_shape("reserved", false);
+        assert_checkpoint_pre_add_failure_shape("submitting", true);
+    }
+
+    #[test]
+    fn checkpoint_pre_add_failure_rejects_mutated_settled_graph() {
+        let prepared = checkpoint_dispatch_fixture();
+        let fixture = &prepared.fixture;
+        ExperimentRepository::new(&fixture.db)
+            .fail_checkpoint_before_add(
+                &prepared.authority,
+                "research_checkpoint_verification_failed",
+                3_105,
+            )
+            .expect("checkpoint pre-add failure");
+        let settled = checkpoint_graph_snapshot(&prepared);
+        let connection = fixture
+            .db
+            .connect()
+            .expect("checkpoint settled mutation connection");
+        connection
+            .execute(
+                "UPDATE research_reviews SET failure_code = 'tampered-settled-review'
+                 WHERE review_id = ?1",
+                [&fixture.review_id],
+            )
+            .expect("checkpoint settled review mutation");
+        drop(connection);
+        let mutated = checkpoint_graph_snapshot(&prepared);
+        assert_ne!(settled, mutated, "settled mutation did not change setup");
+        let result = ExperimentRepository::new(&fixture.db).fail_checkpoint_before_add(
+            &prepared.authority,
+            "research_checkpoint_verification_failed",
+            3_106,
+        );
+        assert!(result.is_err(), "mutated settled graph was accepted: {result:?}");
+        assert_eq!(
+            checkpoint_graph_snapshot(&prepared),
+            mutated,
+            "rejected settled replay mutated unrelated resources"
+        );
+    }
+
+    #[test]
+    fn checkpoint_dispatch_stale_authority_matrix_rejects_without_resource_mutation() {
+        let cases = vec![
+            (
+                "proposal hypothesis",
+                run_stale_dispatch_case("proposal hypothesis", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE proposals SET hypothesis = 'stale hypothesis'
+                             WHERE proposal_id = ?1",
+                            [&fixture.authority.proposal_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "proposal expected evidence",
+                run_stale_dispatch_case("proposal expected evidence", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE proposals SET expected_evidence_json = '[\"stale\"]'
+                             WHERE proposal_id = ?1",
+                            [&fixture.authority.proposal_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "proposal canonical digest",
+                run_stale_dispatch_case("proposal canonical digest", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE proposals SET canonical_digest = ?1 WHERE proposal_id = ?2",
+                            rusqlite::params![
+                                "d".repeat(64),
+                                fixture.authority.proposal_id
+                            ],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "submission argv",
+                run_stale_dispatch_case("submission argv", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE submissions SET argv_json = '[\"python\",\"stale.py\"]'
+                             WHERE submission_id = ?1",
+                            [&fixture.authority.submission_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "submission metadata",
+                run_stale_dispatch_case("submission metadata", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE submissions SET metadata_json = '{\"stale\":true}'
+                             WHERE submission_id = ?1",
+                            [&fixture.authority.submission_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "successor experiment parent",
+                run_stale_dispatch_case("successor experiment parent", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE experiments SET parent_experiment_id = NULL
+                             WHERE experiment_id = ?1",
+                            [&fixture.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "successor experiment status",
+                run_stale_dispatch_case("successor experiment status", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE experiments SET status = 'failed' WHERE experiment_id = ?1",
+                            [&fixture.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "successor attempt",
+                run_stale_dispatch_case("successor attempt", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE experiments SET attempt = attempt + 1
+                             WHERE experiment_id = ?1",
+                            [&fixture.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "reservation campaign",
+                run_stale_dispatch_case("reservation campaign", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE budget_reservations SET campaign_id = ?1
+                             WHERE experiment_id = ?2 AND dimension = 'experiment'",
+                            rusqlite::params![
+                                "checkpoint-foreign-campaign",
+                                fixture.authority.successor_experiment_id
+                            ],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "reservation window",
+                run_stale_dispatch_case("reservation window", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE budget_reservations SET window_ends_at = window_ends_at + 1
+                             WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                            [&fixture.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "reservation identity",
+                run_stale_dispatch_case("reservation identity", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE budget_reservations SET reservation_id = ?1
+                             WHERE experiment_id = ?2 AND dimension = 'experiment'",
+                            rusqlite::params![
+                                "stale-reservation-id",
+                                fixture.authority.successor_experiment_id
+                            ],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "reservation status",
+                run_stale_dispatch_case("reservation status", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE budget_reservations SET status = 'consumed'
+                             WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                            [&fixture.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "native owner",
+                run_stale_dispatch_case("native owner", |fixture, connection| {
+                    mutate_review_notes(fixture, connection, |notes| {
+                        notes["native_recovery"]["run_id"] = json!(999_999);
+                    });
+                }),
+            ),
+            (
+                "native cleanup",
+                run_stale_dispatch_case("native cleanup", |fixture, connection| {
+                    mutate_review_notes(fixture, connection, |notes| {
+                        notes["native_recovery"]["cleanup"]["phase"] = json!("pending");
+                        notes["native_recovery"]["cleanup"]["completed_at"] = Value::Null;
+                    });
+                }),
+            ),
+            (
+                "termination confirmation",
+                run_stale_dispatch_case("termination confirmation", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE termination_requests
+                             SET status = 'requested', confirmed_at = NULL
+                             WHERE request_id = (
+                                 SELECT termination_request_id FROM research_reviews
+                                 WHERE review_id = ?1
+                             )",
+                            [&fixture.fixture.review_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "termination raw signature",
+                run_stale_dispatch_case("termination raw signature", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE termination_requests SET task_signature = 'stale-signature'
+                             WHERE request_id = (
+                                 SELECT termination_request_id FROM research_reviews
+                                 WHERE review_id = ?1
+                             )",
+                            [&fixture.fixture.review_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "termination request identity",
+                run_stale_dispatch_case("termination request identity", |fixture, connection| {
+                    connection
+                        .execute(
+                            "INSERT INTO incidents (
+                                incident_id, project_id, kind, task_key, fingerprint, status,
+                                first_seen_at, last_seen_at, acknowledged_at, resolved_at
+                             ) VALUES (181, ?1, 'research_checkpoint', ?2,
+                                       'checkpoint-fingerprint-replacement', 'open',
+                                       3_100, 3_100, NULL, NULL)",
+                            rusqlite::params![
+                                fixture.fixture.project_id,
+                                fixture.fixture.experiment_id
+                            ],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "INSERT INTO termination_requests (
+                                request_id, incident_id, project_id, task_signature, reason,
+                                status, requested_at, dispatch_lease_until, grace_until,
+                                confirmed_at, last_error
+                             ) VALUES (182, 181, ?1, ?2, 'replacement', 'confirmed',
+                                       3_100, NULL, NULL, 3_101, NULL)",
+                            rusqlite::params![
+                                fixture.fixture.project_id,
+                                fixture.fixture.expected.raw_task_signature
+                            ],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE research_reviews SET termination_request_id = 182
+                             WHERE review_id = ?1",
+                            [&fixture.fixture.review_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "review failure code",
+                run_stale_dispatch_case("review failure code", |fixture, connection| {
+                    connection
+                        .execute(
+                            "UPDATE research_reviews SET failure_code = 'stale-review-failure'
+                             WHERE review_id = ?1",
+                            [&fixture.fixture.review_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+        ];
+        let failures: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(label, result)| result.err().map(|error| (label, error)))
+            .collect();
+        assert!(failures.is_empty(), "stale authority matrix failures: {failures:?}");
+    }
+
+    fn checkpoint_ownership_case<F>(
+        label: &str,
+        mutate: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(&CheckpointDispatchFixture, &Connection),
+    {
+        let prepared = checkpoint_dispatch_fixture();
+        let connection = prepared
+            .fixture
+            .db
+            .connect()
+            .map_err(|error| format!("{label}: connect: {error}"))?;
+        mutate(&prepared, &connection);
+        drop(connection);
+        let mut connection = prepared
+            .fixture
+            .db
+            .connect()
+            .map_err(|error| format!("{label}: ownership connect: {error}"))?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("{label}: ownership transaction: {error}"))?;
+        let ownership = research_ownership_in_transaction(
+            &transaction,
+            &prepared.fixture.project_id,
+            &prepared.fixture.campaign_id,
+            &prepared.fixture.experiment_id,
+        )
+        .map_err(|error| format!("{label}: ownership query: {error}"))?;
+        match ownership {
+            ResearchOwnership::Open(Some(owner)) if !owner.recovery_required => Ok(()),
+            other => Err(format!("{label}: expected non-recovery Open owner, got {other:?}")),
+        }
+    }
+
+    struct CheckpointAdmissionFixture {
+        fixture: SourceAuthorityFixture,
+        owner: ResearchOwnershipSnapshot,
+    }
+
+    fn checkpoint_stop_confirmed_fixture() -> CheckpointAdmissionFixture {
+        let fixture = source_authority_fixture();
+        let incident = Incident {
+            incident_id: 81,
+            project_id: fixture.project_id.clone(),
+            kind: "research_checkpoint".to_owned(),
+            task_key: Some(fixture.expected.owner.source_experiment_id.clone()),
+            fingerprint: "checkpoint-fingerprint-2".to_owned(),
+            status: IncidentStatus::Open,
+            first_seen_at: 3_100,
+            last_seen_at: 3_100,
+            acknowledged_at: None,
+            resolved_at: None,
+        };
+        let request = TerminationRequest {
+            request_id: 82,
+            incident_id: incident.incident_id,
+            project_id: fixture.project_id.clone(),
+            task_signature: fixture.expected.raw_task_signature.clone(),
+            reason: format!("research_action:{}:checkpoint", fixture.review_id),
+            status: TerminationRequestStatus::Confirmed,
+            requested_at: 3_100,
+            dispatch_lease_until: None,
+            grace_until: None,
+            confirmed_at: Some(3_101),
+            last_error: None,
+        };
+        let connection = fixture.db.connect().expect("checkpoint admission setup connection");
+        connection
+            .execute(
+                "INSERT INTO incidents (
+                    incident_id, project_id, kind, task_key, fingerprint, status,
+                    first_seen_at, last_seen_at, acknowledged_at, resolved_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL, NULL)",
+                rusqlite::params![
+                    incident.incident_id,
+                    incident.project_id,
+                    incident.kind,
+                    incident.task_key,
+                    incident.fingerprint,
+                    incident.status,
+                    incident.first_seen_at,
+                ],
+            )
+            .expect("checkpoint admission incident");
+        connection
+            .execute(
+                "INSERT INTO termination_requests (
+                    request_id, incident_id, project_id, task_signature, reason,
+                    status, requested_at, dispatch_lease_until, grace_until,
+                    confirmed_at, last_error
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL)",
+                rusqlite::params![
+                    request.request_id,
+                    request.incident_id,
+                    request.project_id,
+                    request.task_signature,
+                    request.reason,
+                    request.status,
+                    request.requested_at,
+                    request.confirmed_at,
+                ],
+            )
+            .expect("checkpoint admission termination");
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(&fixture.checkpoint)
+            .expect("checkpoint admission encoding");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET checkpoint_json = ?1, operation_stage = 'stop_confirmed',
+                     termination_request_id = ?2
+                 WHERE review_id = ?3",
+                rusqlite::params![encoded, request.request_id, fixture.review_id],
+            )
+            .expect("checkpoint admission confirmed review");
+        drop(connection);
+
+        let mut owner = fixture.expected.owner.clone();
+        owner.operation_stage = Some("stop_confirmed".to_owned());
+        owner.termination_request_id = Some(request.request_id);
+        CheckpointAdmissionFixture {
+            fixture,
+            owner,
+        }
+    }
+
+    fn call_checkpoint_admission(
+        prepared: &CheckpointAdmissionFixture,
+        now: i64,
+    ) -> Result<CheckpointSuccessorAdmission, AppError> {
+        let mut connection = prepared
+            .fixture
+            .db
+            .connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("admission transaction"))?;
+        match super::super::campaigns::accept_checkpoint_successor_in_transaction(
+            &transaction,
+            &prepared.owner,
+            &CampaignLimits::default(),
+            now,
+        ) {
+            Ok(admission) => {
+                transaction
+                    .commit()
+                    .map_err(database_error("admission commit"))?;
+                Ok(admission)
+            }
+            Err(error) => {
+                drop(transaction);
+                Err(error)
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CheckpointAdmissionExistingSnapshot {
+        reviews: Vec<Vec<rusqlite::types::Value>>,
+        proposals: Vec<Vec<rusqlite::types::Value>>,
+        submissions: Vec<Vec<rusqlite::types::Value>>,
+        experiments: Vec<Vec<rusqlite::types::Value>>,
+        reservations: Vec<Vec<rusqlite::types::Value>>,
+        termination_requests: Vec<Vec<rusqlite::types::Value>>,
+        incidents: Vec<Vec<rusqlite::types::Value>>,
+        campaign_research: Vec<Vec<rusqlite::types::Value>>,
+        events: Vec<Vec<rusqlite::types::Value>>,
+        task_observations: Vec<Vec<rusqlite::types::Value>>,
+    }
+
+    fn snapshot_sql_rows<P: rusqlite::Params>(
+        connection: &Connection,
+        sql: &str,
+        params: P,
+    ) -> Vec<Vec<rusqlite::types::Value>> {
+        connection
+            .prepare(sql)
+            .expect("checkpoint admission snapshot statement")
+            .query_map(params, |row| {
+                (0..row.as_ref().column_count())
+                    .map(|index| row.get(index))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("checkpoint admission snapshot query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("checkpoint admission snapshot rows")
+    }
+
+    fn checkpoint_admission_existing_snapshot(
+        fixture: &SourceAuthorityFixture,
+    ) -> CheckpointAdmissionExistingSnapshot {
+        let connection = fixture.db.connect().expect("checkpoint admission snapshot connection");
+        CheckpointAdmissionExistingSnapshot {
+            reviews: snapshot_sql_rows(
+                &connection,
+                "SELECT * FROM research_reviews ORDER BY review_id",
+                rusqlite::params![],
+            ),
+            proposals: snapshot_sql_rows(
+                &connection,
+                "SELECT * FROM proposals ORDER BY proposal_id",
+                rusqlite::params![],
+            ),
+            submissions: snapshot_sql_rows(
+                &connection,
+                "SELECT * FROM submissions ORDER BY submission_id",
+                rusqlite::params![],
+            ),
+            experiments: snapshot_sql_rows(
+                &connection,
+                "SELECT * FROM experiments ORDER BY experiment_id",
+                rusqlite::params![],
+            ),
+            reservations: snapshot_sql_rows(
+                &connection,
+                "SELECT * FROM budget_reservations ORDER BY reservation_id",
+                rusqlite::params![],
+            ),
+            termination_requests: snapshot_sql_rows(
+                &connection,
+                "SELECT * FROM termination_requests ORDER BY request_id",
+                rusqlite::params![],
+            ),
+            incidents: snapshot_sql_rows(
+                &connection,
+                "SELECT * FROM incidents ORDER BY incident_id",
+                rusqlite::params![],
+            ),
+            campaign_research: snapshot_sql_rows(
+                &connection,
+                "SELECT * FROM campaign_research ORDER BY campaign_id",
+                rusqlite::params![],
+            ),
+            events: snapshot_sql_rows(
+                &connection,
+                "SELECT * FROM events ORDER BY event_id",
+                rusqlite::params![],
+            ),
+            task_observations: snapshot_sql_rows(
+                &connection,
+                "SELECT * FROM task_observations ORDER BY task_signature",
+                rusqlite::params![],
+            ),
+        }
+    }
+
+    fn checkpoint_successor_resource_counts(
+        fixture: &SourceAuthorityFixture,
+        successor_ids: &crate::research_checkpoint::CheckpointSuccessorIds,
+    ) -> (i64, i64, i64, i64) {
+        let connection = fixture
+            .db
+            .connect()
+            .expect("checkpoint successor resource count connection");
+        let proposal_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM proposals WHERE proposal_id = ?1",
+                [&successor_ids.proposal_id],
+                |row| row.get(0),
+            )
+            .expect("checkpoint successor proposal count");
+        let submission_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM submissions WHERE submission_id = ?1",
+                [&successor_ids.submission_id],
+                |row| row.get(0),
+            )
+            .expect("checkpoint successor submission count");
+        let experiment_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM experiments WHERE experiment_id = ?1",
+                [&successor_ids.experiment_id],
+                |row| row.get(0),
+            )
+            .expect("checkpoint successor experiment count");
+        let reservation_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM budget_reservations
+                 WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                [&successor_ids.experiment_id],
+                |row| row.get(0),
+            )
+            .expect("checkpoint successor reservation count");
+        (
+            proposal_count,
+            submission_count,
+            experiment_count,
+            reservation_count,
+        )
+    }
+
+    fn insert_successor_id_collision(
+        prepared: &CheckpointAdmissionFixture,
+        kind: &str,
+    ) {
+        let ids = &prepared.fixture.checkpoint.successor_ids;
+        let connection = prepared
+            .fixture
+            .db
+            .connect()
+            .expect("checkpoint collision connection");
+        match kind {
+            "proposal" => {
+                connection
+                    .execute(
+                        "INSERT INTO proposals (
+                            proposal_id, campaign_id, kind, status, hypothesis,
+                            source_experiment_id, argv_json, working_directory,
+                            expected_evidence_json, canonical_digest, reject_reason,
+                            created_at, updated_at
+                         ) VALUES (?1, ?2, 'experiment', 'accepted', 'collision',
+                                   NULL, '[\"python\",\"collision.py\"]', '.',
+                                   '[]', 'collision-proposal-digest', NULL, 3_100, 3_100)",
+                        rusqlite::params![ids.proposal_id, prepared.fixture.campaign_id],
+                    )
+                    .expect("proposal ID collision row");
+            }
+            "submission" => {
+                connection
+                    .execute(
+                        "INSERT INTO submissions (
+                            submission_id, project_id, argv_json, created_at,
+                            pueue_task_id, task_signature, status, kind,
+                            metadata_json, origin_agent_run_id
+                         ) VALUES (?1, ?2, '[\"python\",\"collision.py\"]', 3_100,
+                                   NULL, NULL, 'pending', 'experiment', '{}', NULL)",
+                        rusqlite::params![ids.submission_id, prepared.fixture.project_id],
+                    )
+                    .expect("submission ID collision row");
+            }
+            "experiment" => {
+                connection
+                    .execute(
+                        "INSERT INTO proposals (
+                            proposal_id, campaign_id, kind, status, hypothesis,
+                            source_experiment_id, argv_json, working_directory,
+                            expected_evidence_json, canonical_digest, reject_reason,
+                            created_at, updated_at
+                         ) VALUES ('collision-support-proposal', ?1, 'experiment',
+                                   'accepted', 'collision support', NULL,
+                                   '[\"python\",\"collision-support.py\"]', '.',
+                                   '[]', 'collision-support-digest', NULL, 3_100, 3_100)",
+                        [&prepared.fixture.campaign_id],
+                    )
+                    .expect("experiment collision proposal support");
+                connection
+                    .execute(
+                        "INSERT INTO submissions (
+                            submission_id, project_id, argv_json, created_at,
+                            pueue_task_id, task_signature, status, kind,
+                            metadata_json, origin_agent_run_id
+                         ) VALUES ('collision-support-submission', ?1,
+                                   '[\"python\",\"collision-support.py\"]', 3_100,
+                                   NULL, NULL, 'pending', 'experiment', '{}', NULL)",
+                        [&prepared.fixture.project_id],
+                    )
+                    .expect("experiment collision submission support");
+                connection
+                    .execute(
+                        "INSERT INTO experiments (
+                            experiment_id, campaign_id, proposal_id, submission_id,
+                            parent_experiment_id, attempt, status, pueue_task_id,
+                            task_signature, failure_code, failure_fingerprint,
+                            created_at, updated_at, finished_at,
+                            resume_of_experiment_id, checkpoint_note,
+                            code_change_run_id, code_revision_sha
+                         ) VALUES (?1, ?2, 'collision-support-proposal',
+                                   'collision-support-submission', ?3, 1, 'reserved',
+                                   NULL, NULL, NULL, NULL, 3_100, 3_100, NULL,
+                                   ?3, 'collision', NULL, NULL)",
+                        rusqlite::params![
+                            ids.experiment_id,
+                            prepared.fixture.campaign_id,
+                            prepared.fixture.experiment_id,
+                        ],
+                    )
+                    .expect("experiment ID collision row");
+            }
+            "reservation" => {
+                connection
+                    .execute(
+                        "INSERT INTO budget_reservations (
+                            reservation_id, campaign_id, experiment_id, dimension,
+                            subject_key, status, window_started_at, window_ends_at,
+                            created_at, updated_at
+                         ) VALUES (?1, ?2, NULL, 'agent_run',
+                                   'reservation-collision', 'reserved', 3_100,
+                                   4_100, 3_100, 3_100)",
+                        rusqlite::params![
+                            format!("experiment:{}", ids.experiment_id),
+                            prepared.fixture.campaign_id,
+                        ],
+                    )
+                    .expect("reservation ID collision row");
+            }
+            other => panic!("unknown collision kind: {other}"),
+        }
+    }
+
+    fn checkpoint_successor_proposal(
+        fixture: &SourceAuthorityFixture,
+    ) -> crate::proposals::ValidatedProposal {
+        let connection = fixture
+            .db
+            .connect()
+            .expect("checkpoint successor proposal connection");
+        let expected_evidence_json: String = connection
+            .query_row(
+                "SELECT expected_evidence_json FROM proposals WHERE proposal_id = ?1",
+                [&fixture.proposal_id],
+                |row| row.get(0),
+            )
+            .expect("checkpoint successor source evidence");
+        let expected_evidence: Vec<String> = serde_json::from_str(&expected_evidence_json)
+            .expect("checkpoint successor source evidence JSON");
+        proposals::validate(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: format!(
+                    "Resume {} from its verified checkpoint",
+                    fixture.experiment_id
+                ),
+                source_experiment_id: Some(fixture.experiment_id.clone()),
+                argv: fixture.checkpoint.retained_argv.clone(),
+                working_directory: fixture.checkpoint.source_working_directory.clone(),
+                expected_evidence,
+            },
+            &fixture.checkpoint.campaign_objective_digest,
+        )
+        .expect("checkpoint successor proposal validation")
+    }
+
+    fn insert_canonical_digest_conflict(prepared: &CheckpointAdmissionFixture) {
+        let proposal = checkpoint_successor_proposal(&prepared.fixture);
+        let argv_json = serde_json::to_string(proposal.argv()).expect("conflict argv JSON");
+        let evidence_json =
+            serde_json::to_string(proposal.expected_evidence()).expect("conflict evidence JSON");
+        prepared
+            .fixture
+            .db
+            .connect()
+            .expect("canonical conflict connection")
+            .execute(
+                "INSERT INTO proposals (
+                    proposal_id, campaign_id, kind, status, hypothesis,
+                    source_experiment_id, argv_json, working_directory,
+                    expected_evidence_json, canonical_digest, reject_reason,
+                    created_at, updated_at
+                 ) VALUES ('canonical-conflict-proposal', ?1, ?2, 'accepted', ?3,
+                           ?4, ?5, ?6, ?7, ?8, NULL, 3_100, 3_100)",
+                rusqlite::params![
+                    prepared.fixture.campaign_id,
+                    proposal.kind(),
+                    proposal.hypothesis(),
+                    proposal.source_experiment_id(),
+                    argv_json,
+                    proposal.working_directory(),
+                    evidence_json,
+                    proposal.canonical_digest(),
+                ],
+            )
+            .expect("canonical digest conflict row");
+    }
+
+    #[test]
+    fn checkpoint_admission_rejects_each_successor_id_collision_without_mutation() {
+        let mut failures: Vec<(&str, String)> = Vec::new();
+        for kind in ["proposal", "submission", "experiment", "reservation"] {
+            let prepared = checkpoint_stop_confirmed_fixture();
+            insert_successor_id_collision(&prepared, kind);
+            let before = checkpoint_admission_existing_snapshot(&prepared.fixture);
+            let result = call_checkpoint_admission(&prepared, 3_102);
+            let after = checkpoint_admission_existing_snapshot(&prepared.fixture);
+            let collision_rejected = if kind == "reservation" {
+                matches!(
+                    &result,
+                    Err(AppError::Database { operation, .. })
+                        if *operation == "insert experiment budget reservation"
+                )
+            } else {
+                matches!(&result, Ok(CheckpointSuccessorAdmission::Blocked))
+            };
+            if !collision_rejected {
+                failures.push((kind, format!("collision was not rejected: {result:?}")));
+            }
+            if before != after {
+                failures.push((kind, "ID collision mutated an existing row".to_owned()));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "successor ID collision failures: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_admission_rejects_canonical_digest_conflict_without_resources() {
+        let prepared = checkpoint_stop_confirmed_fixture();
+        insert_canonical_digest_conflict(&prepared);
+        let before = checkpoint_admission_existing_snapshot(&prepared.fixture);
+        let result = call_checkpoint_admission(&prepared, 3_102);
+        let after = checkpoint_admission_existing_snapshot(&prepared.fixture);
+        assert!(
+            matches!(
+                &result,
+                Err(AppError::Database { operation, .. })
+                    if *operation == "insert campaign proposal"
+            ),
+            "canonical conflict did not reach proposal insertion: {result:?}"
+        );
+        assert_eq!(before, after, "canonical conflict mutated an existing row");
+        assert_eq!(
+            checkpoint_successor_resource_counts(&prepared.fixture, &prepared.fixture.checkpoint.successor_ids),
+            (0, 0, 0, 0),
+            "canonical conflict left successor resources behind"
+        );
+    }
+
+    #[test]
+    fn checkpoint_admission_final_review_cas_loss_rolls_back_all_resources() {
+        let prepared = checkpoint_stop_confirmed_fixture();
+        let successor = &prepared.fixture.checkpoint.successor_ids;
+        let quote = |value: &str| value.replace('\'', "''");
+        let trigger = format!(
+            "CREATE TRIGGER force_checkpoint_final_cas_loss\n\
+             AFTER INSERT ON budget_reservations\n\
+             WHEN NEW.experiment_id = '{experiment}'\n\
+               AND EXISTS (SELECT 1 FROM proposals WHERE proposal_id = '{proposal}')\n\
+               AND EXISTS (SELECT 1 FROM submissions WHERE submission_id = '{submission}')\n\
+               AND EXISTS (SELECT 1 FROM experiments WHERE experiment_id = '{experiment}')\n\
+             BEGIN\n\
+               UPDATE research_reviews\n\
+               SET state = 'blocked', failure_code = 'test_final_cas_loss'\n\
+               WHERE review_id = '{review}' AND state = 'ready';\n\
+             END;",
+            experiment = quote(&successor.experiment_id),
+            proposal = quote(&successor.proposal_id),
+            submission = quote(&successor.submission_id),
+            review = quote(&prepared.fixture.review_id),
+        );
+        prepared
+            .fixture
+            .db
+            .connect()
+            .expect("final CAS trigger connection")
+            .execute_batch(&trigger)
+            .expect("final CAS trigger");
+        let before = checkpoint_admission_existing_snapshot(&prepared.fixture);
+        let result = call_checkpoint_admission(&prepared, 3_102);
+        let after = checkpoint_admission_existing_snapshot(&prepared.fixture);
+        assert!(
+            matches!(
+                &result,
+                Err(AppError::Validation { field, message })
+                    if *field == "research.review"
+                        && *message == "changed before checkpoint successor reservation"
+            ),
+            "final review CAS loss did not reach the guarded final CAS: {result:?}"
+        );
+        assert_eq!(
+            before, after,
+            "final review CAS loss changed an existing row after rollback"
+        );
+        assert_eq!(
+            checkpoint_successor_resource_counts(&prepared.fixture, successor),
+            (0, 0, 0, 0),
+            "final review CAS loss left one or more successor resources"
+        );
+    }
+
+    fn mutate_checkpoint_terminal(
+        prepared: &CheckpointDispatchFixture,
+        connection: &Connection,
+        status: &str,
+    ) {
+        let (failure_code, failure_fingerprint) = if status == "failed" {
+            (Some("pueue_failed"), Some("terminal-fingerprint"))
+        } else {
+            (None, None)
+        };
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', operation_stage = NULL,
+                     failure_code = NULL, finished_at = 3_200, updated_at = 3_200
+                 WHERE review_id = ?1",
+                [&prepared.fixture.review_id],
+            )
+            .expect("checkpoint terminal review");
+        connection
+            .execute(
+                "UPDATE submissions
+                 SET status = 'accepted', pueue_task_id = 99,
+                     task_signature = 'pueue-managed-run:v1:terminal'
+                 WHERE submission_id = ?1",
+                [&prepared.authority.submission_id],
+            )
+            .expect("checkpoint terminal submission");
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET status = ?1, pueue_task_id = 99,
+                     task_signature = 'pueue-managed-run:v1:terminal',
+                     failure_code = ?2, failure_fingerprint = ?3,
+                     finished_at = 3_200, updated_at = 3_200
+                 WHERE experiment_id = ?4",
+                rusqlite::params![status, failure_code, failure_fingerprint, prepared.authority.successor_experiment_id],
+            )
+            .expect("checkpoint terminal experiment");
+        connection
+            .execute(
+                "UPDATE budget_reservations SET status = 'consumed', updated_at = 3_200
+                 WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                [&prepared.authority.successor_experiment_id],
+            )
+            .expect("checkpoint terminal reservation");
+    }
+
+    fn completed_task_failed_checkpoint_fixture() -> CheckpointDispatchFixture {
+        let prepared = checkpoint_dispatch_fixture();
+        let connection = prepared
+            .fixture
+            .db
+            .connect()
+            .expect("completed task failure connection");
+        mutate_checkpoint_terminal(&prepared, &connection, "failed");
+        drop(connection);
+        prepared
+    }
+
+    fn completed_pre_add_checkpoint_fixture() -> CheckpointDispatchFixture {
+        let prepared = checkpoint_dispatch_fixture();
+        ExperimentRepository::new(&prepared.fixture.db)
+            .fail_checkpoint_before_add(
+                &prepared.authority,
+                "research_checkpoint_verification_failed",
+                3_205,
+            )
+            .expect("completed pre-add failure");
+        prepared
+            .fixture
+            .db
+            .connect()
+            .expect("completed pre-add connection")
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', operation_stage = NULL,
+                     finished_at = 3_206, updated_at = 3_206
+                 WHERE review_id = ?1",
+                [&prepared.fixture.review_id],
+            )
+            .expect("completed pre-add review");
+        prepared
+    }
+
+    fn checkpoint_ownership_for_dispatch(
+        prepared: &CheckpointDispatchFixture,
+    ) -> Result<ResearchOwnership, String> {
+        let mut connection = prepared
+            .fixture
+            .db
+            .connect()
+            .map_err(|error| format!("ownership connection: {error}"))?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("ownership transaction: {error}"))?;
+        let ownership = research_ownership_in_transaction(
+            &transaction,
+            &prepared.fixture.project_id,
+            &prepared.fixture.campaign_id,
+            &prepared.fixture.experiment_id,
+        )
+        .map_err(|error| format!("ownership query: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("ownership commit: {error}"))?;
+        Ok(ownership)
+    }
+
+    #[test]
+    fn checkpoint_ownership_completed_phase_hybrid_mutations_require_recovery() {
+        let mutations: Vec<(&str, fn(&CheckpointDispatchFixture, &Connection))> = vec![
+            (
+                "review failure",
+                |prepared, connection| {
+                    connection
+                        .execute(
+                            "UPDATE research_reviews SET failure_code = 'hybrid-review'
+                             WHERE review_id = ?1",
+                            [&prepared.fixture.review_id],
+                        )
+                        .unwrap();
+                },
+            ),
+            (
+                "missing experiment failure code",
+                |prepared, connection| {
+                    connection
+                        .execute(
+                            "UPDATE experiments SET failure_code = NULL
+                             WHERE experiment_id = ?1",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                },
+            ),
+            (
+                "task identity",
+                |prepared, connection| {
+                    connection
+                        .execute(
+                            "UPDATE experiments
+                             SET pueue_task_id = 100, task_signature = 'hybrid-task'
+                             WHERE experiment_id = ?1",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                },
+            ),
+            (
+                "submission phase",
+                |prepared, connection| {
+                    connection
+                        .execute(
+                            "UPDATE submissions
+                             SET status = 'pending', pueue_task_id = NULL,
+                                 task_signature = NULL
+                             WHERE submission_id = ?1",
+                            [&prepared.authority.submission_id],
+                        )
+                        .unwrap();
+                },
+            ),
+            (
+                "reservation phase",
+                |prepared, connection| {
+                    connection
+                        .execute(
+                            "UPDATE budget_reservations SET status = 'reserved'
+                             WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                },
+            ),
+            (
+                "review stage",
+                |prepared, connection| {
+                    connection
+                        .execute(
+                            "UPDATE research_reviews SET operation_stage = 'successor_reserved'
+                             WHERE review_id = ?1",
+                            [&prepared.fixture.review_id],
+                        )
+                        .unwrap();
+                },
+            ),
+        ];
+        let bases: Vec<(&str, fn() -> CheckpointDispatchFixture)> = vec![
+            ("completed task-backed failed", completed_task_failed_checkpoint_fixture),
+            ("completed known pre-add failed", completed_pre_add_checkpoint_fixture),
+        ];
+        let mut failures: Vec<(String, String)> = Vec::new();
+        for (base_label, make_fixture) in bases {
+            let baseline = make_fixture();
+            match checkpoint_ownership_for_dispatch(&baseline) {
+                Ok(ResearchOwnership::Open(Some(owner))) if !owner.recovery_required => {}
+                Ok(other) => failures.push((
+                    base_label.to_owned(),
+                    format!("valid completed baseline was not non-recovery Open: {other:?}"),
+                )),
+                Err(error) => failures.push((base_label.to_owned(), error)),
+            }
+            for (mutation_label, mutate) in &mutations {
+                let prepared = make_fixture();
+                let connection = prepared.fixture.db.connect().unwrap();
+                mutate(&prepared, &connection);
+                drop(connection);
+                match checkpoint_ownership_for_dispatch(&prepared) {
+                    Ok(ResearchOwnership::Open(Some(owner))) if owner.recovery_required => {}
+                    Ok(other) => failures.push((
+                        format!("{base_label}/{mutation_label}"),
+                        format!("expected recovery Open: {other:?}"),
+                    )),
+                    Err(error) => failures.push((
+                        format!("{base_label}/{mutation_label}"),
+                        error,
+                    )),
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "completed phase hybrid failures: {failures:?}"
+        );
+    }
+
+    fn mutate_terminal_submission_failed(
+        prepared: &CheckpointDispatchFixture,
+        connection: &Connection,
+    ) {
+        connection
+            .execute(
+                "UPDATE submissions
+                 SET status = 'failed'
+                 WHERE submission_id = ?1",
+                [&prepared.authority.submission_id],
+            )
+            .unwrap();
+    }
+
+    fn mutate_terminal_tasks_cleared(
+        prepared: &CheckpointDispatchFixture,
+        connection: &Connection,
+    ) {
+        connection
+            .execute(
+                "UPDATE submissions
+                 SET pueue_task_id = NULL, task_signature = NULL
+                 WHERE submission_id = ?1",
+                [&prepared.authority.submission_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET pueue_task_id = NULL, task_signature = NULL
+                 WHERE experiment_id = ?1",
+                [&prepared.authority.successor_experiment_id],
+            )
+            .unwrap();
+    }
+
+    fn mutate_terminal_failure_fields_swapped(
+        prepared: &CheckpointDispatchFixture,
+        connection: &Connection,
+    ) {
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET failure_code = 'research_checkpoint_verification_failed'
+                 WHERE review_id = ?1",
+                [&prepared.fixture.review_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET failure_code = NULL, failure_fingerprint = NULL
+                 WHERE experiment_id = ?1",
+                [&prepared.authority.successor_experiment_id],
+            )
+            .unwrap();
+    }
+
+    fn mutate_terminal_failure_fields_cleared(
+        prepared: &CheckpointDispatchFixture,
+        connection: &Connection,
+    ) {
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET failure_code = NULL, failure_fingerprint = NULL
+                 WHERE experiment_id = ?1",
+                [&prepared.authority.successor_experiment_id],
+            )
+            .unwrap();
+    }
+
+    fn mutate_terminal_pre_add_failure_fields(
+        prepared: &CheckpointDispatchFixture,
+        connection: &Connection,
+    ) {
+        let mut digest = Sha256::new();
+        digest.update(b"research_checkpoint_verification_failed");
+        digest.update([0]);
+        digest.update(prepared.encoded.as_bytes());
+        let failure_fingerprint = format!("research-checkpoint-pre-add:{:x}", digest.finalize());
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET failure_code = 'research_checkpoint_verification_failed',
+                     failure_fingerprint = ?1
+                 WHERE experiment_id = ?2",
+                rusqlite::params![failure_fingerprint, prepared.authority.successor_experiment_id],
+            )
+            .unwrap();
+    }
+
+    fn mutate_pre_add_submission_accepted(
+        prepared: &CheckpointDispatchFixture,
+        connection: &Connection,
+    ) {
+        connection
+            .execute(
+                "UPDATE submissions
+                 SET status = 'accepted'
+                 WHERE submission_id = ?1",
+                [&prepared.authority.submission_id],
+            )
+            .unwrap();
+    }
+
+    fn mutate_pre_add_tasks_added(
+        prepared: &CheckpointDispatchFixture,
+        connection: &Connection,
+    ) {
+        connection
+            .execute(
+                "UPDATE submissions
+                 SET pueue_task_id = 99,
+                     task_signature = 'pueue-managed-run:v1:terminal'
+                 WHERE submission_id = ?1",
+                [&prepared.authority.submission_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET pueue_task_id = 99,
+                     task_signature = 'pueue-managed-run:v1:terminal'
+                 WHERE experiment_id = ?1",
+                [&prepared.authority.successor_experiment_id],
+            )
+            .unwrap();
+    }
+
+    fn mutate_pre_add_failure_fields_swapped(
+        prepared: &CheckpointDispatchFixture,
+        connection: &Connection,
+    ) {
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET failure_code = NULL
+                 WHERE review_id = ?1",
+                [&prepared.fixture.review_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET failure_code = 'pueue_failed',
+                     failure_fingerprint = 'terminal-fingerprint'
+                 WHERE experiment_id = ?1",
+                [&prepared.authority.successor_experiment_id],
+            )
+            .unwrap();
+    }
+
+    fn mutate_pre_add_failure_fields_cleared(
+        prepared: &CheckpointDispatchFixture,
+        connection: &Connection,
+    ) {
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET failure_code = NULL
+                 WHERE review_id = ?1",
+                [&prepared.fixture.review_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET failure_code = NULL, failure_fingerprint = NULL
+                 WHERE experiment_id = ?1",
+                [&prepared.authority.successor_experiment_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn checkpoint_ownership_cross_projection_hybrids_require_recovery_open() {
+        let cases: Vec<(
+            &str,
+            fn() -> CheckpointDispatchFixture,
+            fn(&CheckpointDispatchFixture, &Connection),
+        )> = vec![
+            (
+                "terminal accepted-to-failed submission with tasks",
+                completed_task_failed_checkpoint_fixture,
+                mutate_terminal_submission_failed,
+            ),
+            (
+                "terminal accepted with both tasks cleared",
+                completed_task_failed_checkpoint_fixture,
+                mutate_terminal_tasks_cleared,
+            ),
+            (
+                "terminal review and experiment failure fields swapped",
+                completed_task_failed_checkpoint_fixture,
+                mutate_terminal_failure_fields_swapped,
+            ),
+            (
+                "terminal experiment failure fields cleared",
+                completed_task_failed_checkpoint_fixture,
+                mutate_terminal_failure_fields_cleared,
+            ),
+            (
+                "terminal exact pre-add failure fields",
+                completed_task_failed_checkpoint_fixture,
+                mutate_terminal_pre_add_failure_fields,
+            ),
+            (
+                "pre-add failed-to-accepted submission with null tasks",
+                completed_pre_add_checkpoint_fixture,
+                mutate_pre_add_submission_accepted,
+            ),
+            (
+                "pre-add failed with matching non-null tasks",
+                completed_pre_add_checkpoint_fixture,
+                mutate_pre_add_tasks_added,
+            ),
+            (
+                "pre-add review and experiment failure fields swapped",
+                completed_pre_add_checkpoint_fixture,
+                mutate_pre_add_failure_fields_swapped,
+            ),
+            (
+                "pre-add review and experiment failure fields cleared",
+                completed_pre_add_checkpoint_fixture,
+                mutate_pre_add_failure_fields_cleared,
+            ),
+        ];
+        let mut failures: Vec<(String, String)> = Vec::new();
+        for (label, make_fixture, mutate) in cases {
+            let prepared = make_fixture();
+            let connection = prepared.fixture.db.connect().unwrap();
+            mutate(&prepared, &connection);
+            drop(connection);
+            match checkpoint_ownership_for_dispatch(&prepared) {
+                Ok(ResearchOwnership::Open(Some(owner))) if owner.recovery_required => {}
+                Ok(other) => failures.push((
+                    label.to_owned(),
+                    format!("expected recovery Open: {other:?}"),
+                )),
+                Err(error) => failures.push((label.to_owned(), error)),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "cross-projection hybrid failures: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_ownership_lifecycle_active_and_terminal_shapes_are_nonrecovery_open() {
+        let cases = vec![
+            (
+                "submitting",
+                checkpoint_ownership_case("submitting", |prepared, connection| {
+                    connection
+                        .execute(
+                            "UPDATE experiments SET status = 'submitting'
+                             WHERE experiment_id = ?1",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "unreconciled",
+                checkpoint_ownership_case("unreconciled", |prepared, connection| {
+                    connection
+                        .execute(
+                            "UPDATE experiments
+                             SET status = 'unreconciled', failure_code = 'identity-mismatch'
+                             WHERE experiment_id = ?1",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE submissions SET status = 'unreconciled'
+                             WHERE submission_id = ?1",
+                            [&prepared.authority.submission_id],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE budget_reservations SET status = 'consumed'
+                             WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "succeeded",
+                checkpoint_ownership_case("succeeded", |prepared, connection| {
+                    mutate_checkpoint_terminal(prepared, connection, "succeeded");
+                }),
+            ),
+            (
+                "failed",
+                checkpoint_ownership_case("failed", |prepared, connection| {
+                    mutate_checkpoint_terminal(prepared, connection, "failed");
+                }),
+            ),
+            (
+                "cancelled",
+                checkpoint_ownership_case("cancelled", |prepared, connection| {
+                    mutate_checkpoint_terminal(prepared, connection, "cancelled");
+                }),
+            ),
+        ];
+        let failures: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(label, result)| result.err().map(|error| (label, error)))
+            .collect();
+        assert!(failures.is_empty(), "ownership lifecycle failures: {failures:?}");
+    }
+
+    #[test]
+    fn checkpoint_ownership_known_pre_add_failed_completed_history_is_nonrecovery_open() {
+        let prepared = checkpoint_dispatch_fixture();
+        ExperimentRepository::new(&prepared.fixture.db)
+            .fail_checkpoint_before_add(
+                &prepared.authority,
+                "research_checkpoint_verification_failed",
+                3_105,
+            )
+            .expect("checkpoint known pre-add failure");
+        prepared
+            .fixture
+            .db
+            .connect()
+            .expect("checkpoint known pre-add history connection")
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', operation_stage = NULL,
+                     finished_at = 3_200, updated_at = 3_200
+                 WHERE review_id = ?1",
+                [&prepared.fixture.review_id],
+            )
+            .expect("checkpoint known pre-add history");
+        let mut connection = prepared
+            .fixture
+            .db
+            .connect()
+            .expect("checkpoint known pre-add ownership connection");
+        let transaction = connection
+            .transaction()
+            .expect("checkpoint known pre-add ownership transaction");
+        let ownership = research_ownership_in_transaction(
+            &transaction,
+            &prepared.fixture.project_id,
+            &prepared.fixture.campaign_id,
+            &prepared.fixture.experiment_id,
+        )
+        .expect("checkpoint known pre-add ownership");
+        assert!(
+            matches!(
+                ownership,
+                ResearchOwnership::Open(Some(ResearchOwnershipSnapshot {
+                    recovery_required: false,
+                    ..
+                }))
+            ),
+            "ownership: {ownership:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_ownership_phase_mutations_require_recovery_open() {
+        let cases: Vec<(
+            &str,
+            fn(&CheckpointDispatchFixture, &Connection),
+        )> = vec![
+            (
+                "accepted without task",
+                |prepared: &CheckpointDispatchFixture, connection: &Connection| {
+                    connection
+                        .execute(
+                            "UPDATE experiments SET status = 'accepted'
+                             WHERE experiment_id = ?1",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                },
+            ),
+            (
+                "consumed reserved",
+                |prepared: &CheckpointDispatchFixture, connection: &Connection| {
+                    connection
+                        .execute(
+                            "UPDATE budget_reservations SET status = 'consumed'
+                             WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                },
+            ),
+            (
+                "reserved failure",
+                |prepared: &CheckpointDispatchFixture, connection: &Connection| {
+                    connection
+                        .execute(
+                            "UPDATE experiments SET failure_code = 'unexpected'
+                             WHERE experiment_id = ?1",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                },
+            ),
+            (
+                "task identity mismatch",
+                |prepared: &CheckpointDispatchFixture, connection: &Connection| {
+                    connection
+                        .execute(
+                            "UPDATE submissions SET pueue_task_id = 98,
+                             task_signature = 'pueue-managed-run:v1:wrong'
+                             WHERE submission_id = ?1",
+                            [&prepared.authority.submission_id],
+                        )
+                        .unwrap();
+                },
+            ),
+        ];
+        let failures: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(label, mutate)| {
+                let prepared = checkpoint_dispatch_fixture();
+                let connection = prepared.fixture.db.connect().unwrap();
+                mutate(&prepared, &connection);
+                drop(connection);
+                let mut connection = prepared.fixture.db.connect().unwrap();
+                let transaction = connection.transaction().unwrap();
+                let ownership = research_ownership_in_transaction(
+                    &transaction,
+                    &prepared.fixture.project_id,
+                    &prepared.fixture.campaign_id,
+                    &prepared.fixture.experiment_id,
+                )
+                .unwrap();
+                match ownership {
+                    ResearchOwnership::Open(Some(ResearchOwnershipSnapshot {
+                        recovery_required: true,
+                        ..
+                    })) => None,
+                    other => Some((label, format!("expected recovery Open, got {other:?}"))),
+                }
+            })
+            .collect();
+        assert!(failures.is_empty(), "ownership mutation failures: {failures:?}");
+    }
+
+    #[test]
+    fn checkpoint_pre_add_failure_rejects_post_add_and_unreconciled_without_writes() {
+        let cases: Vec<(
+            &str,
+            fn(&CheckpointDispatchFixture, &Connection),
+        )> = vec![
+            (
+                "post-add accepted",
+                |prepared, connection| {
+                    connection
+                        .execute(
+                            "UPDATE submissions SET status = 'accepted', pueue_task_id = 99,
+                             task_signature = 'pueue-managed-run:v1:post-add'
+                             WHERE submission_id = ?1",
+                            [&prepared.authority.submission_id],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE experiments
+                             SET status = 'accepted', pueue_task_id = 99,
+                                 task_signature = 'pueue-managed-run:v1:post-add'
+                             WHERE experiment_id = ?1",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE budget_reservations SET status = 'consumed'
+                             WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                },
+            ),
+            (
+                "unreconciled",
+                |prepared, connection| {
+                    connection
+                        .execute(
+                            "UPDATE submissions SET status = 'unreconciled'
+                             WHERE submission_id = ?1",
+                            [&prepared.authority.submission_id],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE experiments
+                             SET status = 'unreconciled', failure_code = 'identity-mismatch'
+                             WHERE experiment_id = ?1",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "UPDATE budget_reservations SET status = 'consumed'
+                             WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                            [&prepared.authority.successor_experiment_id],
+                        )
+                        .unwrap();
+                },
+            ),
+        ];
+        let failures: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(label, mutate)| {
+                let prepared = checkpoint_dispatch_fixture();
+                let connection = prepared.fixture.db.connect().unwrap();
+                mutate(&prepared, &connection);
+                drop(connection);
+                let before = checkpoint_graph_snapshot(&prepared);
+                let result = ExperimentRepository::new(&prepared.fixture.db).fail_checkpoint_before_add(
+                    &prepared.authority,
+                    "research_checkpoint_verification_failed",
+                    3_205,
+                );
+                let after = checkpoint_graph_snapshot(&prepared);
+                if result.is_ok() {
+                    Some((label, format!("post-shape was accepted: {result:?}")))
+                } else if before != after {
+                    Some((label, "rejected post-shape mutated graph".to_owned()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(failures.is_empty(), "pre-add rejection failures: {failures:?}");
+    }
+
+    #[test]
+    fn checkpoint_pre_add_history_shared_oracle_preserves_failure_semantics() {
+        let completed = checkpoint_dispatch_fixture();
+        ExperimentRepository::new(&completed.fixture.db)
+            .fail_checkpoint_before_add(
+                &completed.authority,
+                "research_checkpoint_verification_failed",
+                3_206,
+            )
+            .expect("checkpoint completed pre-add failure");
+        completed
+            .fixture
+            .db
+            .connect()
+            .expect("checkpoint completed pre-add connection")
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', operation_stage = NULL,
+                     finished_at = 3_207, updated_at = 3_207
+                 WHERE review_id = ?1",
+                [&completed.fixture.review_id],
+            )
+            .expect("checkpoint completed pre-add review");
+        let mut connection = completed.fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let completed_graph = super::super::campaigns::checkpoint_successor_graph_matches_authority(
+            &transaction,
+            &completed.authority,
+            None,
+            None,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        let arbitrary = checkpoint_dispatch_fixture();
+        ExperimentRepository::new(&arbitrary.fixture.db)
+            .fail_checkpoint_before_add(
+                &arbitrary.authority,
+                "research_checkpoint_verification_failed",
+                3_208,
+            )
+            .expect("checkpoint arbitrary pre-add failure");
+        arbitrary
+            .fixture
+            .db
+            .connect()
+            .expect("checkpoint arbitrary pre-add connection")
+            .execute(
+                "UPDATE experiments
+                 SET failure_code = 'unrelated-failure',
+                     failure_fingerprint = 'unrelated-fingerprint'
+                 WHERE experiment_id = ?1",
+                [&arbitrary.authority.successor_experiment_id],
+            )
+            .expect("checkpoint arbitrary pre-add experiment");
+        let mut connection = arbitrary.fixture.db.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let arbitrary_graph = super::super::campaigns::checkpoint_successor_graph_matches_authority(
+            &transaction,
+            &arbitrary.authority,
+            None,
+            None,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        assert!(
+            completed_graph && !arbitrary_graph,
+            "completed_graph={completed_graph}, arbitrary_graph={arbitrary_graph}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_successor_replay_is_exact_and_partial_graph_blocks_without_resources() {
+        let prepared = checkpoint_dispatch_fixture();
+        let before = checkpoint_graph_snapshot(&prepared);
+        let mut connection = prepared.fixture.db.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let owner = match research_ownership_in_transaction(
+            &transaction,
+            &prepared.fixture.project_id,
+            &prepared.fixture.campaign_id,
+            &prepared.fixture.experiment_id,
+        )
+        .unwrap()
+        {
+            ResearchOwnership::Open(Some(owner)) => owner,
+            other => panic!("unexpected replay owner: {other:?}"),
+        };
+        assert!(matches!(
+            super::super::campaigns::accept_checkpoint_successor_in_transaction(
+                &transaction,
+                &owner,
+                &CampaignLimits::default(),
+                3_210,
+            )
+            .unwrap(),
+            CheckpointSuccessorAdmission::Ready(_)
+        ));
+        transaction.commit().unwrap();
+        assert_eq!(checkpoint_graph_snapshot(&prepared), before);
+
+        let partial = checkpoint_dispatch_fixture();
+        let mut connection = partial.fixture.db.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let owner = match research_ownership_in_transaction(
+            &transaction,
+            &partial.fixture.project_id,
+            &partial.fixture.campaign_id,
+            &partial.fixture.experiment_id,
+        )
+        .unwrap()
+        {
+            ResearchOwnership::Open(Some(owner)) => owner,
+            other => panic!("unexpected partial owner: {other:?}"),
+        };
+        transaction.commit().unwrap();
+        partial
+            .fixture
+            .db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE proposals SET hypothesis = 'partial replay mutation'
+                 WHERE proposal_id = ?1",
+                [&partial.authority.proposal_id],
+            )
+            .unwrap();
+        let mutated = checkpoint_graph_snapshot(&partial);
+        let mut connection = partial.fixture.db.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(matches!(
+            super::super::campaigns::accept_checkpoint_successor_in_transaction(
+                &transaction,
+                &owner,
+                &CampaignLimits::default(),
+                3_211,
+            )
+            .unwrap(),
+            CheckpointSuccessorAdmission::Blocked
+        ));
+        transaction.commit().unwrap();
+        let after = checkpoint_graph_snapshot(&partial);
+        assert_eq!(after.proposal, mutated.proposal);
+        assert_eq!(after.submission, mutated.submission);
+        assert_eq!(after.experiment, mutated.experiment);
+        assert_eq!(after.reservation, mutated.reservation);
+        assert_eq!(after.termination, mutated.termination);
+        assert_eq!(after.resource_counts, mutated.resource_counts);
+        assert_eq!(after.review[0], rusqlite::types::Value::Text("blocked".to_owned()));
     }
 
     #[test]

@@ -9,13 +9,14 @@ use crate::{
         discard_undispatched_research_action_in_transaction, ready_research_action_in_transaction,
     },
     db::{
-        count_live_reservations, discard_ready_research_action_in_transaction, next_research_due,
-        research_ownership_in_transaction, CampaignRepository, Db, DecisionRepository,
-        ExperimentRepository, IncidentRepository, ProjectRepository, ResearchOwnership,
-        ResearchRepository, TerminalDecisionEventProjection, TerminationRequestRepository,
+        discard_ready_research_action_in_transaction, next_research_due,
+        replacement_admission_available_in_transaction, research_ownership_in_transaction,
+        CampaignRepository, Db, DecisionRepository, ExperimentRepository, IncidentRepository,
+        ProjectRepository, ResearchOwnership, ResearchRepository,
+        TerminalDecisionEventProjection, TerminationRequestRepository,
     },
     execution_policy::ResolvedExecutionPolicy,
-    models::{BudgetDimension, NewIncident, NewTerminationRequest},
+    models::{NewIncident, NewTerminationRequest},
     output::bounded_redacted_text,
     pueue::{PueueApi, PueueTask},
     reconcile::{managed_task_run_signature, parse_timestamp, task_incident_key},
@@ -200,11 +201,11 @@ pub async fn advance_research_actions<P: PueueApi + ?Sized>(
                 )?
             }
             "stop_and_next" => {
-                if !replacement_admission_available(
+                if !replacement_admission_available_in_transaction(
                     &transaction,
                     &action.owner.campaign_id,
                     &action.owner.source_experiment_id,
-                    policy.campaign_limits,
+                    &policy.campaign_limits,
                     now,
                 )? {
                     transaction
@@ -591,35 +592,4 @@ fn terminal_exit_code(result: &Value) -> Option<i32> {
         .and_then(|object| object.get("Failed").or_else(|| object.get("Success")))
         .and_then(Value::as_i64)
         .and_then(|code| i32::try_from(code).ok())
-}
-
-fn replacement_admission_available(
-    transaction: &rusqlite::Transaction<'_>,
-    campaign_id: &str,
-    source_experiment_id: &str,
-    limits: crate::execution_policy::CampaignLimits,
-    now: i64,
-) -> Result<bool, AppError> {
-    let parallel_count: i64 = transaction
-        .query_row(
-            "SELECT COUNT(*) FROM experiments
-             WHERE campaign_id = ?1 AND experiment_id <> ?2
-               AND status IN ('reserved','submitting','accepted','unreconciled')",
-            rusqlite::params![campaign_id, source_experiment_id],
-            |row| row.get(0),
-        )
-        .map_err(crate::db::database_error(
-            "count replacement experiment capacity",
-        ))?;
-    if parallel_count >= i64::from(limits.max_parallel_experiments) {
-        return Ok(false);
-    }
-    let experiment_budget =
-        count_live_reservations(transaction, campaign_id, BudgetDimension::Experiment, now)?;
-    if experiment_budget >= i64::from(limits.max_new_experiments_per_24h) {
-        return Ok(false);
-    }
-    let agent_budget =
-        count_live_reservations(transaction, campaign_id, BudgetDimension::AgentRun, now)?;
-    Ok(agent_budget < i64::from(limits.max_agent_runs_per_hour))
 }

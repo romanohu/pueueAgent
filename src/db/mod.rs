@@ -28,8 +28,15 @@ pub use research::{
 };
 pub(crate) use research::{
     bind_research_termination_intent_in_transaction, complete_research_continue_in_transaction,
+    bind_checkpoint_termination_intent_in_transaction,
+    block_checkpoint_orphan_in_transaction, block_invalid_checkpoint_review_in_transaction,
     checkpoint_source_authority_for_preparation, CheckpointSourceAuthority,
     CheckpointSourceAuthorityRead,
+    prepared_checkpoint_source_authority_in_connection,
+    CheckpointDispatchAuthority, CheckpointDispatchSelection, CheckpointSuccessorAdmission,
+    CheckpointSuccessorPreflight, checkpoint_successor_preflight_in_transaction,
+    checkpoint_retry_admission_available_for_campaign,
+    checkpoint_retry_admission_count,
     completed_research_handoff_in_transaction,
     CheckpointJsonState, CheckpointSqliteStorageClass,
     discard_ready_research_action_in_transaction,
@@ -39,6 +46,10 @@ pub(crate) use research::{
     native_research_authority_immutable_matches, ready_research_action_in_transaction,
     research_ownership_in_transaction, startup_research_owner_snapshot, ReadyResearchAction,
     CompletedResearchHandoff, ResearchOwnership, ResearchOwnershipSnapshot, StartupResearchOwner,
+};
+pub(crate) use campaigns::{
+    accept_checkpoint_successor_in_transaction,
+    replacement_admission_available_in_transaction,
 };
 pub use running_health::HealthRepository;
 

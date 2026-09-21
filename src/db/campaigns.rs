@@ -20,12 +20,15 @@ use crate::{
     },
     output::bounded_redacted_text,
     proposals::{self, ProposalInput, ValidatedProposal},
+    research_checkpoint::parse_prepared_checkpoint,
     state::ObjectiveSnapshot,
     AppError,
 };
 
 use super::{
     code_changes::validate_sha, database_error, research_ownership_in_transaction, Db,
+    prepared_checkpoint_source_authority_in_connection, CheckpointDispatchAuthority,
+    CheckpointSuccessorAdmission,
     DecisionRepository, DecisionReservation, ResearchOwnership, ResearchOwnershipSnapshot,
 };
 
@@ -1943,6 +1946,14 @@ impl<'db> CampaignRepository<'db> {
                    AND project.enabled = 1
                    AND project.paused = 0
                    AND project.halted_reason IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM research_reviews AS review
+                       WHERE review.campaign_id = experiment.campaign_id
+                         AND review.successor_experiment_id = experiment.experiment_id
+                         AND review.state = 'blocked'
+                         AND review.operation_stage = 'successor_reserved'
+                         AND review.decision_cycle_id IS NULL
+                   )
                  ORDER BY experiment.experiment_id
                  LIMIT ?1",
             )
@@ -3177,6 +3188,26 @@ impl<'db> ExperimentRepository<'db> {
                 "reserved experiment submission identity is inconsistent",
             ));
         }
+        let checkpoint_successor_marker: bool = transaction
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM research_reviews AS review
+                         WHERE review.successor_experiment_id = ?1
+                           AND {}
+                     )",
+                    super::research::CHECKPOINT_INCOMING_CLAIM_PREDICATE
+                ),
+                [experiment_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("check checkpoint successor marker"))?;
+        if checkpoint_successor_marker {
+            return Err(validation_error(
+                "research.checkpoint",
+                "checkpoint successor requires checkpoint dispatch authority",
+            ));
+        }
         let project_available = project_is_available(&transaction, &campaign.project_id)?;
         if campaign.state == CampaignState::BudgetWaiting && campaign.next_eligible_at.is_none() {
             return Err(validation_error(
@@ -3201,6 +3232,387 @@ impl<'db> ExperimentRepository<'db> {
             .commit()
             .map_err(database_error("commit experiment submitting transition"))?;
         Ok(Some(stored))
+    }
+
+    pub(crate) fn begin_checkpoint_submitting_or_defer(
+        &self,
+        authority: &CheckpointDispatchAuthority,
+        now: i64,
+    ) -> Result<Option<Experiment>, AppError> {
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin checkpoint submitting transition"))?;
+        let campaign = read_campaign(&transaction, &authority.campaign_id)?;
+        if campaign.project_id != authority.project_id
+            || campaign.state != CampaignState::Active
+            || !project_is_available(&transaction, &campaign.project_id)?
+        {
+            transaction
+                .commit()
+                .map_err(database_error("commit deferred checkpoint submission"))?;
+            return Ok(None);
+        }
+        let experiment = read_experiment(&transaction, &authority.successor_experiment_id)?;
+        let submission = read_submission(&transaction, &experiment.submission_id)?;
+        let review = transaction
+            .query_row(
+                "SELECT state, operation_stage,
+                        CASE
+                          WHEN typeof(checkpoint_json) = 'text'
+                           AND length(CAST(checkpoint_json AS BLOB)) BETWEEN 1 AND 131072
+                          THEN checkpoint_json
+                        END,
+                        typeof(checkpoint_json), length(CAST(checkpoint_json AS BLOB)),
+                        successor_experiment_id, termination_request_id
+                 FROM research_reviews
+                 WHERE review_id = ?1 AND campaign_id = ?2 AND experiment_id = ?3",
+                params![authority.review_id, authority.campaign_id, authority.source_experiment_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error("read checkpoint submitting review"))?;
+        let Some((state, stage, raw, storage, byte_len, successor_id, termination_request_id)) = review else {
+            return Err(validation_error(
+                "research.review",
+                "checkpoint dispatch review is missing",
+            ));
+        };
+        if state != "ready"
+            || stage.as_deref() != Some("successor_reserved")
+            || successor_id.as_deref() != Some(authority.successor_experiment_id.as_str())
+            || storage != "text"
+            || byte_len != Some(authority.raw_checkpoint.as_bytes().len() as i64)
+            || raw.as_deref() != Some(authority.raw_checkpoint.as_str())
+            || experiment.experiment_id != authority.successor_experiment_id
+            || experiment.proposal_id != authority.proposal_id
+            || experiment.submission_id != authority.submission_id
+            || experiment.parent_experiment_id.as_deref()
+                != Some(authority.source_experiment_id.as_str())
+            || experiment.status != ExperimentStatus::Reserved
+            || submission.status != SubmissionStatus::Pending
+            || submission.pueue_task_id.is_some()
+            || submission.task_signature.is_some()
+            || termination_request_id.is_none()
+        {
+            return Err(validation_error(
+                "research.checkpoint",
+                "dispatch authority changed before submitting",
+            ));
+        }
+        if !checkpoint_successor_graph_matches_authority(
+            &transaction,
+            authority,
+            Some("reserved"),
+            Some(ExperimentStatus::Reserved),
+        )? {
+            return Err(validation_error(
+                "research.checkpoint",
+                "successor graph changed before submitting",
+            ));
+        }
+        let termination_confirmed: bool = transaction
+            .query_row(
+                "SELECT project_id = ?1 AND task_signature = ?2
+                        AND status = 'confirmed' AND confirmed_at IS NOT NULL
+                 FROM termination_requests WHERE request_id = ?3",
+                params![
+                    authority.project_id,
+                    authority.checkpoint.source_raw_task_signature,
+                    termination_request_id,
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read checkpoint submitting termination"))?
+            .unwrap_or(false);
+        if !termination_confirmed {
+            return Err(validation_error(
+                "research.termination_request",
+                "checkpoint termination is not confirmed",
+            ));
+        }
+        prepared_checkpoint_source_authority_in_connection(&transaction, &authority.checkpoint)?;
+        transaction
+            .execute(
+                "UPDATE experiments
+                 SET status = 'submitting', updated_at = ?1
+                 WHERE experiment_id = ?2 AND status = 'reserved'",
+                params![now, authority.successor_experiment_id],
+            )
+            .map_err(database_error("mark checkpoint experiment submitting"))?;
+        let stored = read_experiment(&transaction, &authority.successor_experiment_id)?;
+        transaction
+            .commit()
+            .map_err(database_error("commit checkpoint submitting transition"))?;
+        Ok(Some(stored))
+    }
+
+    pub(crate) fn fail_checkpoint_before_add(
+        &self,
+        authority: &CheckpointDispatchAuthority,
+        failure_code: &'static str,
+        now: i64,
+    ) -> Result<(), AppError> {
+        const CHECKPOINT_VERIFICATION_FAILED: &str =
+            super::research::CHECKPOINT_PRE_ADD_FAILURE_CODE;
+        if failure_code != CHECKPOINT_VERIFICATION_FAILED {
+            return Err(validation_error(
+                "failure_code",
+                "checkpoint pre-add failures use the fixed verification code",
+            ));
+        }
+        let mut connection = self.db.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error("begin checkpoint pre-add failure"))?;
+        let experiment = read_experiment(&transaction, &authority.successor_experiment_id)?;
+        let submission = read_submission(&transaction, &experiment.submission_id)?;
+        let reservation = transaction
+            .query_row(
+                "SELECT status FROM budget_reservations
+                 WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                [&authority.successor_experiment_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(database_error("read checkpoint pre-add reservation"))?;
+        let mut fingerprint_digest = Sha256::new();
+        fingerprint_digest.update(failure_code.as_bytes());
+        fingerprint_digest.update([0]);
+        fingerprint_digest.update(authority.raw_checkpoint.as_bytes());
+        let fingerprint = format!(
+            "research-checkpoint-pre-add:{:x}",
+            fingerprint_digest.finalize()
+        );
+        let review = transaction
+            .query_row(
+                "SELECT state, operation_stage,
+                        CASE
+                          WHEN typeof(checkpoint_json) = 'text'
+                           AND length(CAST(checkpoint_json AS BLOB)) BETWEEN 1 AND 131072
+                          THEN checkpoint_json
+                        END,
+                        typeof(checkpoint_json), length(CAST(checkpoint_json AS BLOB)),
+                        successor_experiment_id, termination_request_id
+                 FROM research_reviews
+                 WHERE review_id = ?1 AND campaign_id = ?2 AND experiment_id = ?3",
+                params![authority.review_id, authority.campaign_id, authority.source_experiment_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                    ))
+                },
+            )
+        .map_err(database_error("read checkpoint pre-add review"))?;
+        let review_failure_code: Option<String> = transaction
+            .query_row(
+                "SELECT failure_code FROM research_reviews WHERE review_id = ?1",
+                [&authority.review_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error("read checkpoint pre-add failure code"))?;
+        let already_settled = review.0 == "blocked"
+            && review.1.as_deref() == Some("successor_reserved")
+            && review.2.as_deref() == Some(authority.raw_checkpoint.as_str())
+            && review.3 == "text"
+            && review.4 == Some(authority.raw_checkpoint.as_bytes().len() as i64)
+            && review.5.as_deref() == Some(authority.successor_experiment_id.as_str())
+            && review.6.is_some()
+            && review_failure_code.as_deref() == Some(failure_code)
+            && experiment.status == ExperimentStatus::Failed
+            && experiment.failure_code.as_deref() == Some(failure_code)
+            && experiment.failure_fingerprint.as_deref() == Some(fingerprint.as_str())
+            && experiment.pueue_task_id.is_none()
+            && experiment.task_signature.is_none()
+            && submission.status == SubmissionStatus::Failed
+            && submission.pueue_task_id.is_none()
+            && submission.task_signature.is_none()
+            && reservation.as_deref() == Some("consumed");
+        if already_settled {
+            if !checkpoint_successor_graph_matches_authority(
+                &transaction,
+                authority,
+                None,
+                None,
+            )? {
+                return Err(validation_error(
+                    "research.checkpoint",
+                    "settled checkpoint successor graph is not exact",
+                ));
+            }
+            let request_id = review.6.expect("settled checkpoint has termination request");
+            let termination_confirmed: bool = transaction
+                .query_row(
+                    "SELECT project_id = ?1 AND task_signature = ?2
+                            AND status = 'confirmed' AND confirmed_at IS NOT NULL
+                     FROM termination_requests WHERE request_id = ?3",
+                    params![
+                        authority.project_id,
+                        authority.checkpoint.source_raw_task_signature,
+                        request_id,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(database_error("read settled checkpoint termination"))?
+                .unwrap_or(false);
+            if !termination_confirmed {
+                return Err(validation_error(
+                    "research.termination_request",
+                    "settled checkpoint termination is not confirmed",
+                ));
+            }
+            prepared_checkpoint_source_authority_in_connection(&transaction, &authority.checkpoint)?;
+            transaction
+                .commit()
+                .map_err(database_error("commit idempotent checkpoint pre-add failure"))?;
+            return Ok(());
+        }
+        if !matches!(experiment.status, ExperimentStatus::Reserved | ExperimentStatus::Submitting)
+            || submission.status != SubmissionStatus::Pending
+            || experiment.pueue_task_id.is_some()
+            || experiment.task_signature.is_some()
+            || submission.pueue_task_id.is_some()
+            || submission.task_signature.is_some()
+            || review.0 != "ready"
+            || review.1.as_deref() != Some("successor_reserved")
+            || review.2.as_deref() != Some(authority.raw_checkpoint.as_str())
+            || review.3 != "text"
+            || review.4 != Some(authority.raw_checkpoint.as_bytes().len() as i64)
+            || review.5.as_deref() != Some(authority.successor_experiment_id.as_str())
+            || review.6.is_none()
+            || reservation.as_deref() != Some("reserved")
+        {
+            return Err(validation_error(
+                "research.checkpoint",
+                "pre-add failure shape is not pending and exact",
+            ));
+        }
+        if review.3 != "text"
+            || !review.4.is_some_and(|len| (1..=131_072).contains(&len))
+            || !checkpoint_successor_graph_matches_authority(
+                &transaction,
+                authority,
+                Some("reserved"),
+                None,
+            )?
+        {
+            return Err(validation_error(
+                "research.checkpoint",
+                "successor graph changed before pre-add failure",
+            ));
+        }
+        let request_id = review.6.expect("pending checkpoint has termination request");
+        let termination_confirmed: bool = transaction
+            .query_row(
+                "SELECT project_id = ?1 AND task_signature = ?2
+                        AND status = 'confirmed' AND confirmed_at IS NOT NULL
+                 FROM termination_requests WHERE request_id = ?3",
+                params![
+                    authority.project_id,
+                    authority.checkpoint.source_raw_task_signature,
+                    request_id,
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read checkpoint pre-add termination"))?
+            .unwrap_or(false);
+        if !termination_confirmed {
+            return Err(validation_error(
+                "research.termination_request",
+                "checkpoint termination is not confirmed",
+            ));
+        }
+        prepared_checkpoint_source_authority_in_connection(&transaction, &authority.checkpoint)?;
+        let changed = transaction
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'blocked', failure_code = ?1,
+                     finished_at = ?2, not_before = ?2, updated_at = ?2
+                 WHERE review_id = ?3 AND state = 'ready'
+                   AND operation_stage = 'successor_reserved'
+                   AND successor_experiment_id = ?4
+                   AND checkpoint_json = ?5",
+                params![
+                    failure_code,
+                    now,
+                    authority.review_id,
+                    authority.successor_experiment_id,
+                    authority.raw_checkpoint,
+                ],
+            )
+            .map_err(database_error("block checkpoint pre-add review"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "research.review",
+                "checkpoint pre-add review changed before blocking",
+            ));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE submissions SET status = 'failed'
+                 WHERE submission_id = ?1 AND status = 'pending'",
+                [&authority.submission_id],
+            )
+            .map_err(database_error("fail checkpoint pre-add submission"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "submission",
+                "checkpoint pre-add submission changed before failure",
+            ));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE experiments
+                 SET status = 'failed', failure_code = ?1,
+                     failure_fingerprint = ?2, updated_at = ?3, finished_at = ?3
+                 WHERE experiment_id = ?4 AND status IN ('reserved','submitting')
+                   AND pueue_task_id IS NULL AND task_signature IS NULL",
+                params![failure_code, fingerprint, now, authority.successor_experiment_id],
+            )
+            .map_err(database_error("fail checkpoint pre-add experiment"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "experiment",
+                "checkpoint pre-add experiment changed before failure",
+            ));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE budget_reservations
+                 SET status = 'consumed', updated_at = ?1
+                 WHERE experiment_id = ?2 AND dimension = 'experiment'
+                   AND status = 'reserved'",
+                params![now, authority.successor_experiment_id],
+            )
+            .map_err(database_error("consume checkpoint pre-add reservation"))?;
+        if changed != 1 {
+            return Err(validation_error(
+                "budget_reservation",
+                "checkpoint pre-add reservation changed before consumption",
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(database_error("commit checkpoint pre-add failure"))
     }
 
     pub fn mark_accepted(
@@ -3549,6 +3961,399 @@ fn validate_project_available(
     Ok(())
 }
 
+pub(super) fn checkpoint_successor_graph_matches_authority(
+    transaction: &Transaction<'_>,
+    authority: &CheckpointDispatchAuthority,
+    required_reservation_status: Option<&str>,
+    required_experiment_status: Option<ExperimentStatus>,
+) -> Result<bool, AppError> {
+    let checkpoint_pre_add_failure_code = super::research::CHECKPOINT_PRE_ADD_FAILURE_CODE;
+    let checkpoint = &authority.checkpoint;
+    let incoming_claim_count: i64 = transaction
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM research_reviews AS review
+                 WHERE review.successor_experiment_id = ?1
+                   AND {}",
+                super::research::CHECKPOINT_INCOMING_CLAIM_PREDICATE
+            ),
+            [&authority.successor_experiment_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("count incoming checkpoint successor claims"))?;
+    if incoming_claim_count != 1 {
+        return Ok(false);
+    }
+    let review = transaction
+        .query_row(
+            "SELECT state, operation_stage, termination_request_id, task_signature,
+                    attempt, session_generation, agent_run_id, event_id,
+                    failure_code,
+                    CASE
+                      WHEN typeof(checkpoint_json) = 'text'
+                       AND length(CAST(checkpoint_json AS BLOB)) BETWEEN 1 AND 131072
+                      THEN checkpoint_json
+                    END,
+                    typeof(checkpoint_json), length(CAST(checkpoint_json AS BLOB)),
+                    decision_cycle_id
+             FROM research_reviews
+             WHERE review_id = ?1 AND campaign_id = ?2 AND experiment_id = ?3
+               AND successor_experiment_id = ?4",
+            params![
+                authority.review_id,
+                authority.campaign_id,
+                authority.source_experiment_id,
+                authority.successor_experiment_id,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read checkpoint successor authority review"))?;
+    let Some((
+        review_state,
+        operation_stage,
+        termination_request_id,
+        review_task_signature,
+        review_attempt,
+        review_session_generation,
+        review_agent_run_id,
+        review_event_id,
+        review_failure_code,
+        raw,
+        storage,
+        byte_len,
+        review_decision_cycle_id,
+    )) = review
+    else {
+        return Ok(false);
+    };
+    let review_shape_ok = match (review_state.as_str(), operation_stage.as_deref()) {
+        ("ready", Some("successor_reserved"))
+        | ("completed", None)
+        | ("blocked", Some("successor_reserved")) => true,
+        _ => false,
+    };
+    if !review_shape_ok
+        || required_reservation_status.is_some()
+            && (review_state != "ready" || operation_stage.as_deref() != Some("successor_reserved"))
+        || review_task_signature != checkpoint.source_managed_task_signature
+        || review_attempt != checkpoint.review_attempt
+        || review_session_generation != checkpoint.review_session_generation
+        || review_agent_run_id != Some(checkpoint.review_agent_run_id)
+        || review_event_id != Some(checkpoint.review_event_id)
+        || (review_state == "ready" && review_failure_code.is_some())
+        || (review_state == "completed"
+            && review_failure_code
+                .as_deref()
+                .is_some_and(|code| code != checkpoint_pre_add_failure_code))
+        || (review_state == "blocked"
+            && review_failure_code.as_deref()
+                != Some(checkpoint_pre_add_failure_code))
+        || review_decision_cycle_id.is_some()
+        || storage != "text"
+        || byte_len != Some(checkpoint_serialized_len(&authority.raw_checkpoint)?)
+        || raw.as_deref() != Some(authority.raw_checkpoint.as_str())
+    {
+        return Ok(false);
+    }
+    let Some(termination_request_id) = termination_request_id else {
+        return Ok(false);
+    };
+    if authority.termination_request_id != Some(termination_request_id) {
+        return Ok(false);
+    }
+    let termination_confirmed: bool = transaction
+        .query_row(
+            "SELECT project_id = ?1 AND task_signature = ?2
+                    AND status = 'confirmed' AND confirmed_at IS NOT NULL
+             FROM termination_requests WHERE request_id = ?3",
+            params![
+                authority.project_id,
+                checkpoint.source_raw_task_signature,
+                termination_request_id,
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("read checkpoint successor termination"))?
+        .unwrap_or(false);
+    if !termination_confirmed
+        || prepared_checkpoint_source_authority_in_connection(transaction, checkpoint).is_err()
+        || !super::research::checkpoint_native_research_owner_complete(transaction, authority)?
+    {
+        return Ok(false);
+    }
+
+    let intent = match read_intent_by_experiment(transaction, &authority.successor_experiment_id) {
+        Ok(intent) => intent,
+        Err(_) => return Ok(false),
+    };
+    let (resume_of_experiment_id, persisted_checkpoint_note): (Option<String>, Option<String>) = transaction
+        .query_row(
+            "SELECT resume_of_experiment_id, checkpoint_note
+             FROM experiments WHERE experiment_id = ?1",
+            [&authority.successor_experiment_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(database_error("read checkpoint successor lineage"))?;
+    let expected_checkpoint_note = format!(
+        "research-checkpoint:{:x}",
+        Sha256::digest(authority.raw_checkpoint.as_bytes())
+    );
+    let source_proposal = match read_proposal(transaction, &checkpoint.source_proposal_id) {
+        Ok(proposal) => proposal,
+        Err(_) => return Ok(false),
+    };
+    let expected_proposal = match proposals::validate(
+        ProposalInput {
+            kind: ProposalKind::Experiment,
+            hypothesis: format!(
+                "Resume {} from its verified checkpoint",
+                authority.source_experiment_id
+            ),
+            source_experiment_id: Some(authority.source_experiment_id.clone()),
+            argv: checkpoint.retained_argv.clone(),
+            working_directory: checkpoint.source_working_directory.clone(),
+            expected_evidence: source_proposal.expected_evidence.clone(),
+        },
+        &intent.campaign.objective_digest,
+    ) {
+        Ok(proposal) => proposal,
+        Err(_) => return Ok(false),
+    };
+    let expected_submission_metadata = match serialize_submission_metadata(
+        None,
+        &authority.campaign_id,
+        &authority.proposal_id,
+        &authority.successor_experiment_id,
+    )
+    .ok()
+    .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+    {
+        Some(metadata) => metadata,
+        None => return Ok(false),
+    };
+    if intent.campaign.campaign_id != authority.campaign_id
+        || intent.campaign.project_id != authority.project_id
+        || intent.campaign.objective_digest != checkpoint.campaign_objective_digest
+        || intent.proposal.proposal_id != authority.proposal_id
+        || intent.proposal.campaign_id != authority.campaign_id
+        || intent.proposal.kind != ProposalKind::Experiment
+        || intent.proposal.status != ProposalStatus::Accepted
+        || intent.proposal.reject_reason.is_some()
+        || intent.proposal.hypothesis != expected_proposal.hypothesis()
+        || intent.proposal.source_experiment_id.as_deref()
+            != Some(authority.source_experiment_id.as_str())
+        || intent.proposal.argv != expected_proposal.argv()
+        || intent.proposal.working_directory != expected_proposal.working_directory()
+        || intent.proposal.expected_evidence != expected_proposal.expected_evidence()
+        || intent.proposal.canonical_digest != expected_proposal.canonical_digest()
+        || source_proposal.campaign_id != authority.campaign_id
+        || intent.experiment.experiment_id != authority.successor_experiment_id
+        || intent.experiment.campaign_id != authority.campaign_id
+        || intent.experiment.proposal_id != authority.proposal_id
+        || intent.experiment.submission_id != authority.submission_id
+        || intent.experiment.parent_experiment_id.as_deref()
+            != Some(authority.source_experiment_id.as_str())
+        || resume_of_experiment_id.as_deref() != Some(authority.source_experiment_id.as_str())
+        || intent.experiment.attempt < 0
+        || authority
+            .successor_attempt
+            .is_some_and(|attempt| intent.experiment.attempt != attempt)
+        || persisted_checkpoint_note.as_deref() != Some(expected_checkpoint_note.as_str())
+        || intent.experiment.code_change_run_id.is_some()
+        || intent.experiment.code_revision_sha.is_some()
+        || intent.submission.submission_id != authority.submission_id
+        || intent.submission.project_id != authority.project_id
+        || intent.submission.argv != expected_proposal.argv()
+        || intent.submission.kind != SubmissionKind::Experiment
+        || intent.submission.origin_agent_run_id.is_some()
+        || intent.submission.metadata != expected_submission_metadata
+        || required_experiment_status.is_some_and(|status| intent.experiment.status != status)
+        || required_experiment_status.is_some_and(|_| {
+            intent.experiment.pueue_task_id.is_some()
+                || intent.experiment.task_signature.is_some()
+                || intent.experiment.failure_code.is_some()
+                || intent.experiment.failure_fingerprint.is_some()
+                || intent.experiment.finished_at.is_some()
+                || intent.submission.status != SubmissionStatus::Pending
+                || intent.submission.pueue_task_id.is_some()
+                || intent.submission.task_signature.is_some()
+        })
+    {
+        return Ok(false);
+    }
+    let expected_pre_add_fingerprint = {
+        let mut digest = Sha256::new();
+        digest.update(checkpoint_pre_add_failure_code.as_bytes());
+        digest.update([0]);
+        digest.update(authority.raw_checkpoint.as_bytes());
+        format!("research-checkpoint-pre-add:{:x}", digest.finalize())
+    };
+    let reservation = transaction
+        .query_row(
+            "SELECT reservation_id, campaign_id, experiment_id, dimension,
+                    subject_key, status, window_started_at, window_ends_at,
+                    created_at, updated_at
+             FROM budget_reservations
+             WHERE experiment_id = ?1 AND dimension = 'experiment'",
+            [&authority.successor_experiment_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read checkpoint successor reservation graph"))?;
+    let Some((
+        reservation_id,
+        reservation_campaign_id,
+        reservation_experiment_id,
+        reservation_dimension,
+        reservation_subject_key,
+        reservation_status,
+        window_started_at,
+        window_ends_at,
+        created_at,
+        updated_at,
+    )) = reservation
+    else {
+        return Ok(false);
+    };
+    let phase_ok = match intent.experiment.status {
+        ExperimentStatus::Reserved | ExperimentStatus::Submitting => {
+            reservation_status == "reserved"
+                && intent.submission.status == SubmissionStatus::Pending
+                && intent.experiment.pueue_task_id.is_none()
+                && intent.experiment.task_signature.is_none()
+                && intent.submission.pueue_task_id.is_none()
+                && intent.submission.task_signature.is_none()
+                && intent.experiment.failure_code.is_none()
+                && intent.experiment.failure_fingerprint.is_none()
+                && intent.experiment.finished_at.is_none()
+        }
+        ExperimentStatus::Accepted => {
+            reservation_status == "consumed"
+                && intent.submission.status == SubmissionStatus::Accepted
+                && intent.experiment.pueue_task_id.is_some()
+                && intent.experiment.task_signature.is_some()
+                && intent.submission.pueue_task_id == intent.experiment.pueue_task_id
+                && intent.submission.task_signature == intent.experiment.task_signature
+                && intent.experiment.failure_code.is_none()
+                && intent.experiment.failure_fingerprint.is_none()
+                && intent.experiment.finished_at.is_none()
+        }
+        ExperimentStatus::Unreconciled => {
+            reservation_status == "consumed"
+                && intent.submission.status == SubmissionStatus::Unreconciled
+                && intent.experiment.pueue_task_id.is_none()
+                && intent.experiment.task_signature.is_none()
+                && intent.submission.pueue_task_id.is_none()
+                && intent.submission.task_signature.is_none()
+                && intent.experiment.failure_code.is_some()
+                && intent.experiment.failure_fingerprint.is_none()
+                && intent.experiment.finished_at.is_none()
+        }
+        ExperimentStatus::Succeeded | ExperimentStatus::Cancelled => {
+            reservation_status == "consumed"
+                && intent.submission.status == SubmissionStatus::Accepted
+                && intent.experiment.pueue_task_id.is_some()
+                && intent.experiment.task_signature.is_some()
+                && intent.submission.pueue_task_id == intent.experiment.pueue_task_id
+                && intent.submission.task_signature == intent.experiment.task_signature
+                && intent.experiment.failure_code.is_none()
+                && intent.experiment.failure_fingerprint.is_none()
+                && intent.experiment.finished_at.is_some()
+        }
+        ExperimentStatus::Failed => {
+            let pre_add_failure = intent.submission.status == SubmissionStatus::Failed
+                && intent.experiment.pueue_task_id.is_none()
+                && intent.experiment.task_signature.is_none()
+                && intent.submission.pueue_task_id.is_none()
+                && intent.submission.task_signature.is_none()
+                && intent.experiment.failure_code.as_deref()
+                    == Some(checkpoint_pre_add_failure_code)
+                && intent.experiment.failure_fingerprint.as_deref()
+                    == Some(expected_pre_add_fingerprint.as_str());
+            let terminal_task_failure = intent.submission.status == SubmissionStatus::Accepted
+                && intent.experiment.pueue_task_id.is_some()
+                && intent.experiment.task_signature.is_some()
+                && intent.submission.pueue_task_id == intent.experiment.pueue_task_id
+                && intent.submission.task_signature == intent.experiment.task_signature
+                && intent.experiment.failure_code.is_some()
+                && intent.experiment.failure_code.as_deref()
+                    != Some(checkpoint_pre_add_failure_code)
+                && intent.experiment.failure_fingerprint.is_some();
+            reservation_status == "consumed"
+                && (pre_add_failure || terminal_task_failure)
+                && intent.experiment.finished_at.is_some()
+        }
+    };
+    let review_failure_matches_phase = match intent.experiment.status {
+        ExperimentStatus::Failed if intent.submission.status == SubmissionStatus::Failed => {
+            review_failure_code.as_deref() == Some(checkpoint_pre_add_failure_code)
+        }
+        _ => review_failure_code.is_none(),
+    };
+    if super::research::checkpoint_successor_reservation_count(
+        transaction,
+        &authority.successor_experiment_id,
+    )? != 1
+    {
+        return Ok(false);
+    }
+    Ok(phase_ok
+        && review_failure_matches_phase
+        && required_experiment_status
+            .is_none_or(|status| intent.experiment.status == status)
+        && reservation_id == format!("experiment:{}", authority.successor_experiment_id)
+        && reservation_campaign_id == authority.campaign_id
+        && reservation_experiment_id == authority.successor_experiment_id
+        && reservation_dimension == "experiment"
+        && reservation_subject_key == authority.successor_experiment_id
+        && required_reservation_status
+            .is_none_or(|status| reservation_status == status)
+        && (required_reservation_status.is_some()
+            || matches!(reservation_status.as_str(), "reserved" | "consumed"))
+        && window_ends_at > window_started_at
+        && authority
+            .reservation_window_ends_at
+            .is_none_or(|window_end| window_ends_at == window_end)
+        && created_at == window_started_at
+        && updated_at >= created_at)
+}
+
+fn checkpoint_serialized_len(raw_checkpoint: &str) -> Result<i64, AppError> {
+    i64::try_from(raw_checkpoint.as_bytes().len())
+        .map_err(|_| validation_error("research.checkpoint_json", "length overflows SQLite"))
+}
+
 fn project_is_available(
     transaction: &Transaction<'_>,
     project_id: &str,
@@ -3571,7 +4376,7 @@ fn project_is_available(
     Ok(state.0 && !state.1 && state.2.is_none())
 }
 
-fn insert_proposal(
+pub(super) fn insert_proposal(
     transaction: &Transaction<'_>,
     proposal_id: &str,
     campaign_id: &str,
@@ -3606,7 +4411,7 @@ fn insert_proposal(
     Ok(())
 }
 
-fn insert_submission(
+pub(super) fn insert_submission(
     transaction: &Transaction<'_>,
     submission_id: &str,
     project_id: &str,
@@ -3637,7 +4442,7 @@ fn insert_submission(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn insert_experiment(
+pub(super) fn insert_experiment(
     transaction: &Transaction<'_>,
     experiment_id: &str,
     campaign_id: &str,
@@ -3678,7 +4483,7 @@ fn insert_experiment(
     Ok(())
 }
 
-fn insert_experiment_reservation(
+pub(super) fn insert_experiment_reservation(
     transaction: &Transaction<'_>,
     campaign_id: &str,
     experiment_id: &str,
@@ -3919,6 +4724,450 @@ pub(crate) fn count_live_reservations(
         .map_err(database_error("count live rolling budget reservations"))
 }
 
+pub(crate) fn replacement_admission_available_in_transaction(
+    transaction: &Transaction<'_>,
+    campaign_id: &str,
+    source_experiment_id: &str,
+    limits: &CampaignLimits,
+    now: i64,
+) -> Result<bool, AppError> {
+    let parallel_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM experiments
+             WHERE campaign_id = ?1 AND experiment_id <> ?2
+               AND status IN ('reserved','submitting','accepted','unreconciled')",
+            params![campaign_id, source_experiment_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("count replacement experiment capacity"))?;
+    if parallel_count >= i64::from(limits.max_parallel_experiments) {
+        return Ok(false);
+    }
+    let experiment_budget =
+        count_live_reservations(transaction, campaign_id, BudgetDimension::Experiment, now)?;
+    if experiment_budget >= i64::from(limits.max_new_experiments_per_24h) {
+        return Ok(false);
+    }
+    let agent_budget =
+        count_live_reservations(transaction, campaign_id, BudgetDimension::AgentRun, now)?;
+    Ok(agent_budget < i64::from(limits.max_agent_runs_per_hour))
+}
+
+pub(crate) fn accept_checkpoint_successor_in_transaction(
+    transaction: &Transaction<'_>,
+    expected: &ResearchOwnershipSnapshot,
+    limits: &CampaignLimits,
+    now: i64,
+) -> Result<CheckpointSuccessorAdmission, AppError> {
+    let campaign = read_campaign(transaction, &expected.campaign_id)?;
+    if campaign.project_id != expected.project_id {
+        return Err(validation_error(
+            "research.project_id",
+            "checkpoint owner campaign belongs to another project",
+        ));
+    }
+    let replaying_reserved_successor =
+        expected.operation_stage.as_deref() == Some("successor_reserved");
+    if !matches!(
+        expected.operation_stage.as_deref(),
+        Some("stop_confirmed" | "successor_reserved")
+    )
+        || expected.recovery_required
+        || expected.decision_cycle_id.is_some()
+        || (!replaying_reserved_successor && expected.successor_experiment_id.is_some())
+        || expected.termination_request_id.is_none()
+    {
+        return Err(validation_error(
+            "research.owner",
+            "checkpoint admission requires an exact stop-confirmed owner",
+        ));
+    }
+    let ownership = research_ownership_in_transaction(
+        transaction,
+        &expected.project_id,
+        &expected.campaign_id,
+        &expected.source_experiment_id,
+    )?;
+    let owner_matches = match ownership {
+        ResearchOwnership::Open(Some(owner)) => {
+            if !replaying_reserved_successor {
+                !owner.recovery_required && owner == *expected
+            } else {
+                let mut expected_identity = expected.clone();
+                expected_identity.recovery_required = owner.recovery_required;
+                owner == expected_identity
+            }
+        }
+        _ => false,
+    };
+    if !owner_matches {
+        if replaying_reserved_successor {
+            return Err(validation_error(
+                "research.owner",
+                "checkpoint successor replay owner is ambiguous",
+            ));
+        } else {
+            return Err(validation_error(
+                "research.owner",
+                "checkpoint owner changed before admission",
+            ));
+        }
+    }
+    let (state, operation_stage, termination_request_id, decision_cycle_id, linked_successor_id, raw, storage, byte_len) = transaction
+        .query_row(
+            "SELECT state, operation_stage, termination_request_id,
+                    decision_cycle_id, successor_experiment_id,
+                    CASE
+                      WHEN typeof(checkpoint_json) = 'text'
+                       AND length(CAST(checkpoint_json AS BLOB)) BETWEEN 1 AND 131072
+                      THEN checkpoint_json
+                    END,
+                    typeof(checkpoint_json), length(CAST(checkpoint_json AS BLOB))
+            FROM research_reviews
+             WHERE review_id = ?1 AND campaign_id = ?2 AND experiment_id = ?3
+               AND task_signature = ?4 AND attempt = ?5
+               AND session_generation = ?6 AND agent_run_id IS ?7 AND event_id IS ?8",
+            params![
+                expected.review_id,
+                expected.campaign_id,
+                expected.source_experiment_id,
+                expected.managed_task_signature,
+                expected.attempt,
+                expected.session_generation,
+                expected.agent_run_id,
+                expected.event_id,
+            ],
+            |row| {
+                let raw = match row.get::<_, Option<String>>(5)? {
+                    Some(value) => Some(value),
+                    None => None,
+                };
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    raw,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database_error("read checkpoint successor review"))?
+        .ok_or_else(|| validation_error("research.review", "checkpoint owner is missing"))?;
+    if !matches!(operation_stage.as_deref(), Some("stop_confirmed" | "successor_reserved"))
+        || state != "ready"
+        || decision_cycle_id.is_some()
+        || termination_request_id != expected.termination_request_id
+    {
+        return Err(validation_error(
+            "research.review",
+            "is not at the exact checkpoint admission phase",
+        ));
+    }
+    if storage != "text"
+        || !byte_len.is_some_and(|len| (1..=131_072).contains(&len))
+    {
+        return Err(validation_error(
+            "research.checkpoint_json",
+            "must be bounded text",
+        ));
+    }
+    let raw = raw.ok_or_else(|| {
+        validation_error("research.checkpoint_json", "must contain valid UTF-8 text")
+    })?;
+    let checkpoint = parse_prepared_checkpoint(&raw)?;
+    if linked_successor_id.as_deref().is_some_and(|id| id != checkpoint.successor_ids.experiment_id)
+    {
+        return Err(validation_error(
+            "research.successor_experiment_id",
+            "does not match the prepared checkpoint",
+        ));
+    }
+    if checkpoint.review_id != expected.review_id
+        || checkpoint.campaign_id != expected.campaign_id
+        || checkpoint.source_experiment_id != expected.source_experiment_id
+        || checkpoint.review_attempt != expected.attempt
+        || checkpoint.review_session_generation != expected.session_generation
+        || expected.agent_run_id != Some(checkpoint.review_agent_run_id)
+        || expected.event_id != Some(checkpoint.review_event_id)
+        || checkpoint.source_managed_task_signature != expected.managed_task_signature
+    {
+        return Err(validation_error(
+            "research.checkpoint",
+            "does not match the owner snapshot",
+        ));
+    }
+    let request_id = termination_request_id.ok_or_else(|| {
+        validation_error("research.termination_request_id", "is missing")
+    })?;
+    let request_matches: bool = transaction
+        .query_row(
+            "SELECT project_id = ?1 AND task_signature = ?2
+                    AND status = 'confirmed' AND confirmed_at IS NOT NULL
+             FROM termination_requests WHERE request_id = ?3",
+            params![expected.project_id, checkpoint.source_raw_task_signature, request_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error("read confirmed checkpoint termination"))?
+        .unwrap_or(false);
+    if !request_matches {
+        return Err(validation_error(
+            "research.termination_request",
+            "checkpoint source termination is not confirmed",
+        ));
+    }
+    let authority = prepared_checkpoint_source_authority_in_connection(transaction, &checkpoint)?;
+    let source = authority.source;
+    if source.experiment.experiment_id != expected.source_experiment_id
+        || source.proposal.campaign_id != expected.campaign_id
+        || source.proposal.status != ProposalStatus::Accepted
+        || source.submission.status != SubmissionStatus::Accepted
+    {
+        return Err(validation_error(
+            "research.source",
+            "checkpoint source graph is not accepted",
+        ));
+    }
+    let successor_id = checkpoint.successor_ids.experiment_id.clone();
+    let successor_witness = if operation_stage.as_deref() == Some("successor_reserved") {
+        super::research::checkpoint_successor_witness(transaction, &successor_id)?
+    } else {
+        None
+    };
+    let dispatch_authority = CheckpointDispatchAuthority {
+        checkpoint: checkpoint.clone(),
+        raw_checkpoint: raw.clone(),
+        project_id: expected.project_id.clone(),
+        campaign_id: expected.campaign_id.clone(),
+        review_id: expected.review_id.clone(),
+        source_experiment_id: expected.source_experiment_id.clone(),
+        proposal_id: checkpoint.successor_ids.proposal_id.clone(),
+        submission_id: checkpoint.successor_ids.submission_id.clone(),
+        successor_experiment_id: successor_id.clone(),
+        successor_attempt: successor_witness.map(|(attempt, _)| attempt),
+        reservation_window_ends_at: successor_witness.map(|(_, window_end)| window_end),
+        termination_request_id,
+    };
+    if operation_stage.as_deref() == Some("successor_reserved") {
+        let graph_ok = checkpoint_successor_graph_matches_authority(
+            transaction,
+            &dispatch_authority,
+            None,
+            None,
+        )?;
+        let existing = graph_ok.then(|| read_intent_by_experiment(transaction, &successor_id));
+        let replay_valid = existing.as_ref().is_some_and(|result| {
+            result.as_ref().is_ok_and(|existing| {
+                matches!(
+                    existing.experiment.status,
+                    ExperimentStatus::Reserved
+                        | ExperimentStatus::Submitting
+                        | ExperimentStatus::Accepted
+                        | ExperimentStatus::Unreconciled
+                ) && existing.submission.status != SubmissionStatus::Failed
+            })
+        });
+        if !replay_valid {
+            let changed = transaction
+                .execute(
+                    "UPDATE research_reviews
+                     SET state = 'blocked',
+                         failure_code = 'research_checkpoint_authority_corrupt',
+                         finished_at = ?1, not_before = ?1, updated_at = ?1
+                     WHERE review_id = ?2 AND campaign_id = ?3
+                       AND experiment_id = ?4 AND state = 'ready'
+                       AND operation_stage = 'successor_reserved'
+                       AND successor_experiment_id = ?5
+                       AND checkpoint_json = ?6",
+                    params![
+                        now,
+                        expected.review_id,
+                        expected.campaign_id,
+                        expected.source_experiment_id,
+                        successor_id,
+                        raw,
+                    ],
+                )
+                .map_err(database_error("block inconsistent checkpoint successor replay"))?;
+            if changed != 1 {
+                return Err(validation_error(
+                    "research.review",
+                    "checkpoint successor replay changed before blocking",
+                ));
+            }
+            return Ok(CheckpointSuccessorAdmission::Blocked);
+        }
+        return Ok(CheckpointSuccessorAdmission::Ready(
+            existing
+                .expect("valid checkpoint successor replay intent")
+                .expect("valid checkpoint successor replay graph"),
+        ));
+    }
+    if successor_id.is_empty() {
+        return Err(validation_error(
+            "research.successor_experiment_id",
+            "prepared successor identity is empty",
+        ));
+    }
+    let incoming_claim_count: i64 = transaction
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM research_reviews AS review
+                 WHERE review.successor_experiment_id = ?1
+                   AND {}",
+                super::research::CHECKPOINT_INCOMING_CLAIM_PREDICATE
+            ),
+            [&successor_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("count incoming checkpoint successor claims"))?;
+    if incoming_claim_count != 0 {
+        return Ok(CheckpointSuccessorAdmission::Blocked);
+    }
+    if transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM proposals WHERE proposal_id = ?1
+                 UNION ALL SELECT 1 FROM experiments WHERE experiment_id = ?2
+                 UNION ALL SELECT 1 FROM submissions WHERE submission_id = ?3
+             )",
+            params![
+                checkpoint.successor_ids.proposal_id,
+                checkpoint.successor_ids.experiment_id,
+                checkpoint.successor_ids.submission_id,
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(database_error("check checkpoint successor identities"))?
+    {
+        return Ok(CheckpointSuccessorAdmission::Blocked);
+    }
+    if campaign.state != CampaignState::Active
+        || !project_is_available(transaction, &campaign.project_id)?
+    {
+        return Ok(CheckpointSuccessorAdmission::Deferred);
+    }
+    let Some(same_spec_count) = super::checkpoint_retry_admission_count(
+        transaction,
+        &checkpoint,
+        limits,
+        now,
+    )? else {
+        return Ok(CheckpointSuccessorAdmission::Deferred);
+    };
+    let source_proposal = source.proposal.clone();
+    let proposal_input = ProposalInput {
+        kind: ProposalKind::Experiment,
+        hypothesis: format!(
+            "Resume {} from its verified checkpoint",
+            expected.source_experiment_id
+        ),
+        source_experiment_id: Some(expected.source_experiment_id.clone()),
+        argv: checkpoint.retained_argv.clone(),
+        working_directory: checkpoint.source_working_directory.clone(),
+        expected_evidence: source_proposal.expected_evidence.clone(),
+    };
+    let validated = proposals::validate(proposal_input, &campaign.objective_digest)?;
+    if validated.kind() != ProposalKind::Experiment
+        || validated.source_experiment_id() != Some(expected.source_experiment_id.as_str())
+    {
+        return Err(validation_error(
+            "research.successor_proposal",
+            "does not identify the checkpoint source",
+        ));
+    }
+    let argv_json = serialize_strings(validated.argv(), "serialize checkpoint successor argv")?;
+    let evidence_json = serialize_strings(
+        validated.expected_evidence(),
+        "serialize checkpoint successor evidence",
+    )?;
+    let metadata_json = serialize_submission_metadata(
+        None,
+        &campaign.campaign_id,
+        &checkpoint.successor_ids.proposal_id,
+        &checkpoint.successor_ids.experiment_id,
+    )?;
+    let checkpoint_note = format!(
+        "research-checkpoint:{:x}",
+        Sha256::digest(raw.as_bytes())
+    );
+    let window_ends_at = rolling_window_end(now)?;
+    insert_proposal(
+        transaction,
+        &checkpoint.successor_ids.proposal_id,
+        &campaign.campaign_id,
+        &validated,
+        ProposalStatus::Accepted,
+        &argv_json,
+        &evidence_json,
+        now,
+    )?;
+    insert_submission(
+        transaction,
+        &checkpoint.successor_ids.submission_id,
+        &campaign.project_id,
+        &argv_json,
+        &metadata_json,
+        None,
+        now,
+    )?;
+    insert_experiment(
+        transaction,
+        &checkpoint.successor_ids.experiment_id,
+        &campaign.campaign_id,
+        &checkpoint.successor_ids.proposal_id,
+        &checkpoint.successor_ids.submission_id,
+        Some(&expected.source_experiment_id),
+        same_spec_count,
+        Some(&expected.source_experiment_id),
+        Some(&checkpoint_note),
+        None,
+        None,
+        now,
+    )?;
+    insert_experiment_reservation(
+        transaction,
+        &campaign.campaign_id,
+        &checkpoint.successor_ids.experiment_id,
+        now,
+        window_ends_at,
+    )?;
+    let changed = transaction
+        .execute(
+            "UPDATE research_reviews
+             SET operation_stage = 'successor_reserved',
+                 successor_experiment_id = ?, updated_at = ?
+             WHERE review_id = ? AND campaign_id = ? AND experiment_id = ?
+               AND state = 'ready' AND operation_stage = 'stop_confirmed'
+               AND termination_request_id = ? AND decision_cycle_id IS NULL
+               AND successor_experiment_id IS NULL AND checkpoint_json = ?",
+            params![
+                &checkpoint.successor_ids.experiment_id,
+                now,
+                expected.review_id,
+                expected.campaign_id,
+                expected.source_experiment_id,
+                request_id,
+                raw,
+            ],
+        )
+        .map_err(database_error("reserve checkpoint successor"))?;
+    if changed != 1 {
+        return Err(validation_error(
+            "research.review",
+            "changed before checkpoint successor reservation",
+        ));
+    }
+    Ok(CheckpointSuccessorAdmission::Ready(read_intent_by_experiment(
+        transaction,
+        &checkpoint.successor_ids.experiment_id,
+    )?))
+}
+
 fn research_owner_blocks_admission(
     transaction: &Transaction<'_>,
     project_id: &str,
@@ -3945,12 +5194,15 @@ fn has_incoming_checkpoint_successor_lineage(
 ) -> Result<bool, AppError> {
     transaction
         .query_row(
-            "SELECT EXISTS(
-                 SELECT 1
-                 FROM research_reviews AS review
-                 WHERE review.successor_experiment_id = ?1
-                   AND review.checkpoint_json IS NOT NULL
-             )",
+            &format!(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM research_reviews AS review
+                     WHERE review.successor_experiment_id = ?1
+                       AND {}
+                 )",
+                super::research::CHECKPOINT_INCOMING_CLAIM_PREDICATE
+            ),
             [source_experiment_id],
             |row| row.get(0),
         )
@@ -4760,6 +6012,26 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(accepted, ProposalAcceptance::Accepted(_)));
+    }
+
+    #[test]
+    fn replacement_capacity_helper_uses_one_transaction_and_excludes_source() {
+        let fixture = FenceFixture::new();
+        let mut limits = CampaignLimits::default();
+        limits.max_parallel_experiments = 1;
+        let mut connection = fixture.db.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(replacement_admission_available_in_transaction(
+            &transaction,
+            "campaign-1",
+            "experiment-source",
+            &limits,
+            105,
+        )
+        .unwrap());
+        transaction.commit().unwrap();
     }
 }
 
