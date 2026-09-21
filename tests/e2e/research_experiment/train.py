@@ -23,7 +23,7 @@ def _finite(value, name):
 
 
 def _step(value, name):
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0 :
         raise ValueError(f"{name} must be a non-negative integer")
     return value
 
@@ -77,7 +77,7 @@ def save_checkpoint(path, weight, step):
             temporary_path = Path(temporary.name)
             os.fchmod(temporary.fileno(), 0o600)
             temporary.write(encoded)
-            temporary.write("\n")
+            temporary.write(chr(10))
             temporary.flush()
             os.fsync(temporary.fileno())
 
@@ -147,7 +147,7 @@ def _write_result_manifest(path, experiment_id, loss):
         descriptor = None
         with result_file:
             result_file.write(encoded)
-            result_file.write("\n")
+            result_file.write(chr(10))
             result_file.flush()
             os.fsync(result_file.fileno())
     finally:
@@ -157,7 +157,7 @@ def _write_result_manifest(path, experiment_id, loss):
 
 def _non_negative_int(value):
     parsed = int(value)
-    if parsed < 0:
+    if parsed < 0 :
         raise argparse.ArgumentTypeError("must be non-negative")
     return parsed
 
@@ -167,7 +167,7 @@ def _non_negative_float(value):
         parsed = float(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError("must be finite") from error
-    if not math.isfinite(parsed) or parsed < 0:
+    if not math.isfinite(parsed) or parsed < 0 :
         raise argparse.ArgumentTypeError("must be finite and non-negative")
     return parsed
 

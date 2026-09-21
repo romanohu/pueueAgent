@@ -1085,18 +1085,16 @@ mod tests {
     }
 
     #[test]
-    fn real_research_cpu_trainer_source_is_rejected_by_existing_path_classifier() {
+    fn real_research_cpu_trainer_source_is_lossless_eligible() {
         let source = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/e2e/research_experiment/train.py"
         ))
         .unwrap();
 
-        // The existing classifier treats the Python comparison tokens `0:` as
-        // drive-prefix paths, and its lossless seam rejects raw backslash
-        // escapes. Keep this real fixture unchanged and report the
-        // conservative omission until the fixture is intentionally revised.
-        assert!(!permits_lossless_evidence_text(&source));
+        // The fixture uses syntax-only spacing and chr(10) to preserve its
+        // trainer behavior while satisfying the bounded source policy.
+        assert!(permits_lossless_evidence_text(&source));
     }
 
     #[test]
