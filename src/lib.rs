@@ -43,6 +43,7 @@ pub mod pueue_security;
 pub mod reconcile;
 pub mod result_manifest;
 pub mod research_evidence;
+pub(crate) mod research_checkpoint;
 pub mod research_actions;
 pub mod research_protocol;
 pub mod research;

@@ -529,7 +529,33 @@ pub fn format_state(state: &str) -> String {
 pub fn redact_sensitive_text(value: &str) -> String {
     let sanitized = strip_control_and_ansi(value);
     let tokens = lex_tokens(&sanitized);
+    redact_sensitive_tokens(&tokens, false, false).0.join(" ")
+}
+
+/// Return whether source text can be published byte-for-byte under the
+/// existing sensitivity policy. This is an eligibility predicate only: it
+/// deliberately does not bound, normalize, or emit the source text.
+pub(crate) fn permits_lossless_evidence_text(value: &str) -> bool {
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' if characters.peek() != Some(&'\n') => return false,
+            '\n' | '\r' | '\t' => {}
+            character if character.is_control() => return false,
+            _ => {}
+        }
+    }
+    let tokens = lex_tokens(value);
+    !redact_sensitive_tokens(&tokens, true, true).1
+}
+
+fn redact_sensitive_tokens(
+    tokens: &[LexToken],
+    allow_unquoted_slash_operators: bool,
+    reject_raw_backslashes: bool,
+) -> (Vec<String>, bool) {
     let mut redacted = Vec::with_capacity(tokens.len());
+    let mut redacted_any = false;
     let mut redact_next = false;
     let mut redact_assignment_value = false;
     let mut assignment_redaction_emitted = false;
@@ -540,13 +566,14 @@ pub fn redact_sensitive_text(value: &str) -> String {
         let token = &tokens[index];
 
         if redact_assignment_value {
-            if is_assignment_boundary(&tokens, index) {
+            if is_assignment_boundary(tokens, index) {
                 redact_assignment_value = false;
                 assignment_redaction_emitted = false;
                 continue;
             }
             if !assignment_redaction_emitted {
                 redacted.push("[REDACTED]".to_owned());
+                redacted_any = true;
                 assignment_redaction_emitted = true;
             }
             index += 1;
@@ -554,7 +581,7 @@ pub fn redact_sensitive_text(value: &str) -> String {
         }
 
         if redact_structured_value {
-            if is_assignment_boundary(&tokens, index) {
+            if is_assignment_boundary(tokens, index) {
                 redact_structured_value = false;
                 continue;
             }
@@ -567,6 +594,7 @@ pub fn redact_sensitive_text(value: &str) -> String {
                 assignment_redaction_emitted = false;
             } else {
                 redacted.push("[REDACTED]".to_owned());
+                redacted_any = true;
                 redact_assignment_value = true;
                 assignment_redaction_emitted = true;
             }
@@ -582,14 +610,21 @@ pub fn redact_sensitive_text(value: &str) -> String {
                 assignment_redaction_emitted = false;
             } else {
                 redacted.push("[REDACTED]".to_owned());
+                redacted_any = true;
             }
             redact_next = false;
             index += 1;
             continue;
         }
 
-        if is_path_token(&token.value) {
+        let is_unquoted_slash_operator = allow_unquoted_slash_operators
+            && !token.quoted
+            && !token.had_backslash
+            && matches!(token.value.as_str(), "/" | "//" | "/=");
+        let is_raw_backslash_path = reject_raw_backslashes && token.had_backslash;
+        if (is_path_token(&token.value) || is_raw_backslash_path) && !is_unquoted_slash_operator {
             redacted.push("[path]".to_owned());
+            redacted_any = true;
             index += 1;
             continue;
         }
@@ -597,6 +632,7 @@ pub fn redact_sensitive_text(value: &str) -> String {
         if let Some((key, _)) = token.value.split_once('=') {
             if is_sensitive_key(key) {
                 redacted.push(format!("{key}=[REDACTED]"));
+                redacted_any = true;
                 redact_assignment_value = true;
                 assignment_redaction_emitted = true;
                 index += 1;
@@ -616,6 +652,7 @@ pub fn redact_sensitive_text(value: &str) -> String {
         if let Some((flag, _)) = token.value.split_once('=') {
             if is_sensitive_flag(flag) {
                 redacted.push(format!("{flag}=[REDACTED]"));
+                redacted_any = true;
                 index += 1;
                 continue;
             }
@@ -652,6 +689,7 @@ pub fn redact_sensitive_text(value: &str) -> String {
                     assignment_redaction_emitted = inline_value;
                     if inline_value {
                         redacted.push(format!("{label}{separator}[REDACTED]"));
+                        redacted_any = true;
                     } else {
                         redacted.push(format!("{label}{separator}"));
                     }
@@ -690,6 +728,7 @@ pub fn redact_sensitive_text(value: &str) -> String {
                 index += 2;
             } else {
                 redacted.push("[REDACTED]".to_owned());
+                redacted_any = true;
                 redact_next = true;
                 index += 1;
             }
@@ -698,6 +737,7 @@ pub fn redact_sensitive_text(value: &str) -> String {
 
         if is_bare_secret_token(&token.value) {
             redacted.push("[REDACTED]".to_owned());
+            redacted_any = true;
             index += 1;
             continue;
         }
@@ -706,7 +746,7 @@ pub fn redact_sensitive_text(value: &str) -> String {
         index += 1;
     }
 
-    redacted.join(" ")
+    (redacted, redacted_any)
 }
 
 fn is_assignment_boundary(tokens: &[LexToken], index: usize) -> bool {
@@ -942,6 +982,7 @@ fn strip_control_and_ansi(value: &str) -> String {
 struct LexToken {
     value: String,
     quoted: bool,
+    had_backslash: bool,
 }
 
 fn lex_tokens(value: &str) -> Vec<LexToken> {
@@ -963,11 +1004,13 @@ fn lex_tokens(value: &str) -> Vec<LexToken> {
         let mut token = String::new();
         let mut quote = None;
         let mut quoted = false;
+        let mut had_backslash = false;
         while let Some(character) = characters.next() {
             if let Some(quote_character) = quote {
                 if character == quote_character {
                     quote = None;
                 } else if character == '\\' {
+                    had_backslash = true;
                     if let Some(escaped) = characters.next() {
                         token.push(escaped);
                     }
@@ -981,6 +1024,7 @@ fn lex_tokens(value: &str) -> Vec<LexToken> {
                 quote = Some(character);
                 quoted = true;
             } else if character == '\\' {
+                had_backslash = true;
                 if let Some(escaped) = characters.next() {
                     token.push(escaped);
                 }
@@ -993,8 +1037,96 @@ fn lex_tokens(value: &str) -> Vec<LexToken> {
         tokens.push(LexToken {
             value: token,
             quoted,
+            had_backslash,
         });
     }
 
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{permits_lossless_evidence_text, redact_sensitive_text};
+
+    #[test]
+    fn lossless_source_allows_multiline_indentation_and_cpu_fixture_syntax() {
+        let source = format!(
+            "# CPU trainer\n\ndef train(value):\n\treturn value / 2\n{}\n",
+            "# ordinary source ".repeat(20)
+        );
+
+        assert!(source.len() > 240);
+        assert!(permits_lossless_evidence_text(&source));
+        assert!(permits_lossless_evidence_text(
+            "def train():\r\n\treturn 1 / 2\r\n"
+        ));
+    }
+
+    #[test]
+    fn lossless_source_rejects_relative_backslash_paths_and_preserves_display_redaction() {
+        for source in [
+            "model\\step.pt\n",
+            "\"model\\step.pt\"\n",
+            "model\\\\step.pt\n",
+            concat!(r"\/", "\n"),
+            concat!(r"\//", "\n"),
+            concat!(r"\/=", "\n"),
+        ] {
+            assert!(!permits_lossless_evidence_text(source), "source={source:?}");
+        }
+        assert_eq!(redact_sensitive_text("model\\step.pt"), "modelstep.pt");
+        assert_eq!(redact_sensitive_text("C:\\model\\step.json"), "[path]");
+    }
+
+    #[test]
+    fn lossless_source_rejects_lone_carriage_return() {
+        assert!(!permits_lossless_evidence_text("before\rafter\n"));
+        assert!(!permits_lossless_evidence_text("before\r"));
+    }
+
+    #[test]
+    fn real_research_cpu_trainer_source_is_rejected_by_existing_path_classifier() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/e2e/research_experiment/train.py"
+        ))
+        .unwrap();
+
+        // The existing classifier treats the Python comparison tokens `0:` as
+        // drive-prefix paths, and its lossless seam rejects raw backslash
+        // escapes. Keep this real fixture unchanged and report the
+        // conservative omission until the fixture is intentionally revised.
+        assert!(!permits_lossless_evidence_text(&source));
+    }
+
+    #[test]
+    fn lossless_source_allows_only_exact_unquoted_slash_operators() {
+        assert!(permits_lossless_evidence_text(
+            "value / other\nratio // count\nvalue /= 2\n"
+        ));
+        assert!(!permits_lossless_evidence_text("path = /tmp/model\n"));
+        assert!(!permits_lossless_evidence_text("compact = a/b\n"));
+        assert!(!permits_lossless_evidence_text("quoted = \"/\"\n"));
+        assert!(!permits_lossless_evidence_text("quoted = '//'\n"));
+        assert!(!permits_lossless_evidence_text(
+            "url = https://example.test/model\n"
+        ));
+        assert!(!permits_lossless_evidence_text(
+            "windows = C:\\model\\step.json\n"
+        ));
+    }
+
+    #[test]
+    fn lossless_source_rejects_existing_sensitive_classifiers_and_controls() {
+        for source in [
+            "API_KEY = \"value\"\n",
+            "--token secret-value\n",
+            "agent.context.session_id: abc\n",
+            "before\x1b[31mafter\n",
+            "before\0after\n",
+            "before\x0bafter\n",
+        ] {
+            assert!(!permits_lossless_evidence_text(source), "source={source:?}");
+        }
+    }
 }
