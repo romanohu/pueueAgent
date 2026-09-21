@@ -9,12 +9,12 @@ use std::os::unix::fs::PermissionsExt;
 use async_trait::async_trait;
 use pueue_agent::{
     db::{
-        CampaignRepository, Db, ExperimentRepository, HealthRepository, ProjectRepository,
-        StartCampaignRequest, TerminationRequestRepository,
+        CampaignRepository, Db, EventRepository, ExperimentRepository, HealthRepository,
+        ProjectRepository, StartCampaignRequest, TerminationRequestRepository,
     },
     execution_policy::CampaignLimits,
     health::HealthEngine,
-    models::{ExperimentStatus, HealthState, NewProject, ProposalKind},
+    models::{EventKind, ExperimentStatus, HealthState, NewEvent, NewProject, ProposalKind},
     proposals::{self, ProposalInput},
     pueue::{PueueApi, PueueTask},
     reconcile::{managed_task_run_signature, Reconciler},
@@ -252,6 +252,112 @@ impl Harness {
             )
             .unwrap();
         experiment_id
+    }
+
+    fn insert_checkpoint_successor_marker(&self, source_experiment_id: &str) {
+        let connection = self.db.connect().unwrap();
+        let (campaign_id, project_id): (String, String) = connection
+            .query_row(
+                "SELECT campaign_id, project_id FROM campaigns WHERE baseline_experiment_id = ?1",
+                [source_experiment_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let origin_proposal_id = "health-checkpoint-origin-proposal";
+        let origin_submission_id = "health-checkpoint-origin-submission";
+        let origin_experiment_id = "health-checkpoint-origin-experiment";
+        let origin_argv = json!(["python", "origin.py"]).to_string();
+        connection
+            .execute(
+                "INSERT INTO proposals (
+                    proposal_id, campaign_id, kind, status, hypothesis,
+                    source_experiment_id, argv_json, working_directory,
+                    expected_evidence_json, canonical_digest, reject_reason,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, 'experiment', 'accepted',
+                           'checkpoint origin', NULL, ?3, '.', '[]', ?4, NULL, 104, 104)",
+                rusqlite::params![
+                    origin_proposal_id,
+                    campaign_id,
+                    origin_argv,
+                    "b".repeat(64),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO submissions (
+                    submission_id, project_id, argv_json, created_at,
+                    pueue_task_id, task_signature, status, kind, metadata_json,
+                    origin_agent_run_id
+                 ) VALUES (?1, ?2, ?3, 104, NULL, NULL,
+                           'accepted', 'experiment', '{}', NULL)",
+                rusqlite::params![origin_submission_id, project_id, origin_argv],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO experiments (
+                    experiment_id, campaign_id, proposal_id, submission_id,
+                    parent_experiment_id, attempt, status, pueue_task_id,
+                    task_signature, failure_code, failure_fingerprint, created_at,
+                    updated_at, finished_at, resume_of_experiment_id,
+                    checkpoint_note, code_change_run_id, code_revision_sha
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, 0, 'succeeded', NULL,
+                           NULL, NULL, NULL, 104, 104, 104, NULL, NULL, NULL, NULL)",
+                rusqlite::params![
+                    origin_experiment_id,
+                    campaign_id,
+                    origin_proposal_id,
+                    origin_submission_id,
+                ],
+            )
+            .unwrap();
+        let event = EventRepository::new(&self.db)
+            .insert_idempotent(
+                &NewEvent::new(
+                    project_id,
+                    EventKind::CampaignResearch,
+                    "health-checkpoint-origin-review",
+                    json!({"review_id":"health-checkpoint-origin-review"}),
+                    104,
+                    104,
+                )
+                .with_campaign_lineage(campaign_id.clone(), Some(origin_experiment_id)),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE events
+                 SET status = 'completed', completed_at = 104, lease_until = NULL
+                 WHERE event_id = ?1",
+                [event.event_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO research_reviews (
+                    review_id, campaign_id, experiment_id, task_signature, attempt,
+                    state, operation_stage, agent_run_id, context_json, context_digest,
+                    response_json, termination_request_id, successor_experiment_id,
+                    evidence_schema_version, session_generation, event_id, not_before,
+                    notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                    created_at, started_at, finished_at, updated_at
+                 ) VALUES (
+                    'health-checkpoint-origin-review', ?1, ?2,
+                    'pueue-managed-run:v1:health-checkpoint-origin', 1, 'completed',
+                    NULL, NULL, NULL, NULL, NULL, NULL, ?3, NULL, 0, ?4, 104,
+                    NULL, NULL, NULL, ?5, 104, 104, 104, 104
+                 )",
+                rusqlite::params![
+                    campaign_id,
+                    origin_experiment_id,
+                    source_experiment_id,
+                    event.event_id,
+                    r#"{"prepared":true}"#,
+                ],
+            )
+            .unwrap();
     }
 
     fn set_action_pending(&self, experiment_id: &str, recommended_action: &str) {
@@ -505,6 +611,51 @@ async fn diagnosed_kill_completes_full_chain_without_seeded_requests() {
 }
 
 #[tokio::test]
+async fn checkpoint_successor_health_resume_escalates_without_generic_child() {
+    let harness = Harness::new();
+    fs::write(harness.log_path("project-a", 41), "epoch 1 loss 0.52\n").unwrap();
+    let experiment_id = harness.accepted_campaign_experiment("project-a", "pa-project", "a", 41);
+    harness.insert_checkpoint_successor_marker(&experiment_id);
+
+    let marker_lineage: (String, String) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT experiment_id, successor_experiment_id
+             FROM research_reviews
+             WHERE review_id = 'health-checkpoint-origin-review'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_ne!(marker_lineage.0, experiment_id);
+    assert_eq!(marker_lineage.1, experiment_id);
+
+    harness
+        .reconcile_tasks(
+            vec![running_task("pa-project", 41, "100")],
+            &CampaignLimits::default(),
+            200,
+        )
+        .await;
+    harness.set_action_pending(&experiment_id, "kill_and_resume");
+
+    let limits = CampaignLimits::default();
+    assert_eq!(harness.execute_pending(&limits, 300).await, 1);
+    harness.run_termination_pass().await;
+    assert_eq!(harness.fake_pueue.kill_calls(), vec![41]);
+    harness
+        .reconcile_tasks(vec![killed_task("pa-project", 41, "100")], &limits, 400)
+        .await;
+
+    assert!(harness.experiment_ids_resuming(&experiment_id).is_empty());
+    assert_eq!(harness.experiment_count(), 2, "origin marker and source only");
+    assert_eq!(harness.campaign_state("campaign-health-a"), "degraded");
+    assert_eq!(harness.event_count("operator_wake"), 1);
+}
+
+#[tokio::test]
 async fn confirmed_request_keeps_executor_from_reopening_the_pipeline() {
     let harness = Harness::new();
     fs::write(harness.log_path("project-a", 41), "epoch 1 loss 0.52\n").unwrap();
@@ -655,4 +806,3 @@ async fn resume_chain_depth_is_capped_across_all_descendants() {
         }
     }
 }
-

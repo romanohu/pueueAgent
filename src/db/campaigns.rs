@@ -1730,6 +1730,12 @@ impl<'db> CampaignRepository<'db> {
                 "must reference a terminal experiment",
             ));
         }
+        if has_incoming_checkpoint_successor_lineage(&transaction, source_experiment_id)? {
+            transaction
+                .commit()
+                .map_err(database_error("commit blocked campaign resume proposal"))?;
+            return Ok(None);
+        }
 
         let resume_count: i64 =
             count_live_repair_descendants(&transaction, source_experiment_id)
@@ -3933,6 +3939,24 @@ fn research_owner_blocks_admission(
     ))
 }
 
+fn has_incoming_checkpoint_successor_lineage(
+    transaction: &Transaction<'_>,
+    source_experiment_id: &str,
+) -> Result<bool, AppError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM research_reviews AS review
+                 WHERE review.successor_experiment_id = ?1
+                   AND review.checkpoint_json IS NOT NULL
+             )",
+            [source_experiment_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check incoming checkpoint successor lineage"))
+}
+
 fn decision_candidate_authority(
     transaction: &Transaction<'_>,
     campaign: &Campaign,
@@ -4166,7 +4190,7 @@ mod tests {
         proposals::{self, ProposalInput},
         state::ObjectiveSnapshot,
     };
-    use rusqlite::TransactionBehavior;
+    use rusqlite::{types::Value as SqlValue, TransactionBehavior};
     use tempfile::TempDir;
 
     struct FenceFixture {
@@ -4291,6 +4315,160 @@ mod tests {
                 )
                 .unwrap();
             transaction.commit().unwrap();
+        }
+
+        fn insert_checkpoint_successor_marker(
+            &self,
+            successor_experiment_id: &str,
+            checkpoint_json: SqlValue,
+            state: &str,
+            operation_stage: Option<&str>,
+        ) {
+            let mut connection = self.db.connect().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let proposal_id = "proposal-checkpoint-origin";
+            let submission_id = "submission-checkpoint-origin";
+            let origin_experiment_id = "experiment-checkpoint-origin";
+            transaction
+                .execute(
+                    "INSERT INTO proposals (
+                        proposal_id, campaign_id, kind, status, hypothesis,
+                        source_experiment_id, argv_json, working_directory,
+                        expected_evidence_json, canonical_digest, created_at, updated_at
+                     ) VALUES (?1, 'campaign-1', 'experiment', 'accepted',
+                               'checkpoint origin', NULL, ?2, '.', '[]', ?3, 104, 104)",
+                    rusqlite::params![
+                        proposal_id,
+                        r#"["python","origin.py"]"#,
+                        "a".repeat(64),
+                    ],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO submissions (
+                        submission_id, project_id, argv_json, created_at,
+                        pueue_task_id, task_signature, status, kind, metadata_json,
+                        origin_agent_run_id
+                     ) VALUES (?1, 'project-1', ?2, 104, NULL, NULL, 'accepted',
+                               'experiment', '{}', NULL)",
+                    rusqlite::params![submission_id, r#"["python","origin.py"]"#],
+                )
+                .unwrap();
+            insert_experiment(
+                &transaction,
+                origin_experiment_id,
+                "campaign-1",
+                proposal_id,
+                submission_id,
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                104,
+            )
+            .unwrap();
+            transaction
+                .execute(
+                    "UPDATE experiments
+                     SET status = 'succeeded', finished_at = 104
+                     WHERE experiment_id = ?1",
+                    [origin_experiment_id],
+                )
+                .unwrap();
+            let event = NewEvent::new(
+                "project-1",
+                EventKind::CampaignResearch,
+                "checkpoint-origin-review",
+                serde_json::json!({"review_id":"checkpoint-origin-review"}),
+                104,
+                104,
+            )
+            .with_campaign_lineage("campaign-1", Some(origin_experiment_id));
+            let (stored, _) =
+                super::super::insert_event_completed_in_transaction(&transaction, &event).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO research_reviews (
+                        review_id, campaign_id, experiment_id, task_signature, attempt,
+                        state, operation_stage, agent_run_id, context_json, context_digest,
+                        response_json, termination_request_id, successor_experiment_id,
+                        evidence_schema_version, session_generation, event_id, not_before,
+                        notes_json, failure_code, decision_cycle_id, checkpoint_json,
+                        created_at, started_at, finished_at, updated_at
+                     ) VALUES (
+                        'checkpoint-origin-review', 'campaign-1', ?1,
+                        'pueue-managed-run:v1:checkpoint-origin', 1, ?2, ?3, NULL,
+                        NULL, NULL, NULL, NULL, ?4, NULL, 0, ?5, 104, NULL, NULL,
+                        NULL, ?6, 104, 104, 104, 104
+                     )",
+                    rusqlite::params![
+                        origin_experiment_id,
+                        state,
+                        operation_stage,
+                        successor_experiment_id,
+                        stored.event_id,
+                        checkpoint_json,
+                    ],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        fn assert_no_research_owner(&self, source_experiment_id: &str) {
+            let mut connection = self.db.connect().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(matches!(
+                research_ownership_in_transaction(
+                    &transaction,
+                    "project-1",
+                    "campaign-1",
+                    source_experiment_id,
+                )
+                .unwrap(),
+                ResearchOwnership::None
+            ));
+            transaction.commit().unwrap();
+        }
+
+        fn admission_counts(&self) -> (i64, i64, i64, i64) {
+            let connection = self.db.connect().unwrap();
+            (
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM proposals WHERE campaign_id = 'campaign-1'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM submissions WHERE project_id = 'project-1'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM experiments WHERE campaign_id = 'campaign-1'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = 'campaign-1'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+            )
         }
 
         fn counts(&self) -> (i64, i64, i64) {
@@ -4477,6 +4655,111 @@ mod tests {
             .unwrap();
         assert!(matches!(acceptance, ProposalAcceptance::Accepted(_)));
         assert_eq!(fixture.counts(), (2, 2, 2));
+    }
+
+    #[test]
+    fn incoming_checkpoint_successor_marker_defers_resume_without_resource_inserts() {
+        for (state, operation_stage) in [("pending", Some("intent")), ("completed", None)] {
+            let fixture = FenceFixture::new();
+            fixture.insert_checkpoint_successor_marker(
+                "experiment-source",
+                SqlValue::Text(r#"{"prepared":true}"#.to_owned()),
+                state,
+                operation_stage,
+            );
+            fixture.assert_no_research_owner("experiment-source");
+            let before = fixture.admission_counts();
+            let resume = fixture.proposal("checkpoint-resume");
+            let resumed = CampaignRepository::new(&fixture.db)
+                .accept_resume_proposal(
+                    "campaign-1",
+                    "proposal-resume",
+                    "experiment-resume",
+                    "submission-resume",
+                    &resume,
+                    "checkpoint note",
+                    &CampaignLimits::default(),
+                    106,
+                )
+                .unwrap();
+            assert!(resumed.is_none(), "state={state} must be fenced");
+            assert_eq!(fixture.admission_counts(), before);
+        }
+    }
+
+    #[test]
+    fn incoming_checkpoint_corrupt_markers_still_defer_resume_without_resource_inserts() {
+        for (label, checkpoint_json) in [
+            ("malformed", SqlValue::Text("not-json".to_owned())),
+            ("blob", SqlValue::Blob(vec![0, 1, 2])),
+            ("oversized", SqlValue::Text("x".repeat(131_073))),
+        ] {
+            let fixture = FenceFixture::new();
+            fixture.insert_checkpoint_successor_marker(
+                "experiment-source",
+                checkpoint_json,
+                "completed",
+                None,
+            );
+            fixture.assert_no_research_owner("experiment-source");
+            let before = fixture.admission_counts();
+            let resume = fixture.proposal(&format!("checkpoint-{label}"));
+            let resumed = CampaignRepository::new(&fixture.db)
+                .accept_resume_proposal(
+                    "campaign-1",
+                    "proposal-resume",
+                    "experiment-resume",
+                    "submission-resume",
+                    &resume,
+                    "checkpoint note",
+                    &CampaignLimits::default(),
+                    106,
+                )
+                .unwrap();
+            assert!(resumed.is_none(), "{label} marker must be fenced");
+            assert_eq!(fixture.admission_counts(), before);
+        }
+    }
+
+    #[test]
+    fn incoming_checkpoint_fence_leaves_ordinary_resume_and_proposal_admission_unchanged() {
+        let ordinary = FenceFixture::new();
+        let resume = ordinary.proposal("ordinary-resume");
+        let accepted_resume = CampaignRepository::new(&ordinary.db)
+            .accept_resume_proposal(
+                "campaign-1",
+                "proposal-resume",
+                "experiment-resume",
+                "submission-resume",
+                &resume,
+                "ordinary repair",
+                &CampaignLimits::default(),
+                106,
+            )
+            .unwrap();
+        assert!(accepted_resume.is_some());
+
+        let explicit = FenceFixture::new();
+        explicit.insert_checkpoint_successor_marker(
+            "experiment-source",
+            SqlValue::Text(r#"{"prepared":true}"#.to_owned()),
+            "completed",
+            None,
+        );
+        explicit.assert_no_research_owner("experiment-source");
+        let proposal = explicit.proposal("ordinary-proposal");
+        let accepted = CampaignRepository::new(&explicit.db)
+            .accept_proposal(
+                "campaign-1",
+                "proposal-explicit",
+                "experiment-explicit",
+                "submission-explicit",
+                &proposal,
+                &CampaignLimits::default(),
+                106,
+            )
+            .unwrap();
+        assert!(matches!(accepted, ProposalAcceptance::Accepted(_)));
     }
 }
 
