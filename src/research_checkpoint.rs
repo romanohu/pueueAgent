@@ -255,6 +255,349 @@ impl VerifiedPreparedCheckpoint {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct RuntimeAuthorityFixtureBridge {
+    pub(crate) _temporary: tempfile::TempDir,
+    pub(crate) db: Db,
+    pub(crate) policy: ResolvedExecutionPolicy,
+    pub(crate) project_policy: ResolvedProjectExecutionPolicy,
+    pub(crate) action: ReadyResearchAction,
+    pub(crate) request: CheckpointRequest,
+    pub(crate) project_root: std::path::PathBuf,
+    pub(crate) candidate_path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_authority_fixture_bridge(
+    nested_working_directory: bool,
+) -> RuntimeAuthorityFixtureBridge {
+    let fixture = tests::runtime_authority_fixture(nested_working_directory);
+    RuntimeAuthorityFixtureBridge {
+        _temporary: fixture._temporary,
+        db: fixture.db,
+        policy: fixture.policy,
+        project_policy: fixture.project_policy,
+        action: fixture.action,
+        request: fixture.request,
+        project_root: fixture.project_root,
+        candidate_path: fixture.candidate_path,
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct RuntimeCheckpointDispatchFixtureBridge {
+    pub(crate) _temporary: tempfile::TempDir,
+    pub(crate) db: Db,
+    pub(crate) policy: ResolvedExecutionPolicy,
+    pub(crate) checkpoint: PreparedCheckpoint,
+    pub(crate) intent: crate::db::ManagedSubmissionIntent,
+    pub(crate) project: crate::models::Project,
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_checkpoint_dispatch_fixture_bridge(
+) -> RuntimeCheckpointDispatchFixtureBridge {
+    let fixture = runtime_authority_fixture_bridge(false);
+    let verified = prepare_checkpoint(
+        &fixture.db,
+        &fixture.action,
+        &fixture.request,
+        &fixture.policy,
+        &fixture.project_policy,
+    )
+    .expect("runtime checkpoint preparation");
+    let checkpoint = verified.checkpoint().clone();
+    let encoded = serialize_prepared_checkpoint(&checkpoint)
+        .expect("runtime checkpoint encoding");
+    let incident = crate::models::Incident {
+        incident_id: 81,
+        project_id: fixture.action.owner.project_id.clone(),
+        kind: "research_checkpoint".to_owned(),
+        task_key: Some(fixture.action.owner.source_experiment_id.clone()),
+        fingerprint: "checkpoint-runtime-fingerprint".to_owned(),
+        status: crate::models::IncidentStatus::Open,
+        first_seen_at: 3_100,
+        last_seen_at: 3_100,
+        acknowledged_at: None,
+        resolved_at: None,
+    };
+    let request = crate::models::TerminationRequest {
+        request_id: 82,
+        incident_id: incident.incident_id,
+        project_id: fixture.action.owner.project_id.clone(),
+        task_signature: fixture.action.raw_task_signature.clone(),
+        reason: format!(
+            "research_action:{}:checkpoint",
+            fixture.action.owner.review_id
+        ),
+        status: crate::models::TerminationRequestStatus::Confirmed,
+        requested_at: 3_100,
+        dispatch_lease_until: None,
+        grace_until: None,
+        confirmed_at: Some(3_101),
+        last_error: None,
+    };
+    let connection = fixture
+        .db
+        .connect()
+        .expect("runtime checkpoint setup connection");
+    connection
+        .execute(
+            "INSERT INTO incidents (
+                incident_id, project_id, kind, task_key, fingerprint, status,
+                first_seen_at, last_seen_at, acknowledged_at, resolved_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL, NULL)",
+            rusqlite::params![
+                incident.incident_id,
+                incident.project_id,
+                incident.kind,
+                incident.task_key,
+                incident.fingerprint,
+                incident.status,
+                incident.first_seen_at,
+            ],
+        )
+        .expect("runtime checkpoint incident");
+    connection
+        .execute(
+            "INSERT INTO termination_requests (
+                request_id, incident_id, project_id, task_signature, reason,
+                status, requested_at, dispatch_lease_until, grace_until,
+                confirmed_at, last_error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL)",
+            rusqlite::params![
+                request.request_id,
+                request.incident_id,
+                request.project_id,
+                request.task_signature,
+                request.reason,
+                request.status,
+                request.requested_at,
+                request.confirmed_at,
+            ],
+        )
+        .expect("runtime checkpoint termination");
+    let mut connection = connection;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .expect("runtime checkpoint binding transaction");
+    assert!(crate::db::bind_checkpoint_termination_intent_in_transaction(
+        &transaction,
+        &fixture.action,
+        &encoded,
+        &incident,
+        &request,
+        3_102,
+    )
+    .expect("runtime checkpoint binding"));
+    transaction
+        .commit()
+        .expect("runtime checkpoint binding commit");
+    connection
+        .execute(
+            "UPDATE research_reviews
+             SET operation_stage = 'stop_confirmed', updated_at = ?1
+             WHERE review_id = ?2 AND operation_stage = 'intent'
+               AND termination_request_id = ?3",
+            rusqlite::params![3_103, fixture.action.owner.review_id, request.request_id],
+        )
+        .expect("runtime checkpoint stop confirmation");
+    verified.release_lease();
+
+    let mut owner = fixture.action.owner.clone();
+    owner.operation_stage = Some("stop_confirmed".to_owned());
+    owner.termination_request_id = Some(request.request_id);
+    let mut connection = fixture
+        .db
+        .connect()
+        .expect("runtime checkpoint successor connection");
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .expect("runtime checkpoint successor transaction");
+    let intent = match crate::db::accept_checkpoint_successor_in_transaction(
+        &transaction,
+        &owner,
+        &crate::execution_policy::CampaignLimits::default(),
+        3_104,
+    )
+    .expect("runtime checkpoint successor admission")
+    {
+        crate::db::CheckpointSuccessorAdmission::Ready(intent) => intent,
+        other => panic!("unexpected runtime checkpoint admission: {other:?}"),
+    };
+    transaction
+        .commit()
+        .expect("runtime checkpoint successor commit");
+    let project = crate::db::ProjectRepository::new(&fixture.db)
+        .find_by_id(&fixture.action.owner.project_id)
+        .expect("runtime checkpoint project query")
+        .expect("runtime checkpoint project");
+    RuntimeCheckpointDispatchFixtureBridge {
+        _temporary: fixture._temporary,
+        db: fixture.db,
+        policy: fixture.policy,
+        checkpoint,
+        intent,
+        project,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn rewrite_checkpoint_group_coherently(db: &Db, successor_id: &str) {
+    let connection = db
+        .connect()
+        .expect("coherent group rewrite connection");
+    let (
+        review_id,
+        source_experiment_id,
+        source_submission_id,
+        termination_request_id,
+        checkpoint_json,
+        context_json,
+        response_json,
+    ): (String, String, String, i64, String, String, String) = connection
+        .query_row(
+            "SELECT review_id, experiment_id, termination_request_id,
+                    (SELECT submission_id FROM experiments WHERE experiment_id = review.experiment_id),
+                    checkpoint_json, context_json, response_json
+             FROM research_reviews AS review
+             WHERE successor_experiment_id = ?1",
+            [successor_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(3)?,
+                    row.get(2)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .expect("coherent group rewrite review");
+    let mut checkpoint: PreparedCheckpoint = parse_prepared_checkpoint(&checkpoint_json)
+        .expect("coherent group rewrite checkpoint");
+    let (source_task_id, command_json, enqueued_at, started_at, ended_at, state): (
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = connection
+        .query_row(
+            "SELECT pueue_task_id, command_json, CAST(enqueued_at AS TEXT),
+                    CAST(started_at AS TEXT), CAST(ended_at AS TEXT), state
+             FROM task_observations
+             WHERE task_signature = ?1",
+            [&checkpoint.source_raw_task_signature],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("coherent group rewrite observation");
+    let task = crate::pueue::PueueTask {
+        id: source_task_id,
+        group: "coherent-group".to_owned(),
+        command: serde_json::from_str::<Vec<String>>(&command_json)
+            .expect("coherent group rewrite command")
+            .into_iter()
+            .next()
+            .expect("coherent group rewrite command entry"),
+        state,
+        enqueued_at: Some(enqueued_at),
+        started_at,
+        ended_at,
+        result: None,
+    };
+    let raw_signature = crate::reconcile::task_signature(&task);
+    let managed_signature = crate::reconcile::managed_task_run_signature(&task)
+        .expect("coherent group rewrite managed signature");
+    checkpoint.source_raw_task_signature = raw_signature.clone();
+    checkpoint.source_managed_task_signature = managed_signature.clone();
+    let mut context: Value = serde_json::from_str(&context_json)
+        .expect("coherent group rewrite context");
+    context["facts"]["review"]["task_signature"] = Value::String(managed_signature.clone());
+    context["facts"]["target"]["task_signature"] = Value::String(managed_signature.clone());
+    let context_json = context.to_string();
+    let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+    let mut response: Value = serde_json::from_str(&response_json)
+        .expect("coherent group rewrite response");
+    response["context_digest"] = Value::String(context_digest.clone());
+    let response_json = response.to_string();
+    checkpoint.context_digest = context_digest.clone();
+    checkpoint.response_digest = format!("{:x}", Sha256::digest(response_json.as_bytes()));
+    let checkpoint_json = serialize_prepared_checkpoint(&checkpoint)
+        .expect("coherent group rewrite serialization");
+    let checkpoint_note = format!(
+        "research-checkpoint:{:x}",
+        Sha256::digest(checkpoint_json.as_bytes())
+    );
+    let project_id = checkpoint.project_id.clone();
+    connection
+        .execute(
+            "UPDATE projects SET pueue_group = 'coherent-group' WHERE project_id = ?1",
+            [&project_id],
+        )
+        .expect("coherent group rewrite project");
+    connection
+        .execute(
+            "UPDATE task_observations
+             SET task_signature = ?1, pueue_group = 'coherent-group'
+             WHERE project_id = ?2 AND pueue_task_id = ?3",
+            rusqlite::params![raw_signature, project_id, source_task_id],
+        )
+        .expect("coherent group rewrite observation update");
+    connection
+        .execute(
+            "UPDATE experiments SET task_signature = ?1 WHERE experiment_id = ?2",
+            rusqlite::params![managed_signature, source_experiment_id],
+        )
+        .expect("coherent group rewrite experiment");
+    connection
+        .execute(
+            "UPDATE submissions SET task_signature = ?1 WHERE submission_id = ?2",
+            rusqlite::params![managed_signature, source_submission_id],
+        )
+        .expect("coherent group rewrite submission");
+    connection
+        .execute(
+            "UPDATE experiments SET checkpoint_note = ?1 WHERE experiment_id = ?2",
+            rusqlite::params![checkpoint_note, successor_id],
+        )
+        .expect("coherent group rewrite successor note");
+    connection
+        .execute(
+            "UPDATE research_reviews
+             SET task_signature = ?1, context_json = ?2, context_digest = ?3,
+                 response_json = ?4, checkpoint_json = ?5
+             WHERE review_id = ?6",
+            rusqlite::params![
+                managed_signature,
+                context_json,
+                context_digest,
+                response_json,
+                checkpoint_json,
+                review_id,
+            ],
+        )
+        .expect("coherent group rewrite review update");
+    connection
+        .execute(
+            "UPDATE termination_requests SET task_signature = ?1 WHERE request_id = ?2",
+            rusqlite::params![raw_signature, termination_request_id],
+        )
+        .expect("coherent group rewrite termination");
+}
+
 pub(crate) fn prepare_checkpoint(
     db: &Db,
     action: &ReadyResearchAction,
@@ -3865,18 +4208,20 @@ mod tests {
         }
     }
 
-    struct RuntimeAuthorityFixture {
-        _temporary: TempDir,
-        db: crate::db::Db,
-        policy: crate::execution_policy::ResolvedExecutionPolicy,
-        project_policy: crate::execution_policy::ResolvedProjectExecutionPolicy,
-        action: crate::db::ReadyResearchAction,
-        request: CheckpointRequest,
-        project_root: PathBuf,
-        candidate_path: PathBuf,
+    pub(super) struct RuntimeAuthorityFixture {
+        pub(super) _temporary: TempDir,
+        pub(super) db: crate::db::Db,
+        pub(super) policy: crate::execution_policy::ResolvedExecutionPolicy,
+        pub(super) project_policy: crate::execution_policy::ResolvedProjectExecutionPolicy,
+        pub(super) action: crate::db::ReadyResearchAction,
+        pub(super) request: CheckpointRequest,
+        pub(super) project_root: PathBuf,
+        pub(super) candidate_path: PathBuf,
     }
 
-    fn runtime_authority_fixture(nested_working_directory: bool) -> RuntimeAuthorityFixture {
+    pub(super) fn runtime_authority_fixture(
+        nested_working_directory: bool,
+    ) -> RuntimeAuthorityFixture {
         let (temporary, policy, anchor, project, project_policy) = runtime_policy_fixture();
         let db = crate::db::Db::open(&temporary.path().join("state.sqlite3")).unwrap();
         ProjectRepository::new(&db)

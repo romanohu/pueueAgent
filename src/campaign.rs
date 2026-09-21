@@ -11,9 +11,10 @@ use uuid::Uuid;
 use crate::{
     code_change,
     db::{
-        CampaignRepository, CodeChangeReentry, CodeChangeRepository, Db, DecisionReservation,
-        ExperimentRepository, ManagedSubmissionIntent, ProjectRepository, ProposalAcceptance,
-        ProposalRepository, StartCampaignRequest, SubmissionRepository,
+        CampaignRepository, CheckpointDispatchSelection, CodeChangeReentry, CodeChangeRepository,
+        Db, DecisionReservation, ExperimentRepository, ManagedSubmissionIntent, ProjectRepository,
+        ProposalAcceptance, ProposalRepository, ResearchRepository, StartCampaignRequest,
+        SubmissionRepository,
     },
     environment::ProjectAdmissionLock,
     execution_policy::{
@@ -32,7 +33,10 @@ use crate::{
     },
     proposals::{self, ProposalInput},
     pueue::{validate_add_argv, PueueApi},
-    reconcile::{managed_task_run_signature, try_canonical_command_display_os},
+    reconcile::{
+        managed_task_run_signature, task_signature_group_matches, try_canonical_command_display_os,
+    },
+    research_checkpoint::verify_prepared_checkpoint,
     state::ObjectiveSnapshot,
     status::current_decision_projection,
     AppError,
@@ -45,6 +49,46 @@ const BASELINE_HYPOTHESIS: &str = "Establish the initial campaign baseline";
 const ADD_UNKNOWN_REASON: &str = "pueue_add_unknown";
 const ADD_INTERRUPTED_REASON: &str = "pueue_add_interrupted";
 const ADD_IDENTITY_REASON: &str = "pueue_identity_unresolved";
+const CHECKPOINT_PRE_ADD_FAILURE_CODE: &str = "research_checkpoint_verification_failed";
+
+#[cfg(test)]
+static TEST_AFTER_CLONE_HOOKS:
+    std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<(std::path::PathBuf, String), fn(&Db, &str)>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn set_test_after_clone_hook(
+    db: &Db,
+    experiment_id: &str,
+    callback: Option<fn(&Db, &str)>,
+) {
+    let mut configured = TEST_AFTER_CLONE_HOOKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = (db.path().to_path_buf(), experiment_id.to_owned());
+    match callback {
+        Some(callback) => {
+            configured.insert(key, callback);
+        }
+        None => {
+            configured.remove(&key);
+        }
+    }
+}
+
+#[cfg(test)]
+fn run_test_after_clone_hook(db: &Db, experiment_id: &str) {
+    let mut configured = TEST_AFTER_CLONE_HOOKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let hook = configured.remove(&(db.path().to_path_buf(), experiment_id.to_owned()));
+    drop(configured);
+    if let Some(hook) = hook {
+        hook(db, experiment_id);
+    }
+}
 const RUNTIME_OUTPUT_RECOVERY_REASON: &str = "runtime_output_recovery_required";
 const RUNTIME_OUTPUT_RECOVERY_SUMMARY: &str =
     "candidate runtime output scope could not be verified";
@@ -364,6 +408,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 Some(admission),
                 #[cfg(unix)]
                 None,
+                false,
             )
             .await?
         {
@@ -398,6 +443,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 None,
                 #[cfg(unix)]
                 None,
+                false,
             )
             .await?
         {
@@ -426,6 +472,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             None,
             #[cfg(unix)]
             None,
+            false,
         )
         .await
     }
@@ -490,6 +537,24 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             ),
             None => None,
         };
+        let candidate_experiment_identity = existing_experiment
+            .as_ref()
+            .map(|experiment| experiment.experiment_id.clone())
+            .unwrap_or_else(|| candidate_experiment_id(run_id));
+        match ResearchRepository::new(self.db).checkpoint_dispatch_authority(
+            &durable_project.project_id,
+            &candidate_experiment_identity,
+            now,
+        )? {
+            CheckpointDispatchSelection::NotCheckpoint => {}
+            CheckpointDispatchSelection::Blocked => return Ok(CampaignSubmission::Deferred),
+            CheckpointDispatchSelection::Ready(_) => {
+                return Err(AppError::Validation {
+                    field: "research.checkpoint",
+                    message: "checkpoint successor cannot enter the candidate route",
+                })
+            }
+        }
         if matches!(
             existing_experiment.as_ref().map(|experiment| experiment.status),
             None | Some(ExperimentStatus::Reserved)
@@ -607,6 +672,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             now,
             Some(admission),
             Some((&candidate, &working_directory)),
+            false,
         )
         .await
     }
@@ -1017,6 +1083,26 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             Some(admitted.admission),
             #[cfg(unix)]
             None,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn submit_checkpoint_intent_with_admission(
+        &self,
+        intent: &ManagedSubmissionIntent,
+        project: &Project,
+        admission: CampaignAdmission,
+        now: i64,
+    ) -> Result<CampaignSubmission, AppError> {
+        self.submit_accepted_intent_inner(
+            intent,
+            project,
+            now,
+            Some(admission),
+            #[cfg(unix)]
+            None,
+            true,
         )
         .await
     }
@@ -1031,6 +1117,7 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             &code_change::VerifiedCodeChangeWorktree,
             &VerifiedWorkingDirectory,
         )>,
+        checkpoint_required: bool,
     ) -> Result<CampaignSubmission, AppError> {
         let experiments = ExperimentRepository::new(self.db);
         let current = experiments
@@ -1067,6 +1154,8 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
             &durable_submission,
             &durable_project,
         )?;
+        #[cfg(test)]
+        run_test_after_clone_hook(self.db, &current.experiment_id);
         let admission = match admission {
             Some(admission) => admission,
             None => self.acquire_admission(&durable_project)?,
@@ -1076,6 +1165,113 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
                 field: "campaign.project_root",
                 message: "must match the startup-pinned project root",
             });
+        }
+
+        let checkpoint_authority = match ResearchRepository::new(self.db)
+            .checkpoint_dispatch_authority(
+                &durable_project.project_id,
+                &current.experiment_id,
+                now,
+            )? {
+            CheckpointDispatchSelection::NotCheckpoint if checkpoint_required => {
+                return Err(AppError::Validation {
+                    field: "research.checkpoint",
+                    message: "checkpoint dispatch authority is required",
+                })
+            }
+            CheckpointDispatchSelection::NotCheckpoint => None,
+            CheckpointDispatchSelection::Blocked => return Ok(CampaignSubmission::Deferred),
+            CheckpointDispatchSelection::Ready(authority) => {
+                let checkpoint = authority.checkpoint();
+                #[cfg(unix)]
+                if candidate.is_some() {
+                    return Err(AppError::Validation {
+                        field: "research.checkpoint",
+                        message: "checkpoint successor cannot enter the candidate route",
+                    });
+                }
+                if durable_project.project_id != checkpoint.project_id
+                    || durable_project.root_path.to_str()
+                        != Some(checkpoint.source_root_canonical_path.as_str())
+                    || durable_campaign.campaign_id != checkpoint.campaign_id
+                    || current.experiment_id != checkpoint.successor_ids.experiment_id
+                    || current.campaign_id != checkpoint.campaign_id
+                    || current.proposal_id != checkpoint.successor_ids.proposal_id
+                    || current.submission_id != checkpoint.successor_ids.submission_id
+                    || current.parent_experiment_id.as_deref()
+                        != Some(checkpoint.source_experiment_id.as_str())
+                    || durable_proposal.proposal_id != checkpoint.successor_ids.proposal_id
+                    || durable_proposal.campaign_id != checkpoint.campaign_id
+                    || durable_proposal.kind != ProposalKind::Experiment
+                    || durable_proposal.argv != checkpoint.retained_argv
+                    || durable_proposal.working_directory != checkpoint.source_working_directory
+                    || durable_submission.submission_id != checkpoint.successor_ids.submission_id
+                    || durable_submission.project_id != checkpoint.project_id
+                    || durable_submission.argv != checkpoint.retained_argv
+                    || current.code_change_run_id.is_some()
+                    || current.code_revision_sha.is_some()
+                    || !task_signature_group_matches(
+                        &checkpoint.source_raw_task_signature,
+                        &durable_project.pueue_group,
+                    )
+                {
+                    return Err(AppError::Validation {
+                        field: "research.checkpoint",
+                        message: "durable submission values must match checkpoint authority",
+                    });
+                }
+                Some(authority)
+            }
+        };
+        let mut verified_checkpoint = None;
+        let mut checkpoint_submitting_won = false;
+        if let Some(authority) = checkpoint_authority.as_ref() {
+            match authority.successor_status() {
+                ExperimentStatus::Reserved => {
+                    if current.status != ExperimentStatus::Reserved {
+                        return Err(AppError::Validation {
+                            field: "research.checkpoint",
+                            message: "reserved checkpoint phase changed before dispatch",
+                        });
+                    }
+                    let policy = self.execution_policy.ok_or(AppError::Validation {
+                        field: "checkpoint.policy",
+                        message: "startup execution policy is required for checkpoint submission",
+                    })?;
+                    let prepared = match verify_prepared_checkpoint(policy, authority.checkpoint()) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            experiments.fail_checkpoint_before_add(
+                                authority,
+                                CHECKPOINT_PRE_ADD_FAILURE_CODE,
+                                now,
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                    verified_checkpoint = Some(prepared);
+                }
+                ExperimentStatus::Submitting => {
+                    experiments.mark_unreconciled(
+                        &current.experiment_id,
+                        ADD_INTERRUPTED_REASON,
+                        now,
+                    )?;
+                    return Err(reconciliation_required());
+                }
+                ExperimentStatus::Unreconciled => return Err(reconciliation_required()),
+                ExperimentStatus::Accepted
+                | ExperimentStatus::Succeeded
+                | ExperimentStatus::Failed
+                | ExperimentStatus::Cancelled => {
+                    return SubmissionRepository::new(self.db)
+                        .find_by_id(&current.submission_id)?
+                        .ok_or(AppError::Runtime {
+                            operation: "read accepted campaign submission",
+                        })
+                        .map(CampaignSubmission::Submitted);
+                }
+            }
         }
 
         #[cfg(unix)]
@@ -1226,12 +1422,47 @@ impl<'a, P: PueueApi + ?Sized> CampaignCoordinator<'a, P> {
         );
         validate_add_argv(&add_args)?;
 
-        if current.status == ExperimentStatus::Reserved
-            && experiments
-                .begin_submitting_or_defer(&current.experiment_id, now)?
-                .is_none()
-        {
-            return Ok(CampaignSubmission::Deferred);
+        if current.status == ExperimentStatus::Reserved {
+            let submitting = match checkpoint_authority.as_ref() {
+                Some(authority) => {
+                    experiments.begin_checkpoint_submitting_or_defer(authority, now)?
+                }
+                None => experiments.begin_submitting_or_defer(&current.experiment_id, now)?,
+            };
+            let Some(submitting) = submitting else {
+                return Ok(CampaignSubmission::Deferred);
+            };
+            if checkpoint_authority.is_some()
+                && submitting.status != ExperimentStatus::Submitting
+            {
+                return Err(AppError::Validation {
+                    field: "research.checkpoint",
+                    message: "checkpoint submitting transition returned an invalid phase",
+                });
+            }
+            if checkpoint_authority.is_some() {
+                checkpoint_submitting_won = true;
+            }
+        }
+
+        if let Some(verified) = verified_checkpoint.as_ref() {
+            let policy = self.execution_policy.ok_or(AppError::Validation {
+                field: "checkpoint.policy",
+                message: "startup execution policy is required for checkpoint submission",
+            })?;
+            if let Err(error) = verified.reverify(policy) {
+                if checkpoint_submitting_won {
+                    let authority = checkpoint_authority
+                        .as_ref()
+                        .expect("checkpoint CAS must retain its authority");
+                    experiments.fail_checkpoint_before_add(
+                        authority,
+                        CHECKPOINT_PRE_ADD_FAILURE_CODE,
+                        now,
+                    )?;
+                }
+                return Err(error);
+            }
         }
 
         let task_id = match self.pueue.add(&add_args).await {
@@ -2133,6 +2364,13 @@ fn reconciliation_required() -> AppError {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::{
+        ffi::OsString,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
+
+    use async_trait::async_trait;
     use super::*;
     use crate::{
         db::{
@@ -2143,6 +2381,7 @@ mod tests {
         proposals::{self, ProposalInput},
         state::ObjectiveSnapshot,
     };
+    use crate::pueue::PueueTask;
     use rusqlite::TransactionBehavior;
     use tempfile::TempDir;
 
@@ -2150,6 +2389,325 @@ mod tests {
         db: Db,
         _root: TempDir,
         project: Project,
+    }
+
+    struct LockCheckingPueue {
+        root: PathBuf,
+        add_lock_held: Arc<Mutex<Vec<bool>>>,
+        status_lock_held: Arc<Mutex<Vec<bool>>>,
+        task: Arc<Mutex<Option<PueueTask>>>,
+    }
+
+    struct CheckpointLeaseProbePueue {
+        policy: crate::execution_policy::ResolvedExecutionPolicy,
+        campaign_id: String,
+        review_id: String,
+        expected: crate::environment::ResearchFileRecord,
+        task: Arc<Mutex<Option<PueueTask>>>,
+        add_cleanup_blocked: Arc<Mutex<Vec<bool>>>,
+        status_cleanup_blocked: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl CheckpointLeaseProbePueue {
+        fn new(
+            policy: &crate::execution_policy::ResolvedExecutionPolicy,
+            campaign_id: &str,
+            review_id: &str,
+            expected: &crate::environment::ResearchFileRecord,
+        ) -> Self {
+            Self {
+                policy: policy.clone(),
+                campaign_id: campaign_id.to_owned(),
+                review_id: review_id.to_owned(),
+                expected: expected.clone(),
+                task: Arc::new(Mutex::new(None)),
+                add_cleanup_blocked: Arc::new(Mutex::new(Vec::new())),
+                status_cleanup_blocked: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn cleanup_is_blocked(&self) -> bool {
+            let retained_path = self
+                .policy
+                .code_change_state_root_path()
+                .join(&self.expected.relative_path);
+            assert!(retained_path.exists(), "retained file must exist during Pueue call");
+            match crate::environment::cleanup_retained_research_file(
+                &self.policy,
+                &self.campaign_id,
+                &self.review_id,
+                &self.expected,
+            ) {
+                Err(error) => {
+                    assert_eq!(
+                        error.code,
+                        crate::execution_policy::PolicyViolationCode::TempUnsafe
+                    );
+                    assert_eq!(
+                        error.detail,
+                        crate::execution_policy::PolicyViolationDetail::TempUnsafe(
+                            crate::execution_policy::TempUnsafeReason::IoFailure
+                        )
+                    );
+                    assert!(retained_path.exists(), "failed EX cleanup must preserve retained file");
+                    true
+                }
+                Ok(()) => panic!("independent EX cleanup acquired while dispatcher was active"),
+            }
+        }
+    }
+
+    struct NoAddPueue {
+        add_count: Arc<Mutex<usize>>,
+    }
+
+    impl NoAddPueue {
+        fn new() -> Self {
+            Self {
+                add_count: Arc::new(Mutex::new(0)),
+            }
+        }
+    }
+
+    impl LockCheckingPueue {
+        fn new(root: PathBuf) -> Self {
+            Self {
+                root,
+                add_lock_held: Arc::new(Mutex::new(Vec::new())),
+                status_lock_held: Arc::new(Mutex::new(Vec::new())),
+                task: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn lock_is_held(&self) -> bool {
+            let root = ProjectRootAnchor::resolve(&self.root)
+                .unwrap()
+                .verify_identity()
+                .unwrap();
+            ProjectAdmissionLock::try_acquire(&root)
+                .unwrap()
+                .is_none()
+        }
+    }
+
+    #[async_trait]
+    impl crate::pueue::PueueApi for LockCheckingPueue {
+        async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
+            self.status_lock_held
+                .lock()
+                .unwrap()
+                .push(self.lock_is_held());
+            Ok(vec![self.task.lock().unwrap().clone().unwrap()])
+        }
+
+        async fn add(&self, args: &[OsString]) -> Result<i64, AppError> {
+            self.add_lock_held
+                .lock()
+                .unwrap()
+                .push(self.lock_is_held());
+            let separator = args
+                .iter()
+                .position(|argument| argument == &OsString::from("--"))
+                .unwrap();
+            let command = crate::reconcile::try_canonical_command_display_os(
+                &args[separator + 1..],
+            )?;
+            *self.task.lock().unwrap() = Some(PueueTask {
+                id: 17,
+                group: args[1].to_string_lossy().into_owned(),
+                command,
+                state: "Running".to_owned(),
+                enqueued_at: Some("900".to_owned()),
+                started_at: Some("1000".to_owned()),
+                ended_at: None,
+                result: None,
+            });
+            Ok(17)
+        }
+
+        async fn kill(&self, _task_id: i64) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl crate::pueue::PueueApi for CheckpointLeaseProbePueue {
+        async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
+            self.status_cleanup_blocked
+                .lock()
+                .unwrap()
+                .push(self.cleanup_is_blocked());
+            Ok(vec![self.task.lock().unwrap().clone().unwrap()])
+        }
+
+        async fn add(&self, args: &[OsString]) -> Result<i64, AppError> {
+            self.add_cleanup_blocked
+                .lock()
+                .unwrap()
+                .push(self.cleanup_is_blocked());
+            let separator = args
+                .iter()
+                .position(|argument| argument == &OsString::from("--"))
+                .unwrap();
+            let command = crate::reconcile::try_canonical_command_display_os(
+                &args[separator + 1..],
+            )?;
+            *self.task.lock().unwrap() = Some(PueueTask {
+                id: 77,
+                group: args[1].to_string_lossy().into_owned(),
+                command,
+                state: "Running".to_owned(),
+                enqueued_at: Some("900".to_owned()),
+                started_at: Some("1000".to_owned()),
+                ended_at: None,
+                result: None,
+            });
+            Ok(77)
+        }
+
+        async fn kill(&self, _task_id: i64) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl crate::pueue::PueueApi for NoAddPueue {
+        async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
+            Ok(Vec::new())
+        }
+
+        async fn add(&self, _args: &[OsString]) -> Result<i64, AppError> {
+            *self.add_count.lock().unwrap() += 1;
+            Err(AppError::Runtime {
+                operation: "unexpected checkpoint Pueue add",
+            })
+        }
+
+        async fn kill(&self, _task_id: i64) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    fn checkpoint_retained_path(db: &Db, successor_id: &str) -> PathBuf {
+        let connection = db.connect().unwrap();
+        let raw: String = connection
+            .query_row(
+                "SELECT checkpoint_json FROM research_reviews
+                 WHERE successor_experiment_id = ?1",
+                [successor_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let checkpoint = crate::research_checkpoint::parse_prepared_checkpoint(&raw).unwrap();
+        db.path()
+            .parent()
+            .unwrap()
+            .join("state")
+            .join(checkpoint.retained_checkpoint.relative_path)
+    }
+
+    fn tamper_checkpoint_retained_file(db: &Db, successor_id: &str) {
+        let path = checkpoint_retained_path(db, successor_id);
+        assert!(path.exists(), "checkpoint retained file must exist before tamper");
+        std::fs::write(path, b"tampered by stale clone hook\n").unwrap();
+    }
+
+    fn stale_submitting_after_clone(db: &Db, successor_id: &str) {
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE experiments SET status = 'submitting'
+                 WHERE experiment_id = ?1",
+                [successor_id],
+            )
+            .unwrap();
+        let authority = match ResearchRepository::new(db)
+            .checkpoint_dispatch_authority("project", successor_id, 3_105)
+            .unwrap()
+        {
+            CheckpointDispatchSelection::Ready(authority) => authority,
+            other => panic!("expected fresh submitting authority, got {other:?}"),
+        };
+        assert_eq!(authority.successor_status(), ExperimentStatus::Submitting);
+        tamper_checkpoint_retained_file(db, successor_id);
+    }
+
+    fn stale_unreconciled_after_clone(db: &Db, successor_id: &str) {
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE experiments
+                 SET status = 'unreconciled', failure_code = 'identity-mismatch'
+                 WHERE experiment_id = ?1",
+                [successor_id],
+            )
+            .unwrap();
+        let submission_id: String = connection
+            .query_row(
+                "SELECT submission_id FROM experiments WHERE experiment_id = ?1",
+                [successor_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE submissions SET status = 'unreconciled'
+                 WHERE submission_id = ?1",
+                [&submission_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE budget_reservations SET status = 'consumed'
+                 WHERE experiment_id = ?1 AND dimension = 'experiment'",
+                [successor_id],
+            )
+            .unwrap();
+        let authority = match ResearchRepository::new(db)
+            .checkpoint_dispatch_authority("project", successor_id, 3_105)
+            .unwrap()
+        {
+            CheckpointDispatchSelection::Ready(authority) => authority,
+            other => panic!("expected fresh unreconciled authority, got {other:?}"),
+        };
+        assert_eq!(authority.successor_status(), ExperimentStatus::Unreconciled);
+        tamper_checkpoint_retained_file(db, successor_id);
+    }
+
+    fn coherent_group_after_clone(db: &Db, successor_id: &str) {
+        crate::research_checkpoint::rewrite_checkpoint_group_coherently(db, successor_id);
+        let authority = match ResearchRepository::new(db)
+            .checkpoint_dispatch_authority("project", successor_id, 3_105)
+            .unwrap()
+        {
+            CheckpointDispatchSelection::Ready(authority) => authority,
+            other => panic!("expected fresh coherent-group authority, got {other:?}"),
+        };
+        assert_eq!(authority.successor_status(), ExperimentStatus::Reserved);
     }
 
     impl CoordinatorFenceFixture {
@@ -2373,6 +2931,272 @@ mod tests {
             .unwrap();
         assert!(matches!(admission, CampaignProposalAdmission::Deferred));
         assert_eq!(fixture.snapshot(), before);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_wrapper_fails_closed_without_checkpoint_authority() {
+        let fixture = CoordinatorFenceFixture::new();
+        let proposal = fixture.proposal(ProposalKind::Experiment, "checkpoint-wrapper");
+        let intent = match CampaignRepository::new(&fixture.db)
+            .accept_proposal(
+                "campaign-1",
+                "proposal-checkpoint-wrapper",
+                "experiment-checkpoint-wrapper",
+                "submission-checkpoint-wrapper",
+                &proposal,
+                &CampaignLimits::default(),
+                106,
+            )
+            .unwrap()
+        {
+            ProposalAcceptance::Accepted(intent) => intent,
+            other => panic!("expected accepted experiment, got {other:?}"),
+        };
+        let pueue = crate::pueue::CommandPueue::default();
+        let coordinator = CampaignCoordinator::new(&fixture.db, &pueue, CampaignLimits::default());
+        let admission = coordinator.acquire_admission(&fixture.project).unwrap();
+        let result = coordinator
+            .submit_checkpoint_intent_with_admission(&intent, &fixture.project, admission, 107)
+            .await;
+        assert!(matches!(
+            result,
+            Err(AppError::Validation {
+                field: "research.checkpoint",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn campaign_admission_lock_survives_add_and_status_then_releases() {
+        let fixture = CoordinatorFenceFixture::new();
+        let proposal = fixture.proposal(ProposalKind::Experiment, "lease");
+        let intent = match CampaignRepository::new(&fixture.db)
+            .accept_proposal(
+                "campaign-1",
+                "proposal-lease",
+                "experiment-lease",
+                "submission-lease",
+                &proposal,
+                &CampaignLimits::default(),
+                106,
+            )
+            .unwrap()
+        {
+            ProposalAcceptance::Accepted(intent) => intent,
+            other => panic!("expected accepted experiment, got {other:?}"),
+        };
+        let pueue = LockCheckingPueue::new(fixture.project.root_path.clone());
+        let add_lock_held = Arc::clone(&pueue.add_lock_held);
+        let status_lock_held = Arc::clone(&pueue.status_lock_held);
+        let coordinator = CampaignCoordinator::new(&fixture.db, &pueue, CampaignLimits::default());
+        let admission = coordinator.acquire_admission(&fixture.project).unwrap();
+        let result = coordinator
+            .submit_admitted_proposal(
+                AdmittedCampaignProposal {
+                    intent,
+                    matches_requested_intent: true,
+                    admission,
+                },
+                &fixture.project,
+                107,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, CampaignSubmission::Submitted(_)));
+        assert_eq!(*add_lock_held.lock().unwrap(), vec![true]);
+        assert_eq!(*status_lock_held.lock().unwrap(), vec![true]);
+
+        let root = ProjectRootAnchor::resolve(&fixture.project.root_path)
+            .unwrap()
+            .verify_identity()
+            .unwrap();
+        assert!(ProjectAdmissionLock::try_acquire(&root).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_reserved_dispatch_keeps_retained_file_shared_lease_through_add_and_status() {
+        let fixture = crate::research_checkpoint::runtime_checkpoint_dispatch_fixture_bridge();
+        assert_eq!(fixture.intent.experiment.status, ExperimentStatus::Reserved);
+        let checkpoint = fixture.checkpoint.clone();
+        let pueue = CheckpointLeaseProbePueue::new(
+            &fixture.policy,
+            &checkpoint.campaign_id,
+            &checkpoint.review_id,
+            &checkpoint.retained_checkpoint,
+        );
+        let add_cleanup_blocked = Arc::clone(&pueue.add_cleanup_blocked);
+        let status_cleanup_blocked = Arc::clone(&pueue.status_cleanup_blocked);
+        let coordinator = CampaignCoordinator::new(
+            &fixture.db,
+            &pueue,
+            CampaignLimits::default(),
+        )
+        .with_execution_policy(&fixture.policy);
+        let admission = coordinator.acquire_admission(&fixture.project).unwrap();
+        let result = coordinator
+            .submit_checkpoint_intent_with_admission(&fixture.intent, &fixture.project, admission, 3_105)
+            .await
+            .unwrap();
+        let submission = match result {
+            CampaignSubmission::Submitted(submission) => submission,
+            CampaignSubmission::Deferred => panic!("checkpoint dispatch unexpectedly deferred"),
+        };
+
+        assert_eq!(submission.pueue_task_id, Some(77));
+        assert_eq!(submission.status, crate::models::SubmissionStatus::Accepted);
+        assert!(submission.task_signature.is_some());
+        let experiment = ExperimentRepository::new(&fixture.db)
+            .find_by_id(&fixture.intent.experiment.experiment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(experiment.status, ExperimentStatus::Accepted);
+        assert_eq!(experiment.pueue_task_id, Some(77));
+        assert!(experiment.task_signature.is_some());
+        assert_eq!(*add_cleanup_blocked.lock().unwrap(), vec![true]);
+        assert_eq!(*status_cleanup_blocked.lock().unwrap(), vec![true]);
+
+        crate::environment::cleanup_retained_research_file(
+            &fixture.policy,
+            &checkpoint.campaign_id,
+            &checkpoint.review_id,
+            &checkpoint.retained_checkpoint,
+        )
+        .unwrap();
+        let retained_path = fixture
+            .policy
+            .code_change_state_root_path()
+            .join(&checkpoint.retained_checkpoint.relative_path);
+        assert!(!retained_path.exists());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_stale_reserved_clone_observing_submitting_never_adds_or_preadd_fails() {
+        let fixture = crate::research_checkpoint::runtime_checkpoint_dispatch_fixture_bridge();
+        let experiment_id = fixture.intent.experiment.experiment_id.clone();
+        let pueue = NoAddPueue::new();
+        let add_count = Arc::clone(&pueue.add_count);
+        let coordinator = CampaignCoordinator::new(&fixture.db, &pueue, CampaignLimits::default())
+            .with_execution_policy(&fixture.policy);
+        set_test_after_clone_hook(
+            &fixture.db,
+            &experiment_id,
+            Some(stale_submitting_after_clone),
+        );
+        let result = coordinator
+            .submit_reserved_intent(&fixture.intent, &fixture.project, 3_105)
+            .await;
+        set_test_after_clone_hook(&fixture.db, &experiment_id, None);
+
+        assert!(matches!(result, Err(AppError::Validation { field: "experiment", .. })));
+        assert_eq!(*add_count.lock().unwrap(), 0);
+        let experiment = ExperimentRepository::new(&fixture.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(experiment.status, ExperimentStatus::Unreconciled);
+        assert_eq!(experiment.failure_code.as_deref(), Some(ADD_INTERRUPTED_REASON));
+        assert_ne!(experiment.failure_code.as_deref(), Some(CHECKPOINT_PRE_ADD_FAILURE_CODE));
+        assert_eq!(experiment.pueue_task_id, None);
+        assert_eq!(experiment.task_signature, None);
+        let submission = SubmissionRepository::new(&fixture.db)
+            .find_by_id(&fixture.intent.experiment.submission_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(submission.status, crate::models::SubmissionStatus::Unreconciled);
+        assert_eq!(submission.pueue_task_id, None);
+        assert_eq!(submission.task_signature, None);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_stale_reserved_clone_observing_unreconciled_never_adds_or_preadd_fails() {
+        let fixture = crate::research_checkpoint::runtime_checkpoint_dispatch_fixture_bridge();
+        let experiment_id = fixture.intent.experiment.experiment_id.clone();
+        let pueue = NoAddPueue::new();
+        let add_count = Arc::clone(&pueue.add_count);
+        let coordinator = CampaignCoordinator::new(&fixture.db, &pueue, CampaignLimits::default())
+            .with_execution_policy(&fixture.policy);
+        set_test_after_clone_hook(
+            &fixture.db,
+            &experiment_id,
+            Some(stale_unreconciled_after_clone),
+        );
+        let result = coordinator
+            .submit_reserved_intent(&fixture.intent, &fixture.project, 3_105)
+            .await;
+        set_test_after_clone_hook(&fixture.db, &experiment_id, None);
+
+        assert!(matches!(result, Err(AppError::Validation { field: "experiment", .. })));
+        assert_eq!(*add_count.lock().unwrap(), 0);
+        let experiment = ExperimentRepository::new(&fixture.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(experiment.status, ExperimentStatus::Unreconciled);
+        assert_eq!(experiment.failure_code.as_deref(), Some("identity-mismatch"));
+        assert_ne!(experiment.failure_code.as_deref(), Some(CHECKPOINT_PRE_ADD_FAILURE_CODE));
+        assert_eq!(experiment.pueue_task_id, None);
+        assert_eq!(experiment.task_signature, None);
+        let submission = SubmissionRepository::new(&fixture.db)
+            .find_by_id(&fixture.intent.experiment.submission_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(submission.status, crate::models::SubmissionStatus::Unreconciled);
+        assert_eq!(submission.pueue_task_id, None);
+        assert_eq!(submission.task_signature, None);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_coherent_group_clone_binding_rejects_stale_group_before_add() {
+        let fixture = crate::research_checkpoint::runtime_checkpoint_dispatch_fixture_bridge();
+        let experiment_id = fixture.intent.experiment.experiment_id.clone();
+        let pueue = NoAddPueue::new();
+        let add_count = Arc::clone(&pueue.add_count);
+        let coordinator = CampaignCoordinator::new(&fixture.db, &pueue, CampaignLimits::default())
+            .with_execution_policy(&fixture.policy);
+        set_test_after_clone_hook(
+            &fixture.db,
+            &experiment_id,
+            Some(coherent_group_after_clone),
+        );
+        let result = coordinator
+            .submit_reserved_intent(&fixture.intent, &fixture.project, 3_105)
+            .await;
+        set_test_after_clone_hook(&fixture.db, &experiment_id, None);
+
+        assert!(matches!(
+            result,
+            Err(AppError::Validation {
+                field: "research.checkpoint",
+                ..
+            })
+        ));
+        assert_eq!(*add_count.lock().unwrap(), 0);
+        let experiment = ExperimentRepository::new(&fixture.db)
+            .find_by_id(&experiment_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(experiment.status, ExperimentStatus::Reserved);
+        assert_eq!(experiment.pueue_task_id, None);
+        assert_eq!(experiment.task_signature, None);
+        let submission = SubmissionRepository::new(&fixture.db)
+            .find_by_id(&fixture.intent.experiment.submission_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(submission.status, crate::models::SubmissionStatus::Pending);
+        assert_eq!(submission.pueue_task_id, None);
+        assert_eq!(submission.task_signature, None);
+        let stored_group: String = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT pueue_group FROM projects WHERE project_id = ?1",
+                [&fixture.project.project_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_group, "coherent-group");
     }
 
     #[tokio::test]

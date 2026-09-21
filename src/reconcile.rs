@@ -639,6 +639,13 @@ struct ObservedTaskSignature {
     state: String,
 }
 
+pub(crate) fn task_signature_group_matches(raw_signature: &str, expected_group: &str) -> bool {
+    raw_signature
+        .strip_prefix("pueue-task:v1:")
+        .and_then(|encoded| serde_json::from_str::<ObservedTaskSignature>(encoded).ok())
+        .is_some_and(|identity| identity.group == expected_group)
+}
+
 fn observed_task_timestamp_matches(raw: &Option<String>, stored: Option<i64>) -> bool {
     match (raw.as_deref(), stored) {
         (None, None) => true,
@@ -1030,7 +1037,10 @@ fn unix_timestamp() -> Result<i64, AppError> {
 
 #[cfg(test)]
 mod display_tests {
-    use super::try_canonical_command_display_os;
+    use super::{
+        task_signature, task_signature_group_matches, try_canonical_command_display_os,
+    };
+    use crate::pueue::PueueTask;
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
@@ -1056,6 +1066,27 @@ mod display_tests {
             display,
             "/usr/bin/env PUEUE_AGENT_EXPERIMENT_ID=exp-1 echo hi"
         );
+    }
+
+    #[test]
+    fn raw_task_signature_group_matches_expected_group() {
+        let task = PueueTask {
+            id: 7,
+            group: "project-group".to_owned(),
+            command: "python train.py".to_owned(),
+            state: "Running".to_owned(),
+            enqueued_at: Some("2026-09-21T00:00:00Z".to_owned()),
+            started_at: None,
+            ended_at: None,
+            result: None,
+        };
+        let raw = task_signature(&task);
+        assert!(task_signature_group_matches(&raw, "project-group"));
+        assert!(!task_signature_group_matches(&raw, "other-group"));
+        assert!(!task_signature_group_matches(
+            "pueue-task:v1:{}",
+            "project-group"
+        ));
     }
 
     #[test]
