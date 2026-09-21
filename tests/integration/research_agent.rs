@@ -626,9 +626,9 @@ max_agent_runs = 10
             String,
             String,
             String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
             Option<String>,
         ) = connection
             .query_row(
@@ -668,9 +668,9 @@ max_agent_runs = 10
             group: pueue_group,
             command: runtime_command.clone(),
             state,
-            enqueued_at,
-            started_at,
-            ended_at,
+            enqueued_at: enqueued_at.map(|value| value.to_string()),
+            started_at: started_at.map(|value| value.to_string()),
+            ended_at: ended_at.map(|value| value.to_string()),
             result: result.and_then(|value| serde_json::from_str(&value).ok()),
         };
         let managed_signature =
@@ -1050,7 +1050,7 @@ max_agent_runs = 10
         )
     }
 
-    async fn run_replacement_until_ready(
+    async fn run_replacement_until_completed(
         &self,
         daemon: &mut Daemon<ResearchDaemonPueue>,
         review_id: &str,
@@ -1066,15 +1066,19 @@ max_agent_runs = 10
                 .find(review_id)
                 .unwrap()
                 .state
-                == "ready"
+                == "completed"
             {
                 return started;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("replacement daemon did not settle research review {review_id}");
+        panic!("replacement daemon did not complete research review {review_id}");
     }
 
+    // A replacement tick runs research recovery and then consumes the fixture's
+    // `continue` answer through advance_research_actions. The durable Pueue
+    // observation remains running, so a recovered ready row reaches completed
+    // in the same tick; wait for that exact terminal state.
     fn write_fixture_controls(
         &self,
         review_id: &str,
@@ -3559,7 +3563,7 @@ async fn research_replacement_daemon_retires_ready_response_after_terminal_failu
         .find_by_id(claimed.event_id)
         .unwrap()
         .expect("the retired research event must remain durable");
-    assert_eq!(after.state, "ready");
+    assert_eq!(after.state, "completed");
     assert_eq!(after.response_json.as_deref(), Some(before_response.as_str()));
     assert_eq!(after.attempt, before.attempt);
     assert_eq!(
@@ -4093,7 +4097,7 @@ async fn research_replacement_daemon_launches_pending_claim_once() {
     assert_eq!(
         first_report.research_started
             + harness
-                .run_replacement_until_ready(&mut daemon, &claimed.review.review_id)
+                .run_replacement_until_completed(&mut daemon, &claimed.review.review_id)
                 .await,
         1
     );
@@ -4114,7 +4118,7 @@ async fn research_replacement_daemon_launches_pending_claim_once() {
     let review = ResearchRepository::new(&harness.db)
         .find(&claimed.review.review_id)
         .unwrap();
-    assert_eq!(review.state, "ready");
+    assert_eq!(review.state, "completed");
     assert_eq!(review.attempt, 1);
     let run_id = review.agent_run_id.expect("pending claim must bind one run");
     assert_eq!(
@@ -4206,7 +4210,7 @@ async fn research_replacement_daemon_reuses_reservation_without_binding() {
     assert_eq!(
         first_report.research_started
             + harness
-                .run_replacement_until_ready(&mut daemon, &claimed.review.review_id)
+                .run_replacement_until_completed(&mut daemon, &claimed.review.review_id)
                 .await,
         1
     );
@@ -4227,7 +4231,7 @@ async fn research_replacement_daemon_reuses_reservation_without_binding() {
     let review = ResearchRepository::new(&harness.db)
         .find(&claimed.review.review_id)
         .unwrap();
-    assert_eq!(review.state, "ready");
+    assert_eq!(review.state, "completed");
     assert_eq!(review.attempt, 1);
     let run_id = review.agent_run_id.expect("reserved review must bind one run");
     assert_eq!(
