@@ -1,12 +1,17 @@
 use std::{
+    collections::HashSet,
     ffi::OsString,
     path::{Component, Path},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{de, de::DeserializeSeed, Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{
+    environment::{ResearchDirectoryRecord, ResearchFileRecord},
     models::ProposalKind,
+    output::permits_lossless_evidence_text,
     proposals::{self, ProposalInput},
     pueue::validate_add_argv,
     research_protocol::CheckpointRequest,
@@ -15,6 +20,90 @@ use crate::{
 
 const SUPPORTED_INTERPRETERS: &[&str] = &["python", "python3"];
 const MAX_CHECKPOINT_PATH_BYTES: usize = 4 * 1024;
+pub(crate) const CHECKPOINT_SUPPORT_VERSION: u8 = 1;
+pub(crate) const MAX_CHECKPOINT_SOURCE_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_CHECKPOINT_CANDIDATES: usize = 4;
+const MAX_CHECKPOINT_SUPPORT_REASON_BYTES: usize = 1024;
+const MAX_CHECKPOINT_CONTEXT_BYTES: usize = if crate::research_evidence::MAX_RESEARCH_CONTEXT_BYTES
+    < crate::research_evidence::MAX_RESEARCH_NATIVE_EVIDENCE_BYTES
+{
+    crate::research_evidence::MAX_RESEARCH_CONTEXT_BYTES
+} else {
+    crate::research_evidence::MAX_RESEARCH_NATIVE_EVIDENCE_BYTES
+};
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CheckpointLoaderRole {
+    Entrypoint,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointLoaderEvidenceV1 {
+    pub(crate) reference: String,
+    pub(crate) role: CheckpointLoaderRole,
+    pub(crate) argv_index: usize,
+    pub(crate) argv_token: String,
+    pub(crate) root_relative_path: String,
+    pub(crate) length: u64,
+    pub(crate) sha256: String,
+    pub(crate) file: ResearchFileRecord,
+    pub(crate) content: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointCandidateEvidenceV1 {
+    pub(crate) reference: String,
+    pub(crate) source_experiment_id: String,
+    pub(crate) argv_path: String,
+    pub(crate) root_relative_path: String,
+    pub(crate) length: u64,
+    pub(crate) sha256: String,
+    pub(crate) file: ResearchFileRecord,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum CheckpointSupportEvidenceV1 {
+    Available {
+        support_version: u8,
+        source_experiment_id: String,
+        source_proposal_id: String,
+        source_submission_id: String,
+        normalized_working_directory: String,
+        working_directory_record: ResearchDirectoryRecord,
+        loader_support: Vec<CheckpointLoaderEvidenceV1>,
+        checkpoint_candidates: Vec<CheckpointCandidateEvidenceV1>,
+        candidates_complete: bool,
+        candidates_omitted_at_least: usize,
+        candidate_limit: usize,
+    },
+    Unavailable {
+        support_version: u8,
+        reason: String,
+        loader_support: Vec<CheckpointLoaderEvidenceV1>,
+        checkpoint_candidates: Vec<CheckpointCandidateEvidenceV1>,
+        candidates_complete: bool,
+        candidates_omitted_at_least: usize,
+        candidate_limit: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedCheckpointSupport<'a> {
+    pub(crate) loader: &'a CheckpointLoaderEvidenceV1,
+    pub(crate) candidate: &'a CheckpointCandidateEvidenceV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CheckpointSourceLayout {
+    pub(crate) normalized_working_directory: String,
+    pub(crate) entrypoint_index: usize,
+    pub(crate) entrypoint_token: String,
+    pub(crate) entrypoint_root_relative_path: String,
+}
 
 /// The only command delta admitted for a checkpoint successor.
 ///
@@ -179,6 +268,630 @@ pub(crate) fn validate_checkpoint_command(
         checkpoint_path: request.path.clone(),
         delta,
     })
+}
+
+pub(crate) fn checkpoint_source_layout(
+    source_argv: &[String],
+    source_working_directory: &str,
+) -> Result<CheckpointSourceLayout, AppError> {
+    let source = validate_command_proposal(source_argv, source_working_directory)?;
+    validate_trainer_command_shape(source_argv)?;
+
+    let entrypoint_index = if SUPPORTED_INTERPRETERS.contains(&source_argv[0].as_str()) {
+        1
+    } else {
+        0
+    };
+    let entrypoint_token = source_argv
+        .get(entrypoint_index)
+        .ok_or_else(|| checkpoint_validation_error("trainer entrypoint is missing"))?
+        .clone();
+    let lookup_token = entrypoint_token
+        .strip_prefix("./")
+        .unwrap_or(entrypoint_token.as_str());
+    let cwd_components = normal_relative_components(source.working_directory())
+        .ok_or_else(|| checkpoint_validation_error("working directory is not normalized"))?;
+    let entrypoint_components = normal_relative_components(lookup_token)
+        .ok_or_else(|| checkpoint_validation_error("trainer entrypoint is not normalized"))?;
+    let mut root_components = cwd_components;
+    root_components.extend(entrypoint_components);
+    let entrypoint_root_relative_path = root_components.join("/");
+    if entrypoint_root_relative_path.is_empty()
+        || entrypoint_root_relative_path.len() > MAX_CHECKPOINT_PATH_BYTES
+    {
+        return Err(checkpoint_validation_error(
+            "trainer entrypoint path is out of bounds",
+        ));
+    }
+
+    Ok(CheckpointSourceLayout {
+        normalized_working_directory: source.working_directory().to_owned(),
+        entrypoint_index,
+        entrypoint_token,
+        entrypoint_root_relative_path,
+    })
+}
+
+pub(crate) fn checkpoint_candidate_argv_path(
+    normalized_working_directory: &str,
+    candidate_root_relative_path: &str,
+) -> Option<String> {
+    let cwd = normal_relative_components(normalized_working_directory)?;
+    let candidate = normal_relative_components(candidate_root_relative_path)?;
+    if candidate.len() <= cwd.len() || !candidate.starts_with(&cwd) {
+        return None;
+    }
+    let argv_path = candidate[cwd.len()..].join("/");
+    if argv_path.is_empty() || argv_path.len() > MAX_CHECKPOINT_PATH_BYTES {
+        return None;
+    }
+    Some(argv_path)
+}
+
+pub(crate) fn checkpoint_support_from_persisted_context(
+    context_json: &str,
+    expected_context_digest: &str,
+) -> Result<CheckpointSupportEvidenceV1, AppError> {
+    if context_json.is_empty() || context_json.len() > MAX_CHECKPOINT_CONTEXT_BYTES {
+        return Err(checkpoint_evidence_error(
+            "persisted context exceeds the native bound",
+        ));
+    }
+    if !is_lower_hex_digest(expected_context_digest)
+        || format!("{:x}", Sha256::digest(context_json.as_bytes())) != expected_context_digest
+    {
+        return Err(checkpoint_evidence_error(
+            "persisted context digest does not match",
+        ));
+    }
+
+    let context = parse_strict_json_value(context_json.as_bytes())?;
+    if context.get("schema_version").and_then(Value::as_u64)
+        != Some(crate::research_evidence::RESEARCH_CONTEXT_SCHEMA_VERSION as u64)
+    {
+        return Err(checkpoint_evidence_error(
+            "persisted context schema version is unsupported",
+        ));
+    }
+    let operations = context
+        .get("operations")
+        .and_then(Value::as_object)
+        .ok_or_else(|| checkpoint_evidence_error("persisted context operations are missing"))?;
+    let support_value = operations
+        .get("checkpoint_support")
+        .cloned()
+        .ok_or_else(|| checkpoint_evidence_error("checkpoint support packet is missing"))?;
+    let support = serde_json::from_value::<CheckpointSupportEvidenceV1>(support_value)
+        .map_err(|_| checkpoint_evidence_error("checkpoint support packet is malformed"))?;
+    validate_checkpoint_support(&context, &support)?;
+    Ok(support)
+}
+
+pub(crate) fn select_checkpoint_support<'a>(
+    support: &'a CheckpointSupportEvidenceV1,
+    request: &CheckpointRequest,
+) -> Result<SelectedCheckpointSupport<'a>, AppError> {
+    let (loader_support, checkpoint_candidates) = match support {
+        CheckpointSupportEvidenceV1::Available {
+            loader_support,
+            checkpoint_candidates,
+            ..
+        } if loader_support.len() == 1 => (loader_support, checkpoint_candidates),
+        CheckpointSupportEvidenceV1::Available { .. }
+        | CheckpointSupportEvidenceV1::Unavailable { .. } => {
+            return Err(checkpoint_evidence_error(
+                "checkpoint support is not selectable",
+            ));
+        }
+    };
+    if request.support_evidence_refs.len() != 2 {
+        return Err(checkpoint_evidence_error(
+            "checkpoint selection requires one loader and one candidate reference",
+        ));
+    }
+
+    let mut references = HashSet::new();
+    let mut selected_loader = None;
+    let mut selected_candidate = None;
+    for reference in &request.support_evidence_refs {
+        if !references.insert(reference.as_str()) {
+            return Err(checkpoint_evidence_error(
+                "checkpoint support references must be unique",
+            ));
+        }
+        let loader_matches = loader_support
+            .iter()
+            .filter(|loader| loader.reference == *reference)
+            .collect::<Vec<_>>();
+        let candidate_matches = checkpoint_candidates
+            .iter()
+            .filter(|candidate| candidate.reference == *reference)
+            .collect::<Vec<_>>();
+        match (loader_matches.as_slice(), candidate_matches.as_slice()) {
+            ([loader], []) if selected_loader.is_none() => selected_loader = Some(*loader),
+            ([], [candidate]) if selected_candidate.is_none() => {
+                selected_candidate = Some(*candidate)
+            }
+            _ => {
+                return Err(checkpoint_evidence_error(
+                    "checkpoint support reference is unknown or ambiguous",
+                ));
+            }
+        }
+    }
+
+    let loader = selected_loader.ok_or_else(|| {
+        checkpoint_evidence_error("checkpoint selection is missing the loader reference")
+    })?;
+    let candidate = selected_candidate.ok_or_else(|| {
+        checkpoint_evidence_error("checkpoint selection is missing the candidate reference")
+    })?;
+    if request.path != candidate.argv_path {
+        return Err(checkpoint_evidence_error(
+            "checkpoint request path does not match selected evidence",
+        ));
+    }
+    Ok(SelectedCheckpointSupport { loader, candidate })
+}
+
+fn validate_checkpoint_support(
+    context: &Value,
+    support: &CheckpointSupportEvidenceV1,
+) -> Result<(), AppError> {
+    match support {
+        CheckpointSupportEvidenceV1::Unavailable {
+            support_version,
+            reason,
+            loader_support,
+            checkpoint_candidates,
+            candidates_complete,
+            candidate_limit,
+            ..
+        } => {
+            if *support_version != CHECKPOINT_SUPPORT_VERSION
+                || reason.is_empty()
+                || reason.len() > MAX_CHECKPOINT_SUPPORT_REASON_BYTES
+                || reason.chars().any(char::is_control)
+                || !loader_support.is_empty()
+                || !checkpoint_candidates.is_empty()
+                || *candidates_complete
+                || *candidate_limit != MAX_CHECKPOINT_CANDIDATES
+            {
+                return Err(checkpoint_evidence_error(
+                    "unavailable checkpoint support is not empty and bounded",
+                ));
+            }
+            Ok(())
+        }
+        CheckpointSupportEvidenceV1::Available {
+            support_version,
+            source_experiment_id,
+            source_proposal_id,
+            source_submission_id,
+            normalized_working_directory,
+            working_directory_record,
+            loader_support,
+            checkpoint_candidates,
+            candidates_complete,
+            candidates_omitted_at_least,
+            candidate_limit,
+        } => {
+            if *support_version != CHECKPOINT_SUPPORT_VERSION
+                || !valid_bounded_identity(source_experiment_id)
+                || !valid_bounded_identity(source_proposal_id)
+                || !valid_bounded_identity(source_submission_id)
+                || normal_relative_components(normalized_working_directory).is_none()
+                || loader_support.len() != 1
+                || checkpoint_candidates.is_empty()
+                || checkpoint_candidates.len() > MAX_CHECKPOINT_CANDIDATES
+                || *candidate_limit != MAX_CHECKPOINT_CANDIDATES
+                || (*candidates_complete && *candidates_omitted_at_least != 0)
+                || (!*candidates_complete && *candidates_omitted_at_least == 0)
+            {
+                return Err(checkpoint_evidence_error(
+                    "checkpoint support cardinality or bounds are invalid",
+                ));
+            }
+            validate_context_bindings(
+                context,
+                source_experiment_id,
+                source_proposal_id,
+                source_submission_id,
+            )?;
+
+            let loader = &loader_support[0];
+            validate_loader_evidence(loader, normalized_working_directory)?;
+            let common_root = &loader.file.root;
+            if normalized_working_directory == "." && working_directory_record != common_root {
+                return Err(checkpoint_evidence_error(
+                    "root working directory identity does not match file records",
+                ));
+            }
+            if loader_is_direct_child_of_cwd(loader, normalized_working_directory)
+                && loader.file.parent != *working_directory_record
+            {
+                return Err(checkpoint_evidence_error(
+                    "direct loader parent does not match working directory",
+                ));
+            }
+
+            let mut references = HashSet::new();
+            if !references.insert(loader.reference.as_str()) {
+                return Err(checkpoint_evidence_error(
+                    "checkpoint evidence references must be unique",
+                ));
+            }
+            let expected_loader_reference = format!("loader-source:{}", loader.sha256);
+            if loader.reference != expected_loader_reference {
+                return Err(checkpoint_evidence_error(
+                    "loader evidence reference is not deterministic",
+                ));
+            }
+
+            let artifact_prefix = [
+                ".pueue-agent".to_owned(),
+                "artifacts".to_owned(),
+                source_experiment_id.clone(),
+            ];
+            let mut candidate_paths = Vec::with_capacity(checkpoint_candidates.len());
+            let mut candidate_logical_bytes = 0_u64;
+            for candidate in checkpoint_candidates {
+                validate_candidate_evidence(
+                    candidate,
+                    source_experiment_id,
+                    normalized_working_directory,
+                    &artifact_prefix,
+                )?;
+                if candidate.file.root != *common_root {
+                    return Err(checkpoint_evidence_error(
+                        "checkpoint file roots do not share the source root",
+                    ));
+                }
+                if candidate.file.logical_bytes
+                    > crate::environment::MAX_PRIVATE_TEMP_ALLOCATED_BYTES
+                    || candidate.file.allocated_bytes
+                        > crate::environment::MAX_PRIVATE_TEMP_ALLOCATED_BYTES
+                {
+                    return Err(checkpoint_evidence_error(
+                        "checkpoint candidate exceeds the fixed byte bound",
+                    ));
+                }
+                candidate_logical_bytes = candidate_logical_bytes
+                    .checked_add(candidate.file.logical_bytes)
+                    .ok_or_else(|| {
+                        checkpoint_evidence_error(
+                            "checkpoint candidate aggregate exceeds the fixed byte bound",
+                        )
+                    })?;
+                if candidate_logical_bytes > crate::environment::MAX_PRIVATE_TEMP_ALLOCATED_BYTES {
+                    return Err(checkpoint_evidence_error(
+                        "checkpoint candidate aggregate exceeds the fixed byte bound",
+                    ));
+                }
+                if !references.insert(candidate.reference.as_str()) {
+                    return Err(checkpoint_evidence_error(
+                        "checkpoint evidence references must be unique",
+                    ));
+                }
+                candidate_paths.push(candidate.root_relative_path.as_str());
+            }
+            candidate_paths.sort_unstable();
+            candidate_paths.dedup();
+            if candidate_paths.len() != checkpoint_candidates.len() {
+                return Err(checkpoint_evidence_error(
+                    "checkpoint candidate paths must be unique",
+                ));
+            }
+            for (ordinal, root_relative_path) in candidate_paths.iter().enumerate() {
+                let candidate = checkpoint_candidates
+                    .iter()
+                    .find(|candidate| candidate.root_relative_path == *root_relative_path)
+                    .expect("candidate path was validated");
+                let expected_reference = format!(
+                    "checkpoint:{source_experiment_id}:{ordinal}:{}",
+                    candidate.sha256
+                );
+                if candidate.reference != expected_reference {
+                    return Err(checkpoint_evidence_error(
+                        "checkpoint evidence reference is not deterministic",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_loader_evidence(
+    loader: &CheckpointLoaderEvidenceV1,
+    normalized_working_directory: &str,
+) -> Result<(), AppError> {
+    if loader.role != CheckpointLoaderRole::Entrypoint
+        || loader.argv_index > 1
+        || loader.argv_token.is_empty()
+        || loader.argv_token.len() > MAX_CHECKPOINT_PATH_BYTES
+        || has_shell_payload(&loader.argv_token)
+        || normal_relative_components(&loader.root_relative_path).is_none()
+        || loader.file.relative_path != loader.root_relative_path
+        || !is_lower_hex_digest(&loader.sha256)
+        || loader.file.sha256 != loader.sha256
+        || loader.length != loader.file.logical_bytes
+        || usize::try_from(loader.length).ok() != Some(loader.content.len())
+        || loader.content.len() > MAX_CHECKPOINT_SOURCE_BYTES
+        || format!("{:x}", Sha256::digest(loader.content.as_bytes())) != loader.sha256
+        || !permits_lossless_evidence_text(&loader.content)
+    {
+        return Err(checkpoint_evidence_error(
+            "loader evidence does not match the complete source record",
+        ));
+    }
+    let lookup_token = loader
+        .argv_token
+        .strip_prefix("./")
+        .unwrap_or(loader.argv_token.as_str());
+    if (loader.argv_index == 0 && !is_direct_project_entrypoint(&loader.argv_token))
+        || (loader.argv_index == 1 && !is_interpreter_entrypoint(&loader.argv_token))
+    {
+        return Err(checkpoint_evidence_error(
+            "loader argv token is not an accepted entrypoint",
+        ));
+    }
+    let cwd = normal_relative_components(normalized_working_directory)
+        .ok_or_else(|| checkpoint_evidence_error("loader working directory is invalid"))?;
+    let token = normal_relative_components(lookup_token)
+        .ok_or_else(|| checkpoint_evidence_error("loader argv token is not normalized"))?;
+    let mut expected_path = cwd;
+    expected_path.extend(token);
+    if expected_path.join("/") != loader.root_relative_path {
+        return Err(checkpoint_evidence_error(
+            "loader path is not the command entrypoint",
+        ));
+    }
+    Ok(())
+}
+
+fn loader_is_direct_child_of_cwd(
+    loader: &CheckpointLoaderEvidenceV1,
+    normalized_working_directory: &str,
+) -> bool {
+    let Some(cwd) = normal_relative_components(normalized_working_directory) else {
+        return false;
+    };
+    let Some(loader_path) = normal_relative_components(&loader.root_relative_path) else {
+        return false;
+    };
+    loader_path.len() == cwd.len() + 1 && loader_path.starts_with(&cwd)
+}
+
+fn validate_candidate_evidence(
+    candidate: &CheckpointCandidateEvidenceV1,
+    source_experiment_id: &str,
+    normalized_working_directory: &str,
+    artifact_prefix: &[String; 3],
+) -> Result<(), AppError> {
+    let candidate_components = normal_relative_components(&candidate.root_relative_path)
+        .ok_or_else(|| checkpoint_evidence_error("candidate path is not normalized"))?;
+    if candidate.source_experiment_id != source_experiment_id
+        || candidate.file.relative_path != candidate.root_relative_path
+        || !candidate_components.starts_with(artifact_prefix)
+        || candidate_components.len() <= artifact_prefix.len()
+        || checkpoint_candidate_argv_path(
+            normalized_working_directory,
+            &candidate.root_relative_path,
+        ) != Some(candidate.argv_path.clone())
+        || !is_lower_hex_digest(&candidate.sha256)
+        || candidate.file.sha256 != candidate.sha256
+        || candidate.length != candidate.file.logical_bytes
+    {
+        return Err(checkpoint_evidence_error(
+            "checkpoint candidate record or path is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_context_bindings(
+    context: &Value,
+    source_experiment_id: &str,
+    source_proposal_id: &str,
+    source_submission_id: &str,
+) -> Result<(), AppError> {
+    let Some(facts_value) = context.get("facts") else {
+        return Ok(());
+    };
+    let Some(facts) = facts_value.as_object() else {
+        return Err(checkpoint_evidence_error(
+            "persisted context facts are malformed",
+        ));
+    };
+    check_optional_context_id(facts.get("review"), "experiment_id", source_experiment_id)?;
+    check_optional_context_id(facts.get("target"), "experiment_id", source_experiment_id)?;
+    check_optional_context_id(facts.get("target"), "proposal_id", source_proposal_id)?;
+    check_optional_context_id(facts.get("target"), "submission_id", source_submission_id)?;
+    Ok(())
+}
+
+fn check_optional_context_id(
+    value: Option<&Value>,
+    field: &'static str,
+    expected: &str,
+) -> Result<(), AppError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(object) = value.as_object() else {
+        return Err(checkpoint_evidence_error(
+            "persisted context binding is malformed",
+        ));
+    };
+    let Some(actual) = object.get(field) else {
+        return Ok(());
+    };
+    if actual.as_str() != Some(expected) {
+        return Err(checkpoint_evidence_error(
+            "persisted context binding does not match support evidence",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_bounded_identity(value: &str) -> bool {
+    crate::environment::validate_research_id(value).is_ok()
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_strict_json_value(bytes: &[u8]) -> Result<Value, AppError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = StrictJsonValue
+        .deserialize(&mut deserializer)
+        .map_err(|_| checkpoint_evidence_error("persisted context is not strict JSON"))?;
+    deserializer
+        .end()
+        .map_err(|_| checkpoint_evidence_error("persisted context has trailing data"))?;
+    Ok(value)
+}
+
+struct StrictJsonValue;
+
+impl<'de> de::DeserializeSeed<'de> for StrictJsonValue {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictJsonValueVisitor)
+    }
+}
+
+struct StrictJsonValueVisitor;
+
+impl<'de> de::Visitor<'de> for StrictJsonValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a strict JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| de::Error::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::String(value))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(StrictJsonValue)? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: de::MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(de::Error::custom("duplicate JSON object key"));
+            }
+            let value = map.next_value_seed(StrictJsonValue)?;
+            object.insert(key, value);
+        }
+        Ok(Value::Object(object))
+    }
+}
+
+fn normal_relative_components(value: &str) -> Option<Vec<String>> {
+    if value == "." {
+        return Some(Vec::new());
+    }
+    if value.is_empty()
+        || value.len() > MAX_CHECKPOINT_PATH_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return None;
+    }
+    let components = path
+        .components()
+        .map(|component| match component {
+            Component::Normal(component) => component.to_str().map(ToOwned::to_owned),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if components.is_empty() || components.join("/") != value {
+        return None;
+    }
+    Some(components)
 }
 
 /// Validate only the exact argv delta.  This is useful when the surrounding
@@ -406,8 +1119,18 @@ fn is_interpreter_entrypoint(value: &str) -> bool {
     if path.is_absolute() {
         return false;
     }
-    path.components()
-        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+    let mut has_normal = false;
+    if !path.components().all(|component| {
+        if matches!(component, Component::Normal(_)) {
+            has_normal = true;
+            true
+        } else {
+            matches!(component, Component::CurDir)
+        }
+    }) {
+        return false;
+    }
+    has_normal
 }
 
 fn is_direct_project_entrypoint(value: &str) -> bool {
@@ -475,6 +1198,13 @@ fn has_shell_payload(value: &str) -> bool {
 fn checkpoint_validation_error(message: &'static str) -> AppError {
     AppError::Validation {
         field: "checkpoint.argv",
+        message,
+    }
+}
+
+fn checkpoint_evidence_error(message: &'static str) -> AppError {
+    AppError::Validation {
+        field: "checkpoint_support",
         message,
     }
 }
@@ -700,6 +1430,551 @@ mod tests {
             let request = request(path, &argv, ".");
             assert!(validate_checkpoint_command(&source, ".", &request).is_err());
         }
+    }
+
+    #[test]
+    fn checkpoint_delta_roundtrips_and_rejects_unknown_fields() {
+        let delta = CheckpointArgvDelta {
+            form: CheckpointArgvDeltaForm::Pair,
+            index: 2,
+            flag: "--resume".to_owned(),
+        };
+        let encoded = serde_json::to_vec(&delta).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<CheckpointArgvDelta>(&encoded).unwrap(),
+            delta
+        );
+
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        value["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<CheckpointArgvDelta>(value).is_err());
+    }
+
+    #[test]
+    fn shell_guard_isolated_from_valid_delta_when_original_token_is_retained() {
+        let source = vec![
+            "python".to_owned(),
+            "train.py".to_owned(),
+            "literal;token".to_owned(),
+        ];
+        let request_argv = vec![
+            "python".to_owned(),
+            "train.py".to_owned(),
+            "literal;token".to_owned(),
+            "--resume".to_owned(),
+            "checkpoint.json".to_owned(),
+        ];
+        assert!(validate_checkpoint_argv_delta(&source, &request_argv, "checkpoint.json").is_ok());
+        assert!(validate_checkpoint_command(
+            &source,
+            ".",
+            &request(
+                "checkpoint.json",
+                &[
+                    "python",
+                    "train.py",
+                    "literal;token",
+                    "--resume",
+                    "checkpoint.json"
+                ],
+                "."
+            )
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_dot_only_interpreter_and_direct_trainer_entrypoints() {
+        for (source, request_argv) in [
+            (
+                vec!["python".to_owned(), ".".to_owned()],
+                vec!["python", ".", "--resume", "checkpoint.json"],
+            ),
+            (
+                vec!["./".to_owned()],
+                vec!["./", "--resume", "checkpoint.json"],
+            ),
+        ] {
+            let request = request("checkpoint.json", &request_argv, ".");
+            assert!(validate_checkpoint_command(&source, ".", &request).is_err());
+        }
+    }
+
+    #[test]
+    fn source_layout_and_candidate_projection_preserve_lookup_rules() {
+        let interpreter =
+            checkpoint_source_layout(&["python".to_owned(), "train.py".to_owned()], ".").unwrap();
+        assert_eq!(interpreter.entrypoint_index, 1);
+        assert_eq!(interpreter.entrypoint_token, "train.py");
+        assert_eq!(interpreter.entrypoint_root_relative_path, "train.py");
+
+        let direct = checkpoint_source_layout(&["./train.py".to_owned()], ".").unwrap();
+        assert_eq!(direct.entrypoint_index, 0);
+        assert_eq!(direct.entrypoint_token, "./train.py");
+        assert_eq!(direct.entrypoint_root_relative_path, "train.py");
+
+        for argv in [
+            vec!["train.py".to_owned()],
+            vec![".".to_owned()],
+            vec!["./".to_owned()],
+        ] {
+            assert!(checkpoint_source_layout(&argv, ".").is_err());
+        }
+
+        let root = checkpoint_source_layout(
+            &vec!["python".to_owned(), "./trainer/train.py".to_owned()],
+            "runs/exp",
+        )
+        .unwrap();
+        assert_eq!(root.normalized_working_directory, "runs/exp");
+        assert_eq!(root.entrypoint_index, 1);
+        assert_eq!(root.entrypoint_token, "./trainer/train.py");
+        assert_eq!(
+            root.entrypoint_root_relative_path,
+            "runs/exp/trainer/train.py"
+        );
+
+        assert_eq!(
+            checkpoint_candidate_argv_path(
+                "runs/exp",
+                "runs/exp/.pueue-agent/artifacts/e/checkpoint.json"
+            ),
+            Some(".pueue-agent/artifacts/e/checkpoint.json".to_owned())
+        );
+        assert_eq!(
+            checkpoint_candidate_argv_path("runs/exp", "runs/other/checkpoint.json"),
+            None
+        );
+        assert_eq!(checkpoint_candidate_argv_path("runs/exp", "runs/exp"), None);
+        assert_eq!(
+            checkpoint_candidate_argv_path("runs/exp", "runs/exp/../other"),
+            None
+        );
+    }
+
+    fn sample_directory() -> ResearchDirectoryRecord {
+        ResearchDirectoryRecord {
+            device: 1,
+            inode: 2,
+            owner: 3,
+            mode: 0o700,
+            mount_identity: [4, 5],
+        }
+    }
+
+    fn sample_file(relative_path: &str, bytes: &[u8]) -> ResearchFileRecord {
+        let directory = sample_directory();
+        ResearchFileRecord {
+            relative_path: relative_path.to_owned(),
+            root: directory.clone(),
+            parent: directory,
+            device: 6,
+            inode: 7,
+            owner: 3,
+            mode: 0o600,
+            mount_identity: [8, 9],
+            logical_bytes: bytes.len() as u64,
+            allocated_bytes: 512,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }
+    }
+
+    fn sample_support() -> CheckpointSupportEvidenceV1 {
+        let source = "x = 1\n";
+        let source_sha256 = format!("{:x}", Sha256::digest(source.as_bytes()));
+        let candidate_path = ".pueue-agent/artifacts/exp/checkpoint.json";
+        let candidate_bytes = b"checkpoint";
+        let candidate_sha256 = format!("{:x}", Sha256::digest(candidate_bytes));
+        CheckpointSupportEvidenceV1::Available {
+            support_version: CHECKPOINT_SUPPORT_VERSION,
+            source_experiment_id: "exp".to_owned(),
+            source_proposal_id: "proposal".to_owned(),
+            source_submission_id: "submission".to_owned(),
+            normalized_working_directory: ".".to_owned(),
+            working_directory_record: sample_directory(),
+            loader_support: vec![CheckpointLoaderEvidenceV1 {
+                reference: format!("loader-source:{source_sha256}"),
+                role: CheckpointLoaderRole::Entrypoint,
+                argv_index: 1,
+                argv_token: "train.py".to_owned(),
+                root_relative_path: "train.py".to_owned(),
+                length: source.len() as u64,
+                sha256: source_sha256,
+                file: sample_file("train.py", source.as_bytes()),
+                content: source.to_owned(),
+            }],
+            checkpoint_candidates: vec![CheckpointCandidateEvidenceV1 {
+                reference: format!("checkpoint:exp:0:{candidate_sha256}"),
+                source_experiment_id: "exp".to_owned(),
+                argv_path: candidate_path.to_owned(),
+                root_relative_path: candidate_path.to_owned(),
+                length: candidate_bytes.len() as u64,
+                sha256: candidate_sha256,
+                file: sample_file(candidate_path, candidate_bytes),
+            }],
+            candidates_complete: true,
+            candidates_omitted_at_least: 0,
+            candidate_limit: MAX_CHECKPOINT_CANDIDATES,
+        }
+    }
+
+    fn context_for_support(support: CheckpointSupportEvidenceV1) -> (String, String) {
+        let context = serde_json::json!({
+            "schema_version": crate::research_evidence::RESEARCH_CONTEXT_SCHEMA_VERSION,
+            "facts": {
+                "review": {"experiment_id": "exp"},
+                "target": {
+                    "experiment_id": "exp",
+                    "proposal_id": "proposal",
+                    "submission_id": "submission"
+                }
+            },
+            "operations": {"checkpoint_support": support}
+        });
+        let context_json = serde_json::to_string(&context).unwrap();
+        let digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        (context_json, digest)
+    }
+
+    fn sample_support_with_two_candidates() -> CheckpointSupportEvidenceV1 {
+        let CheckpointSupportEvidenceV1::Available {
+            support_version,
+            source_experiment_id,
+            source_proposal_id,
+            source_submission_id,
+            normalized_working_directory,
+            working_directory_record,
+            loader_support,
+            mut checkpoint_candidates,
+            candidates_complete,
+            candidates_omitted_at_least,
+            candidate_limit,
+        } = sample_support()
+        else {
+            unreachable!();
+        };
+        let bytes = b"checkpoint";
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let second_path = ".pueue-agent/artifacts/exp/other.json";
+        checkpoint_candidates.push(CheckpointCandidateEvidenceV1 {
+            reference: format!("checkpoint:exp:1:{sha256}"),
+            source_experiment_id: source_experiment_id.clone(),
+            argv_path: second_path.to_owned(),
+            root_relative_path: second_path.to_owned(),
+            length: bytes.len() as u64,
+            sha256,
+            file: sample_file(second_path, bytes),
+        });
+        CheckpointSupportEvidenceV1::Available {
+            support_version,
+            source_experiment_id,
+            source_proposal_id,
+            source_submission_id,
+            normalized_working_directory,
+            working_directory_record,
+            loader_support,
+            checkpoint_candidates,
+            candidates_complete,
+            candidates_omitted_at_least,
+            candidate_limit,
+        }
+    }
+
+    fn parse_context_value(
+        value: serde_json::Value,
+    ) -> Result<CheckpointSupportEvidenceV1, AppError> {
+        let context = serde_json::to_string(&value).unwrap();
+        let digest = format!("{:x}", Sha256::digest(context.as_bytes()));
+        checkpoint_support_from_persisted_context(&context, &digest)
+    }
+
+    fn sample_request(path: &str, refs: &[String]) -> CheckpointRequest {
+        CheckpointRequest {
+            path: path.to_owned(),
+            argv: vec!["python".to_owned(), "train.py".to_owned()],
+            working_directory: ".".to_owned(),
+            support_evidence_refs: refs.to_owned(),
+        }
+    }
+
+    #[test]
+    fn support_selector_requires_one_loader_and_one_candidate_in_either_order() {
+        let support = sample_support();
+        let (loader_ref, candidate_ref, candidate_path) = match &support {
+            CheckpointSupportEvidenceV1::Available {
+                loader_support,
+                checkpoint_candidates,
+                ..
+            } => (
+                loader_support[0].reference.clone(),
+                checkpoint_candidates[0].reference.clone(),
+                checkpoint_candidates[0].argv_path.clone(),
+            ),
+            CheckpointSupportEvidenceV1::Unavailable { .. } => unreachable!(),
+        };
+
+        for refs in [
+            vec![loader_ref.clone(), candidate_ref.clone()],
+            vec![candidate_ref.clone(), loader_ref.clone()],
+        ] {
+            let selected =
+                select_checkpoint_support(&support, &sample_request(&candidate_path, &refs))
+                    .unwrap();
+            assert_eq!(selected.loader.reference, loader_ref);
+            assert_eq!(selected.candidate.reference, candidate_ref);
+        }
+
+        let two_candidates = sample_support_with_two_candidates();
+        let second_ref = match &two_candidates {
+            CheckpointSupportEvidenceV1::Available {
+                checkpoint_candidates,
+                ..
+            } => checkpoint_candidates[1].reference.clone(),
+            CheckpointSupportEvidenceV1::Unavailable { .. } => unreachable!(),
+        };
+        for refs in [
+            vec![candidate_ref.clone()],
+            vec![loader_ref.clone()],
+            vec![loader_ref.clone(), loader_ref.clone()],
+            vec![loader_ref.clone(), "foreign".to_owned()],
+            vec![loader_ref.clone(), candidate_ref.clone(), second_ref],
+        ] {
+            assert!(select_checkpoint_support(
+                &two_candidates,
+                &sample_request(&candidate_path, &refs)
+            )
+            .is_err());
+        }
+        assert!(select_checkpoint_support(
+            &support,
+            &sample_request("other/checkpoint.json", &[loader_ref, candidate_ref])
+        )
+        .is_err());
+
+        let unavailable = CheckpointSupportEvidenceV1::Unavailable {
+            support_version: CHECKPOINT_SUPPORT_VERSION,
+            reason: "unsupported".to_owned(),
+            loader_support: Vec::new(),
+            checkpoint_candidates: Vec::new(),
+            candidates_complete: false,
+            candidates_omitted_at_least: 0,
+            candidate_limit: MAX_CHECKPOINT_CANDIDATES,
+        };
+        assert!(select_checkpoint_support(
+            &unavailable,
+            &sample_request(
+                &candidate_path,
+                &["loader".to_owned(), "candidate".to_owned()]
+            )
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parser_requires_common_root_and_provable_cwd_parent_identity() {
+        let (context, _) = context_for_support(sample_support());
+        let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        value["operations"]["checkpoint_support"]["working_directory_record"]["inode"] =
+            serde_json::json!(999);
+        assert!(parse_context_value(value).is_err());
+
+        let (context, _) = context_for_support(sample_support());
+        let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        value["operations"]["checkpoint_support"]["checkpoint_candidates"][0]["file"]["root"]
+            ["inode"] = serde_json::json!(999);
+        assert!(parse_context_value(value).is_err());
+
+        let (context, _) = context_for_support(sample_support());
+        let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        value["operations"]["checkpoint_support"]["loader_support"][0]["file"]["parent"]["inode"] =
+            serde_json::json!(999);
+        assert!(parse_context_value(value).is_err());
+
+        let (context, _) = context_for_support(sample_support());
+        let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        value["operations"]["checkpoint_support"]["loader_support"][0]["argv_token"] =
+            serde_json::json!("trainer/train.py");
+        value["operations"]["checkpoint_support"]["loader_support"][0]["root_relative_path"] =
+            serde_json::json!("trainer/train.py");
+        value["operations"]["checkpoint_support"]["loader_support"][0]["file"]["relative_path"] =
+            serde_json::json!("trainer/train.py");
+        value["operations"]["checkpoint_support"]["loader_support"][0]["file"]["parent"]["inode"] =
+            serde_json::json!(999);
+        assert!(parse_context_value(value).is_ok());
+    }
+
+    #[test]
+    fn parser_rejects_present_non_object_facts() {
+        for facts in [serde_json::json!("malformed"), serde_json::json!([])] {
+            let (context, _) = context_for_support(sample_support());
+            let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+            value["facts"] = facts;
+            assert!(parse_context_value(value).is_err());
+        }
+    }
+
+    #[test]
+    fn parser_enforces_fixed_candidate_byte_budgets_and_exact_boundary() {
+        let limit = crate::environment::MAX_PRIVATE_TEMP_ALLOCATED_BYTES;
+
+        let (context, _) = context_for_support(sample_support());
+        let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        value["operations"]["checkpoint_support"]["checkpoint_candidates"][0]["length"] =
+            serde_json::json!(limit + 1);
+        value["operations"]["checkpoint_support"]["checkpoint_candidates"][0]["file"]
+            ["logical_bytes"] = serde_json::json!(limit + 1);
+        assert!(parse_context_value(value).is_err());
+
+        let (context, _) = context_for_support(sample_support());
+        let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        value["operations"]["checkpoint_support"]["checkpoint_candidates"][0]["file"]
+            ["allocated_bytes"] = serde_json::json!(limit + 1);
+        assert!(parse_context_value(value).is_err());
+
+        let (context, _) = context_for_support(sample_support_with_two_candidates());
+        let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        for candidate in value["operations"]["checkpoint_support"]["checkpoint_candidates"]
+            .as_array_mut()
+            .unwrap()
+        {
+            candidate["length"] = serde_json::json!(limit / 2 + 1);
+            candidate["file"]["logical_bytes"] = serde_json::json!(limit / 2 + 1);
+        }
+        assert!(parse_context_value(value).is_err());
+
+        let (context, _) = context_for_support(sample_support());
+        let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        value["operations"]["checkpoint_support"]["checkpoint_candidates"][0]["length"] =
+            serde_json::json!(limit);
+        value["operations"]["checkpoint_support"]["checkpoint_candidates"][0]["file"]
+            ["logical_bytes"] = serde_json::json!(limit);
+        value["operations"]["checkpoint_support"]["checkpoint_candidates"][0]["file"]
+            ["allocated_bytes"] = serde_json::json!(limit);
+        assert!(parse_context_value(value).is_ok());
+    }
+
+    #[test]
+    fn strict_support_parser_accepts_complete_source_and_rejects_unknown_fields() {
+        let (context, digest) = context_for_support(sample_support());
+        let parsed = checkpoint_support_from_persisted_context(&context, &digest).unwrap();
+        assert!(matches!(
+            parsed,
+            CheckpointSupportEvidenceV1::Available { .. }
+        ));
+
+        let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        value["operations"]["checkpoint_support"]["unexpected"] = serde_json::json!(true);
+        let context = serde_json::to_string(&value).unwrap();
+        let digest = format!("{:x}", Sha256::digest(context.as_bytes()));
+        assert!(checkpoint_support_from_persisted_context(&context, &digest).is_err());
+    }
+
+    #[test]
+    fn strict_support_parser_rejects_duplicate_digest_tamper_and_bad_membership() {
+        let (context, _digest) = context_for_support(sample_support());
+        assert!(checkpoint_support_from_persisted_context(&context, &"a".repeat(64)).is_err());
+
+        let duplicate = format!(
+            "{{\"schema_version\":1,\"operations\":{{\"checkpoint_support\":{},\"checkpoint_support\":{}}}}}",
+            serde_json::to_string(&sample_support()).unwrap(),
+            serde_json::to_string(&sample_support()).unwrap()
+        );
+        let duplicate_digest = format!("{:x}", Sha256::digest(duplicate.as_bytes()));
+        assert!(checkpoint_support_from_persisted_context(&duplicate, &duplicate_digest).is_err());
+
+        let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        value["facts"]["target"]["proposal_id"] = serde_json::json!("foreign");
+        let tampered = serde_json::to_string(&value).unwrap();
+        let tampered_digest = format!("{:x}", Sha256::digest(tampered.as_bytes()));
+        assert!(checkpoint_support_from_persisted_context(&tampered, &tampered_digest).is_err());
+
+        let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        value["operations"]["checkpoint_support"]["loader_support"][0]["content"] =
+            serde_json::json!("x = 2\n");
+        let tampered = serde_json::to_string(&value).unwrap();
+        let tampered_digest = format!("{:x}", Sha256::digest(tampered.as_bytes()));
+        assert!(checkpoint_support_from_persisted_context(&tampered, &tampered_digest).is_err());
+
+        let mut value: serde_json::Value = serde_json::from_str(&context).unwrap();
+        value["operations"]["checkpoint_support"]["checkpoint_candidates"][0]
+            ["root_relative_path"] = serde_json::json!("foreign/checkpoint.json");
+        let tampered = serde_json::to_string(&value).unwrap();
+        let tampered_digest = format!("{:x}", Sha256::digest(tampered.as_bytes()));
+        assert!(checkpoint_support_from_persisted_context(&tampered, &tampered_digest).is_err());
+    }
+
+    #[test]
+    fn strict_support_parser_accepts_unique_refs_for_identical_candidate_bytes() {
+        let CheckpointSupportEvidenceV1::Available {
+            support_version,
+            source_experiment_id,
+            source_proposal_id,
+            source_submission_id,
+            normalized_working_directory,
+            working_directory_record,
+            loader_support,
+            mut checkpoint_candidates,
+            candidates_complete,
+            candidates_omitted_at_least,
+            candidate_limit,
+        } = sample_support()
+        else {
+            unreachable!();
+        };
+        let bytes = b"checkpoint";
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let second_path = ".pueue-agent/artifacts/exp/other.json";
+        checkpoint_candidates[0].reference = format!("checkpoint:exp:0:{sha256}");
+        checkpoint_candidates.push(CheckpointCandidateEvidenceV1 {
+            reference: format!("checkpoint:exp:1:{sha256}"),
+            source_experiment_id: source_experiment_id.clone(),
+            argv_path: second_path.to_owned(),
+            root_relative_path: second_path.to_owned(),
+            length: bytes.len() as u64,
+            sha256,
+            file: sample_file(second_path, bytes),
+        });
+        let support = CheckpointSupportEvidenceV1::Available {
+            support_version,
+            source_experiment_id,
+            source_proposal_id,
+            source_submission_id,
+            normalized_working_directory,
+            working_directory_record,
+            loader_support,
+            checkpoint_candidates,
+            candidates_complete,
+            candidates_omitted_at_least,
+            candidate_limit,
+        };
+        let (context, digest) = context_for_support(support);
+        assert!(checkpoint_support_from_persisted_context(&context, &digest).is_ok());
+    }
+
+    #[test]
+    fn unavailable_support_is_explicitly_empty_and_missing_packet_has_no_authority() {
+        let support = CheckpointSupportEvidenceV1::Unavailable {
+            support_version: CHECKPOINT_SUPPORT_VERSION,
+            reason: "no representable checkpoint".to_owned(),
+            loader_support: Vec::new(),
+            checkpoint_candidates: Vec::new(),
+            candidates_complete: false,
+            candidates_omitted_at_least: 0,
+            candidate_limit: MAX_CHECKPOINT_CANDIDATES,
+        };
+        let (context, digest) = context_for_support(support);
+        assert!(matches!(
+            checkpoint_support_from_persisted_context(&context, &digest).unwrap(),
+            CheckpointSupportEvidenceV1::Unavailable { .. }
+        ));
+
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "operations": {}
+        });
+        let legacy = serde_json::to_string(&legacy).unwrap();
+        let legacy_digest = format!("{:x}", Sha256::digest(legacy.as_bytes()));
+        assert!(checkpoint_support_from_persisted_context(&legacy, &legacy_digest).is_err());
     }
 
     #[test]

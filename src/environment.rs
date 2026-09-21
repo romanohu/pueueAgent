@@ -656,6 +656,26 @@ fn open_research_file_on_mount(
     Ok(file)
 }
 
+/// Validate an identifier before it reaches any descriptor-relative lookup.
+/// The same narrow alphabet is used for campaign and review directory names,
+/// so persisted records never carry path syntax or platform-specific bytes.
+pub(crate) fn validate_research_id(value: &str) -> Result<(), PolicyViolation> {
+    if value.is_empty()
+        || value.len() > 128
+        || value == "."
+        || value == ".."
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-')
+        })
+    {
+        return Err(temp_violation_at(
+            TempUnsafeReason::InvalidEntry,
+            PolicyViolationStage::PreBinding,
+        ));
+    }
+    Ok(())
+}
+
 /// Metadata-only evidence discovered relative to a retained project-root
 /// descriptor. File contents are deliberately outside this projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
