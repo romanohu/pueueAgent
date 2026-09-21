@@ -949,6 +949,8 @@ pub enum TempUnsafeReason {
     MountBoundary,
     InvalidEntry,
     IoFailure,
+    ExistingEntry,
+    RetainedPublicationRecoveryRequired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -120,6 +120,30 @@ const MAX_RESEARCH_STDOUT_BYTES: u64 = 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_RESEARCH_STDERR_BYTES: u64 = 256 * 1024;
 const RESEARCH_HASH_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_RESEARCH_CHECKPOINT_CANDIDATES: usize = 4;
+const MAX_RESEARCH_CHECKPOINT_DEPTH: usize = 4;
+const MAX_RESEARCH_CHECKPOINT_ENTRIES: usize = 4096;
+const MAX_RESEARCH_CHECKPOINT_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_RESEARCH_CHECKPOINT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy)]
+struct ResearchCheckpointLimits {
+    max_files: usize,
+    max_depth: usize,
+    max_entries: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const RESEARCH_CHECKPOINT_PRODUCTION_LIMITS: ResearchCheckpointLimits = ResearchCheckpointLimits {
+    max_files: MAX_RESEARCH_CHECKPOINT_CANDIDATES,
+    max_depth: MAX_RESEARCH_CHECKPOINT_DEPTH,
+    max_entries: MAX_RESEARCH_CHECKPOINT_ENTRIES,
+    max_file_bytes: MAX_RESEARCH_CHECKPOINT_FILE_BYTES,
+    max_total_bytes: MAX_RESEARCH_CHECKPOINT_TOTAL_BYTES,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,6 +169,13 @@ pub(crate) struct ResearchFileRecord {
     pub(crate) logical_bytes: u64,
     pub(crate) allocated_bytes: u64,
     pub(crate) sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResearchFileDiscovery {
+    pub(crate) records: Vec<ResearchFileRecord>,
+    pub(crate) omitted_at_least: usize,
+    pub(crate) complete: bool,
 }
 
 /// A source-file capability.  The descriptors and named-chain authority stay
@@ -362,6 +393,769 @@ pub(crate) fn read_verified_research_file(
         let _ = revalidate_research_file(file, max_bytes)?;
         Ok(bytes)
     }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn record_verified_research_directory(
+    _policy: &ResolvedExecutionPolicy,
+    _root_anchor: &ProjectRootAnchor,
+    _relative: &Path,
+) -> Result<ResearchDirectoryRecord, PolicyViolation> {
+    Err(PolicyViolation::new(
+        PolicyViolationCode::UnsupportedPlatform,
+        PolicyViolationStage::PreBinding,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn research_root_for_scope(
+    policy: &ResolvedExecutionPolicy,
+    root_anchor: &ProjectRootAnchor,
+    stage: PolicyViolationStage,
+) -> Result<(File, MountIdentity, ResearchDirectoryRecord), PolicyViolation> {
+    let registered = policy
+        .project_root_anchor(&root_anchor.canonical_path)
+        .map_err(|violation| stage_violation(violation, PolicyViolationStage::PreBinding))?;
+    if registered != *root_anchor {
+        return Err(PolicyViolation::new(
+            PolicyViolationCode::RootChanged,
+            PolicyViolationStage::PreBinding,
+        ));
+    }
+    let verified = root_anchor.verify_identity()?;
+    let mount = directory_mount_identity_at(&verified.directory, stage)?;
+    let record = research_directory_record_at(&verified.directory, mount, stage)?;
+    if record.device != root_anchor.identity.device
+        || record.inode != root_anchor.identity.inode
+        || record.owner != root_anchor.identity.owner
+        || record.mode != root_anchor.identity.mode
+    {
+        return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+    }
+    Ok((verified.directory, mount, record))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn research_open_directory_path(
+    root: &File,
+    mount: MountIdentity,
+    components: &[OsString],
+    stage: PolicyViolationStage,
+) -> Result<(File, Vec<ResearchDirectoryRecord>), PolicyViolation> {
+    let mut current = root
+        .try_clone()
+        .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
+    let mut records = vec![research_directory_record_at(&current, mount, stage)?];
+    for component in components {
+        let next = open_directory_on_mount(&current, component, mount, stage)?;
+        let next_record = research_directory_record_at(&next, mount, stage)?;
+        current = next;
+        records.push(next_record);
+    }
+    Ok((current, records))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+enum ResearchDirectoryPath {
+    Present((File, Vec<ResearchDirectoryRecord>)),
+    Missing {
+        component: usize,
+        records: Vec<ResearchDirectoryRecord>,
+    },
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn research_open_directory_path_allow_missing(
+    root: &File,
+    mount: MountIdentity,
+    components: &[OsString],
+    stage: PolicyViolationStage,
+) -> Result<ResearchDirectoryPath, PolicyViolation> {
+    let mut current = root
+        .try_clone()
+        .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
+    let mut records = vec![research_directory_record_at(&current, mount, stage)?];
+    for (component, name) in components.iter().enumerate() {
+        let Some(next) = open_optional_directory_on_mount(&current, name, mount, stage)? else {
+            return Ok(ResearchDirectoryPath::Missing { component, records });
+        };
+        let next_record = research_directory_record_at(&next, mount, stage)?;
+        current = next;
+        records.push(next_record);
+    }
+    Ok(ResearchDirectoryPath::Present((current, records)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn research_directory_components(relative: &Path) -> Result<Vec<OsString>, PolicyViolation> {
+    if relative == Path::new(".") {
+        return Ok(Vec::new());
+    }
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        return Err(temp_violation_at(
+            TempUnsafeReason::InvalidEntry,
+            PolicyViolationStage::PreBinding,
+        ));
+    }
+    if relative
+        .to_str()
+        .is_some_and(|value| {
+            value
+                .split('/')
+                .any(|component| component.is_empty() || component == "." || component == "..")
+        })
+    {
+        return Err(temp_violation_at(
+            TempUnsafeReason::InvalidEntry,
+            PolicyViolationStage::PreBinding,
+        ));
+    }
+    let mut components = Vec::new();
+    let mut bytes = 0usize;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(temp_violation_at(
+                TempUnsafeReason::InvalidEntry,
+                PolicyViolationStage::PreBinding,
+            ));
+        };
+        let Some(name) = name.to_str() else {
+            return Err(temp_violation_at(
+                TempUnsafeReason::InvalidEntry,
+                PolicyViolationStage::PreBinding,
+            ));
+        };
+        if name.is_empty() {
+            return Err(temp_violation_at(
+                TempUnsafeReason::InvalidEntry,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        bytes = bytes.checked_add(name.len() + 1).ok_or_else(|| {
+            temp_violation_at(
+                TempUnsafeReason::ByteLimit,
+                PolicyViolationStage::PreBinding,
+            )
+        })?;
+        if bytes > 4096 {
+            return Err(temp_violation_at(
+                TempUnsafeReason::ByteLimit,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        components.push(OsString::from(name));
+    }
+    if components.is_empty() {
+        return Err(temp_violation_at(
+            TempUnsafeReason::InvalidEntry,
+            PolicyViolationStage::PreBinding,
+        ));
+    }
+    Ok(components)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn record_verified_research_directory(
+    policy: &ResolvedExecutionPolicy,
+    root_anchor: &ProjectRootAnchor,
+    relative: &Path,
+) -> Result<ResearchDirectoryRecord, PolicyViolation> {
+    record_verified_research_directory_with_hook(policy, root_anchor, relative, None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn record_verified_research_directory_with_hook(
+    policy: &ResolvedExecutionPolicy,
+    root_anchor: &ProjectRootAnchor,
+    relative: &Path,
+    mut hook: Option<&mut dyn FnMut(&Path)>,
+) -> Result<ResearchDirectoryRecord, PolicyViolation> {
+    let stage = PolicyViolationStage::RunBoundPreMarker;
+    let components = research_directory_components(relative)?;
+    let (root, mount, root_record) = research_root_for_scope(policy, root_anchor, stage)?;
+    let (_, records) = research_open_directory_path(&root, mount, &components, stage)?;
+    if let Some(hook) = hook.as_deref_mut() {
+        hook(relative);
+    }
+    let (fresh_root, fresh_mount, fresh_root_record) =
+        research_root_for_scope(policy, root_anchor, stage)?;
+    let (_, fresh_records) =
+        research_open_directory_path(&fresh_root, fresh_mount, &components, stage)?;
+    if fresh_mount != mount || fresh_root_record != root_record || fresh_records != records {
+        return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+    }
+    records
+        .last()
+        .cloned()
+        .ok_or_else(|| temp_violation_at(TempUnsafeReason::IdentityChanged, stage))
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn record_verified_research_directory_with_test_hook(
+    policy: &ResolvedExecutionPolicy,
+    root_anchor: &ProjectRootAnchor,
+    relative: &Path,
+    hook: &mut dyn FnMut(&Path),
+) -> Result<ResearchDirectoryRecord, PolicyViolation> {
+    record_verified_research_directory_with_hook(policy, root_anchor, relative, Some(hook))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn discover_research_checkpoint_files(
+    _policy: &ResolvedExecutionPolicy,
+    _root_anchor: &ProjectRootAnchor,
+    _source_experiment_id: &str,
+) -> Result<ResearchFileDiscovery, PolicyViolation> {
+    Err(PolicyViolation::new(
+        PolicyViolationCode::UnsupportedPlatform,
+        PolicyViolationStage::PreBinding,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+struct ResearchDiscoveryCandidate {
+    relative_path: String,
+    root: ResearchDirectoryRecord,
+    parent: ResearchDirectoryRecord,
+    parent_chain: Vec<ResearchDirectoryRecord>,
+    snapshot: ResearchLeafSnapshot,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+struct ResearchDiscoveryEntry {
+    kind: AuditedEntryKind,
+    regular: bool,
+    identity: (u64, u64),
+    mount_identity: MountIdentity,
+    owner: u32,
+    mode: u32,
+    logical_bytes: u64,
+    allocated_bytes: u64,
+    links: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+enum ResearchDiscoveryEntryError {
+    Missing,
+    Violation(PolicyViolation),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn research_discovery_entry_at(
+    directory: &File,
+    name: &OsStr,
+    stage: PolicyViolationStage,
+) -> Result<ResearchDiscoveryEntry, ResearchDiscoveryEntryError> {
+    use std::{os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+    let name_c = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| ResearchDiscoveryEntryError::Violation(temp_violation_at(
+            TempUnsafeReason::InvalidEntry,
+            stage,
+        )))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if (unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name_c.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    }) != 0
+    {
+        let errno = io::Error::last_os_error().raw_os_error();
+        if errno == Some(libc::ENOENT) {
+            return Err(ResearchDiscoveryEntryError::Missing);
+        }
+        return Err(ResearchDiscoveryEntryError::Violation(temp_violation_at(
+            TempUnsafeReason::IoFailure,
+            stage,
+        )));
+    }
+    let stat = unsafe { stat.assume_init() };
+    let mount_identity = match entry_mount_identity_at(directory, name, stage) {
+        Ok(mount_identity) => mount_identity,
+        Err(error)
+            if matches!(
+                error.detail,
+                PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure)
+            ) && research_discovery_entry_missing(directory, name_c.as_c_str()) =>
+        {
+            return Err(ResearchDiscoveryEntryError::Missing);
+        }
+        Err(error) => return Err(ResearchDiscoveryEntryError::Violation(error)),
+    };
+    let mode = stat.st_mode & 0o7777;
+    let kind = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        AuditedEntryKind::Directory
+    } else {
+        AuditedEntryKind::Leaf
+    };
+    let regular = stat.st_mode & libc::S_IFMT == libc::S_IFREG;
+    let allocated_bytes = u64::try_from(stat.st_blocks)
+        .ok()
+        .and_then(|blocks| blocks.checked_mul(512))
+        .ok_or_else(|| {
+            ResearchDiscoveryEntryError::Violation(temp_violation_at(
+                TempUnsafeReason::ByteLimit,
+                stage,
+            ))
+        })?;
+    let logical_bytes = u64::try_from(stat.st_size).map_err(|_| {
+        ResearchDiscoveryEntryError::Violation(temp_violation_at(
+            TempUnsafeReason::ByteLimit,
+            stage,
+        ))
+    })?;
+    Ok(ResearchDiscoveryEntry {
+        kind,
+        regular,
+        identity: (stat.st_dev as u64, stat.st_ino as u64),
+        mount_identity,
+        owner: stat.st_uid,
+        mode: mode as u32,
+        logical_bytes,
+        allocated_bytes,
+        links: stat.st_nlink as u64,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn research_discovery_entry_missing(directory: &File, name: &std::ffi::CStr) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    (unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    }) != 0
+        && io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn collect_research_checkpoint_candidates(
+    directory: &File,
+    prefix: &str,
+    depth: usize,
+    parent_chain: &[ResearchDirectoryRecord],
+    expected_mount: MountIdentity,
+    limits: ResearchCheckpointLimits,
+    state: &mut AuditState,
+    candidates: &mut Vec<ResearchDiscoveryCandidate>,
+    omitted_at_least: &mut usize,
+    complete: &mut bool,
+) -> Result<(), PolicyViolation> {
+    if depth >= limits.max_depth {
+        return Err(temp_violation_at(
+            TempUnsafeReason::DepthLimit,
+            PolicyViolationStage::RunBoundPreMarker,
+        ));
+    }
+    let remaining = limits.max_entries.saturating_sub(state.entries);
+    let mut entries = directory_entries(
+        directory,
+        remaining,
+        TempUnsafeReason::EntryLimit,
+        PolicyViolationStage::RunBoundPreMarker,
+        None,
+        Some(state),
+        #[cfg(all(test, unix))]
+        None,
+    )?;
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    for listed in entries {
+        let Some(name) = listed.name.to_str() else {
+            if listed.kind == AuditedEntryKind::Directory {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::InvalidEntry,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            *omitted_at_least = omitted_at_least.saturating_add(1);
+            *complete = false;
+            continue;
+        };
+        let metadata = match research_discovery_entry_at(
+            directory,
+            &listed.name,
+            PolicyViolationStage::RunBoundPreMarker,
+        ) {
+            Ok(metadata) => metadata,
+            Err(ResearchDiscoveryEntryError::Missing) => {
+                if listed.kind == AuditedEntryKind::Leaf {
+                    *omitted_at_least = omitted_at_least.saturating_add(1);
+                    *complete = false;
+                    continue;
+                }
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            Err(ResearchDiscoveryEntryError::Violation(error)) => return Err(error),
+        };
+        if metadata.mount_identity != expected_mount || listed.mount_identity != expected_mount {
+            return Err(temp_violation_at(
+                TempUnsafeReason::MountBoundary,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        if metadata.kind != listed.kind || metadata.identity != listed.identity {
+            if listed.kind == AuditedEntryKind::Leaf {
+                *omitted_at_least = omitted_at_least.saturating_add(1);
+                *complete = false;
+                continue;
+            }
+            return Err(temp_violation_at(
+                TempUnsafeReason::IdentityChanged,
+                PolicyViolationStage::RunBoundPreMarker,
+            ));
+        }
+        if metadata.kind == AuditedEntryKind::Directory {
+            let child_prefix = format!("{prefix}/{name}");
+            if child_prefix.len() > 4096 {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::ByteLimit,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            let child = open_directory_on_mount(
+                directory,
+                &listed.name,
+                expected_mount,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            let child_record = research_directory_record_at(
+                &child,
+                expected_mount,
+                PolicyViolationStage::RunBoundPreMarker,
+            )?;
+            if child_record.device != metadata.identity.0
+                || child_record.inode != metadata.identity.1
+            {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::RunBoundPreMarker,
+                ));
+            }
+            let mut child_chain = parent_chain.to_vec();
+            child_chain.push(child_record);
+            collect_research_checkpoint_candidates(
+                &child,
+                &child_prefix,
+                depth + 1,
+                &child_chain,
+                expected_mount,
+                limits,
+                state,
+                candidates,
+                omitted_at_least,
+                complete,
+            )?;
+            continue;
+        }
+        let safe = metadata.regular
+            && metadata.owner == unsafe { libc::geteuid() as u32 }
+            && metadata.mode & 0o022 == 0
+            && metadata.links == 1;
+        if !safe
+            || metadata.logical_bytes > limits.max_file_bytes
+            || metadata.allocated_bytes > limits.max_file_bytes
+            || depth >= limits.max_depth
+        {
+            *omitted_at_least = omitted_at_least.saturating_add(1);
+            *complete = false;
+            continue;
+        }
+        let relative_path = format!("{prefix}/{name}");
+        if relative_path.len() > 4096 {
+            *omitted_at_least = omitted_at_least.saturating_add(1);
+            *complete = false;
+            continue;
+        }
+        candidates.push(ResearchDiscoveryCandidate {
+            relative_path,
+            root: parent_chain
+                .first()
+                .cloned()
+                .ok_or_else(|| {
+                    temp_violation_at(TempUnsafeReason::IdentityChanged, PolicyViolationStage::RunBoundPreMarker)
+                })?,
+            parent: parent_chain
+                .last()
+                .cloned()
+                .ok_or_else(|| {
+                    temp_violation_at(TempUnsafeReason::IdentityChanged, PolicyViolationStage::RunBoundPreMarker)
+                })?,
+            parent_chain: parent_chain.to_vec(),
+            snapshot: ResearchLeafSnapshot {
+                device: metadata.identity.0,
+                inode: metadata.identity.1,
+                owner: metadata.owner,
+                mode: metadata.mode,
+                mount_identity: metadata.mount_identity,
+                logical_bytes: metadata.logical_bytes,
+                allocated_bytes: metadata.allocated_bytes,
+                links: metadata.links,
+            },
+        });
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn research_discovery_candidate_matches(
+    file: &VerifiedResearchFile,
+    candidate: &ResearchDiscoveryCandidate,
+) -> bool {
+    let record = file.record();
+    record.relative_path == candidate.relative_path
+        && record.root == candidate.root
+        && record.parent == candidate.parent
+        && record.device == candidate.snapshot.device
+        && record.inode == candidate.snapshot.inode
+        && record.owner == candidate.snapshot.owner
+        && record.mode == candidate.snapshot.mode
+        && record.mount_identity == candidate.snapshot.mount_identity.0
+        && record.logical_bytes == candidate.snapshot.logical_bytes
+        && record.allocated_bytes == candidate.snapshot.allocated_bytes
+        && file.leaf_links == candidate.snapshot.links
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn research_revalidate_candidate_parent(
+    policy: &ResolvedExecutionPolicy,
+    root_anchor: &ProjectRootAnchor,
+    candidate: &ResearchDiscoveryCandidate,
+    stage: PolicyViolationStage,
+) -> Result<(), PolicyViolation> {
+    let parent_path = Path::new(&candidate.relative_path)
+        .parent()
+        .ok_or_else(|| temp_violation_at(TempUnsafeReason::IdentityChanged, stage))?;
+    let components = research_relative_components(parent_path)?;
+    let (root, mount, root_record) = research_root_for_scope(policy, root_anchor, stage)?;
+    let (_, records) = research_open_directory_path(&root, mount, &components, stage)?;
+    if mount != candidate.snapshot.mount_identity
+        || root_record != candidate.root
+        || records != candidate.parent_chain
+    {
+        return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn discover_research_checkpoint_files_with_limits(
+    policy: &ResolvedExecutionPolicy,
+    root_anchor: &ProjectRootAnchor,
+    source_experiment_id: &str,
+    limits: ResearchCheckpointLimits,
+    mut hook: Option<&mut dyn FnMut(&Path)>,
+) -> Result<ResearchFileDiscovery, PolicyViolation> {
+    validate_research_id(source_experiment_id)?;
+    let stage = PolicyViolationStage::RunBoundPreMarker;
+    let (root, mount, _root_record) = research_root_for_scope(policy, root_anchor, stage)?;
+    let components = [
+        OsString::from(PRIVATE_TEMP_ROOT),
+        OsString::from(ARTIFACTS_DIRECTORY),
+        OsString::from(source_experiment_id),
+    ];
+    let (scope, scope_records) = match research_open_directory_path_allow_missing(
+        &root,
+        mount,
+        &components,
+        stage,
+    )? {
+        ResearchDirectoryPath::Present(path) => path,
+        ResearchDirectoryPath::Missing { component, records } => {
+            if let Some(hook) = hook.as_deref_mut() {
+                hook(Path::new(&format!(
+                    "{PRIVATE_TEMP_ROOT}/{ARTIFACTS_DIRECTORY}/{source_experiment_id}"
+                )));
+            }
+            let (fresh_root, fresh_mount, _) = research_root_for_scope(policy, root_anchor, stage)?;
+            let fresh = research_open_directory_path_allow_missing(
+                &fresh_root,
+                fresh_mount,
+                &components,
+                stage,
+            )?;
+            if fresh_mount != mount
+                || !matches!(
+                    fresh,
+                    ResearchDirectoryPath::Missing {
+                        component: fresh_component,
+                        records: fresh_records,
+                    } if fresh_component == component && fresh_records == records
+                )
+            {
+                return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+            }
+            return Ok(ResearchFileDiscovery {
+                records: Vec::new(),
+                omitted_at_least: 0,
+                complete: true,
+            });
+        }
+    };
+    let root_record = scope_records
+        .first()
+        .cloned()
+        .ok_or_else(|| temp_violation_at(TempUnsafeReason::IdentityChanged, stage))?;
+    let mut state = AuditState::default();
+    state.max_depth = limits.max_depth;
+    state.max_entries = limits.max_entries;
+    state.max_allocated_bytes = u64::MAX;
+    let prefix = format!(
+        "{PRIVATE_TEMP_ROOT}/{ARTIFACTS_DIRECTORY}/{source_experiment_id}"
+    );
+    let mut candidates = Vec::new();
+    let mut omitted_at_least = 0usize;
+    let mut complete = true;
+    collect_research_checkpoint_candidates(
+        &scope,
+        &prefix,
+        0,
+        &scope_records,
+        mount,
+        limits,
+        &mut state,
+        &mut candidates,
+        &mut omitted_at_least,
+        &mut complete,
+    )?;
+    candidates.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let mut records = Vec::with_capacity(limits.max_files);
+    let mut charged_logical_bytes = 0_u64;
+    for candidate in candidates {
+        if records.len() >= limits.max_files
+            || charged_logical_bytes
+                .checked_add(candidate.snapshot.logical_bytes)
+                .is_none_or(|bytes| bytes > limits.max_total_bytes)
+        {
+            omitted_at_least = omitted_at_least.saturating_add(1);
+            complete = false;
+            continue;
+        }
+        charged_logical_bytes = charged_logical_bytes
+            .checked_add(candidate.snapshot.logical_bytes)
+            .ok_or_else(|| temp_violation_at(TempUnsafeReason::ByteLimit, stage))?;
+        if let Some(hook) = hook.as_deref_mut() {
+            hook(Path::new(&candidate.relative_path));
+        }
+        let opened = open_verified_research_file(
+            policy,
+            root_anchor,
+            Path::new(&candidate.relative_path),
+            candidate.snapshot.logical_bytes,
+        );
+        match opened {
+            Ok(file) => {
+                research_revalidate_candidate_parent(policy, root_anchor, &candidate, stage)?;
+                if file.record().allocated_bytes <= limits.max_file_bytes
+                    && research_discovery_candidate_matches(&file, &candidate)
+                {
+                    records.push(file.record().clone());
+                } else {
+                    omitted_at_least = omitted_at_least.saturating_add(1);
+                    complete = false;
+                }
+            }
+            Err(error)
+                if error.code == PolicyViolationCode::RootChanged
+                    || error.code == PolicyViolationCode::UnsupportedPlatform
+                    || matches!(
+                        error.detail,
+                        PolicyViolationDetail::TempUnsafe(
+                            TempUnsafeReason::MountBoundary | TempUnsafeReason::EntryLimit
+                        )
+                    ) =>
+            {
+                return Err(error);
+            }
+            Err(_error) => {
+                research_revalidate_candidate_parent(policy, root_anchor, &candidate, stage)?;
+                omitted_at_least = omitted_at_least.saturating_add(1);
+                complete = false;
+            }
+        }
+    }
+    let (fresh_root, fresh_mount, fresh_root_record) = research_root_for_scope(policy, root_anchor, stage)?;
+    let fresh_scope_records = match research_open_directory_path_allow_missing(
+        &fresh_root,
+        fresh_mount,
+        &components,
+        stage,
+    )? {
+        ResearchDirectoryPath::Present((_, records)) => records,
+        ResearchDirectoryPath::Missing { .. } => {
+            return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+        }
+    };
+    if fresh_mount != mount
+        || fresh_root_record != root_record
+        || fresh_scope_records != scope_records
+    {
+        return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+    }
+    Ok(ResearchFileDiscovery {
+        records,
+        omitted_at_least,
+        complete: complete && omitted_at_least == 0,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn discover_research_checkpoint_files(
+    policy: &ResolvedExecutionPolicy,
+    root_anchor: &ProjectRootAnchor,
+    source_experiment_id: &str,
+) -> Result<ResearchFileDiscovery, PolicyViolation> {
+    discover_research_checkpoint_files_with_limits(
+        policy,
+        root_anchor,
+        source_experiment_id,
+        RESEARCH_CHECKPOINT_PRODUCTION_LIMITS,
+        None,
+    )
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn discover_research_checkpoint_files_with_test_limits(
+    policy: &ResolvedExecutionPolicy,
+    root_anchor: &ProjectRootAnchor,
+    source_experiment_id: &str,
+    limits: ResearchCheckpointLimits,
+) -> Result<ResearchFileDiscovery, PolicyViolation> {
+    discover_research_checkpoint_files_with_limits(
+        policy,
+        root_anchor,
+        source_experiment_id,
+        limits,
+        None,
+    )
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn discover_research_checkpoint_files_with_test_limits_and_hook(
+    policy: &ResolvedExecutionPolicy,
+    root_anchor: &ProjectRootAnchor,
+    source_experiment_id: &str,
+    limits: ResearchCheckpointLimits,
+    hook: &mut dyn FnMut(&Path),
+) -> Result<ResearchFileDiscovery, PolicyViolation> {
+    discover_research_checkpoint_files_with_limits(
+        policy,
+        root_anchor,
+        source_experiment_id,
+        limits,
+        Some(hook),
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -805,6 +1599,7 @@ struct RetentionTestHooks {
     quota_bytes: u64,
     fail_file_sync: bool,
     fail_parent_sync: bool,
+    fail_rollback_parent_sync: bool,
     fail_publication: bool,
     fail_after_publication_validation: bool,
     replace_campaign_before_reopen: bool,
@@ -825,6 +1620,7 @@ impl Default for RetentionTestHooks {
             quota_bytes: MAX_PRIVATE_TEMP_ALLOCATED_BYTES,
             fail_file_sync: false,
             fail_parent_sync: false,
+            fail_rollback_parent_sync: false,
             fail_publication: false,
             fail_after_publication_validation: false,
             replace_campaign_before_reopen: false,
@@ -1491,35 +2287,48 @@ fn retention_entry_is_owned(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn rollback_owned_retention_publication(
+fn retained_publication_recovery_required(stage: PolicyViolationStage) -> PolicyViolation {
+    temp_violation_at(
+        TempUnsafeReason::RetainedPublicationRecoveryRequired,
+        stage,
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rollback_owned_retention_publication_durable(
     review: &File,
     temp_name: &OsStr,
     temp: &File,
     publication: OwnedRetentionPublication,
     hooks: &mut RetentionTestHooks,
     stage: PolicyViolationStage,
-) {
-    let mut modified = false;
-    if retention_entry_is_owned(
+) -> Result<(), PolicyViolation> {
+    let final_owned = retention_entry_is_owned(
         review,
         OsStr::new(RESEARCH_CHECKPOINT_LEAF),
         publication,
         stage,
     )
-    .unwrap_or(false)
-        && unlinkat(review, OsStr::new(RESEARCH_CHECKPOINT_LEAF), false).is_ok()
-    {
-        modified = true;
+    .map_err(|_| retained_publication_recovery_required(stage))?;
+    if !final_owned {
+        return Err(retained_publication_recovery_required(stage));
     }
-    if retention_entry_is_owned(review, temp_name, publication, stage).unwrap_or(false)
-        && unlinkat(review, temp_name, false).is_ok()
-    {
-        modified = true;
+    unlinkat(review, OsStr::new(RESEARCH_CHECKPOINT_LEAF), false)
+        .map_err(|_| retained_publication_recovery_required(stage))?;
+    let temp_owned = retention_entry_is_owned(review, temp_name, publication, stage)
+        .map_err(|_| retained_publication_recovery_required(stage))?;
+    if temp_owned {
+        unlinkat(review, temp_name, false)
+            .map_err(|_| retained_publication_recovery_required(stage))?;
     }
-    if modified {
-        let _ = retention_sync_directory(review, hooks, stage);
+    if hooks.fail_rollback_parent_sync {
+        hooks.fail_rollback_parent_sync = false;
+        return Err(retained_publication_recovery_required(stage));
     }
+    retention_sync_directory(review, hooks, stage)
+        .map_err(|_| retained_publication_recovery_required(stage))?;
     let _ = temp;
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1532,15 +2341,46 @@ fn retain_postpublication_failure<T>(
     hooks: &mut RetentionTestHooks,
     stage: PolicyViolationStage,
 ) -> Result<T, PolicyViolation> {
-    rollback_owned_retention_publication(
+    if rollback_owned_retention_publication_durable(
         review,
         temp_name,
         temp,
         publication,
         hooks,
         stage,
-    );
-    Err(error)
+    )
+    .is_err()
+    {
+        Err(retained_publication_recovery_required(stage))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn retention_publication_failure(
+    error: PolicyViolation,
+    review: &File,
+    temp_name: &OsStr,
+    temp: &File,
+    publication: OwnedRetentionPublication,
+    hooks: &mut RetentionTestHooks,
+    stage: PolicyViolationStage,
+) -> PolicyViolation {
+    if rollback_owned_retention_publication_durable(
+        review,
+        temp_name,
+        temp,
+        publication,
+        hooks,
+        stage,
+    )
+    .is_err()
+    {
+        retained_publication_recovery_required(stage)
+    } else {
+        error
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1566,17 +2406,17 @@ fn rollback_after_downgrade_failure(
         stage,
         None,
     ) else {
-        return Err(error);
+        return Err(retained_publication_recovery_required(stage));
     };
     if !expected_chain.matches_chain(&current_chain) {
-        return Err(error);
+        return Err(retained_publication_recovery_required(stage));
     }
     let current_named_chain = match open_retention_chain(policy, campaign_id, review_id, false, stage) {
         Ok(chain) => chain,
-        Err(_) => return Err(error),
+        Err(_) => return Err(retained_publication_recovery_required(stage)),
     };
     if !expected_chain.matches_chain(&current_named_chain) {
-        return Err(error);
+        return Err(retained_publication_recovery_required(stage));
     }
     let review_record = match research_directory_record_at(
         rollback_review,
@@ -1584,10 +2424,10 @@ fn rollback_after_downgrade_failure(
         stage,
     ) {
         Ok(record) => record,
-        Err(_) => return Err(error),
+        Err(_) => return Err(retained_publication_recovery_required(stage)),
     };
     if review_record != expected_chain.review_record {
-        return Err(error);
+        return Err(retained_publication_recovery_required(stage));
     }
     match retention_entry_is_owned(
         rollback_review,
@@ -1596,16 +2436,20 @@ fn rollback_after_downgrade_failure(
         stage,
     ) {
         Ok(true) => {}
-        Ok(false) | Err(_) => return Err(error),
+        Ok(false) | Err(_) => return Err(retained_publication_recovery_required(stage)),
     }
-    rollback_owned_retention_publication(
+    if rollback_owned_retention_publication_durable(
         rollback_review,
         temp_name,
         temp,
         publication,
         hooks,
         stage,
-    );
+    )
+    .is_err()
+    {
+        return Err(retained_publication_recovery_required(stage));
+    }
     Err(error)
 }
 
@@ -1796,7 +2640,13 @@ fn publish_retention_temp(
         )
     } != 0
     {
-        return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
+        let error = io::Error::last_os_error();
+        let reason = if error.raw_os_error() == Some(libc::EEXIST) {
+            TempUnsafeReason::ExistingEntry
+        } else {
+            TempUnsafeReason::IoFailure
+        };
+        return Err(temp_violation_at(reason, stage));
     }
     let publication = OwnedRetentionPublication {
         device: temp_snapshot.device,
@@ -1806,7 +2656,8 @@ fn publish_retention_temp(
     let entry = match entry_metadata_at(review, temp_name, stage) {
         Ok(entry) => entry,
         Err(error) => {
-            rollback_owned_retention_publication(
+            let error = retention_publication_failure(
+                error,
                 review,
                 temp_name,
                 temp,
@@ -1820,7 +2671,8 @@ fn publish_retention_temp(
     let metadata = match temp.metadata() {
         Ok(metadata) => metadata,
         Err(_) => {
-            rollback_owned_retention_publication(
+            let error = retention_publication_failure(
+                temp_violation_at(TempUnsafeReason::IoFailure, stage),
                 review,
                 temp_name,
                 temp,
@@ -1828,7 +2680,7 @@ fn publish_retention_temp(
                 hooks,
                 stage,
             );
-            return Err(temp_violation_at(TempUnsafeReason::IoFailure, stage));
+            return Err(error);
         }
     };
     use std::os::unix::fs::MetadataExt;
@@ -1837,7 +2689,8 @@ fn publish_retention_temp(
         || entry.identity != (metadata.dev(), metadata.ino())
         || entry.identity != (publication.device, publication.inode)
     {
-        rollback_owned_retention_publication(
+        let error = retention_publication_failure(
+            temp_violation_at(TempUnsafeReason::IdentityChanged, stage),
             review,
             temp_name,
             temp,
@@ -1845,10 +2698,11 @@ fn publish_retention_temp(
             hooks,
             stage,
         );
-        return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+        return Err(error);
     }
     if let Err(error) = unlinkat(review, temp_name, false) {
-        rollback_owned_retention_publication(
+        let error = retention_publication_failure(
+            error,
             review,
             temp_name,
             temp,
@@ -1859,7 +2713,8 @@ fn publish_retention_temp(
         return Err(error);
     }
     if let Err(error) = retention_sync_directory(review, hooks, stage) {
-        rollback_owned_retention_publication(
+        let error = retention_publication_failure(
+            error,
             review,
             temp_name,
             temp,
@@ -2184,7 +3039,8 @@ fn retain_verified_research_file_impl(
         record,
     };
     if let Err(error) = reverify_retained_research_file(policy, &retained) {
-        rollback_owned_retention_publication(
+        return retain_postpublication_failure(
+            error,
             &retained.chain.review,
             &temp_name,
             &temp,
@@ -2192,7 +3048,6 @@ fn retain_verified_research_file_impl(
             hooks,
             stage,
         );
-        return Err(error);
     }
     #[cfg(all(test, unix))]
     let downgrade_result = downgrade_retention_campaign_for_test(
@@ -6413,9 +7268,13 @@ mod tests {
     use super::*;
     use std::{
         fs,
+        os::unix::ffi::OsStrExt,
         os::unix::fs::{symlink, PermissionsExt},
         time::Duration,
     };
+
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStringExt;
 
     fn test_temp(run_id: i64) -> (tempfile::TempDir, PrivateRunTemp) {
         let holder = tempfile::tempdir().unwrap();
@@ -7398,6 +8257,602 @@ mod tests {
         (temporary, policy, anchor)
     }
 
+    fn research_artifact_fixture(
+        policy: &crate::execution_policy::ResolvedExecutionPolicy,
+        experiment_id: &str,
+    ) -> std::path::PathBuf {
+        let artifact_root = policy
+            .project_root_anchor(&policy.project_roots[0])
+            .unwrap()
+            .canonical_path
+            .join(PRIVATE_TEMP_ROOT)
+            .join(ARTIFACTS_DIRECTORY)
+            .join(experiment_id);
+        fs::create_dir_all(&artifact_root).unwrap();
+        for directory in [
+            artifact_root.parent().unwrap(),
+            artifact_root.parent().unwrap().parent().unwrap(),
+            &artifact_root,
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        artifact_root
+    }
+
+    #[test]
+    fn verified_research_directory_records_root_and_nested_cwd() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let nested = anchor.canonical_path.join("runs").join("a");
+        fs::create_dir_all(&nested).unwrap();
+        fs::set_permissions(anchor.canonical_path.join("runs"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let root_record = record_verified_research_directory(&policy, &anchor, Path::new(".")).unwrap();
+        let nested_record =
+            record_verified_research_directory(&policy, &anchor, Path::new("runs/a")).unwrap();
+        assert_ne!(root_record.inode, nested_record.inode);
+        let metadata = fs::metadata(&nested).unwrap();
+        assert_eq!(nested_record.inode, {
+            use std::os::unix::fs::MetadataExt;
+            metadata.ino()
+        });
+        assert!(record_verified_research_directory(&policy, &anchor, Path::new("runs/./a")).is_err());
+        assert!(record_verified_research_directory(&policy, &anchor, Path::new("../a")).is_err());
+        assert!(record_verified_research_directory(&policy, &anchor, &anchor.canonical_path).is_err());
+    }
+
+    #[test]
+    fn verified_research_directory_rejects_anchor_replacement() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let retired = anchor.canonical_path.with_extension("retired");
+        fs::rename(&anchor.canonical_path, &retired).unwrap();
+        fs::create_dir(&anchor.canonical_path).unwrap();
+        fs::set_permissions(&anchor.canonical_path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(record_verified_research_directory(&policy, &anchor, Path::new(".")).is_err());
+        fs::remove_dir(&anchor.canonical_path).unwrap();
+        fs::rename(retired, &anchor.canonical_path).unwrap();
+    }
+
+    #[test]
+    fn verified_research_directory_rejects_cwd_and_parent_replacement_between_walks() {
+        for replace_parent in [true, false] {
+            let (temporary, policy, anchor) = research_policy_fixture();
+            let runs = anchor.canonical_path.join("runs");
+            let cwd = runs.join("a");
+            fs::create_dir(&runs).unwrap();
+            fs::set_permissions(&runs, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::create_dir(&cwd).unwrap();
+            fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
+            let retired = temporary.path().join(if replace_parent {
+                "retired-cwd-parent"
+            } else {
+                "retired-cwd"
+            });
+            let mut hook = |relative: &Path| {
+                if relative == Path::new("runs/a") {
+                    let replaced = if replace_parent { &runs } else { &cwd };
+                    fs::rename(replaced, &retired).unwrap();
+                    fs::create_dir(replaced).unwrap();
+                    fs::set_permissions(replaced, fs::Permissions::from_mode(0o700)).unwrap();
+                    if replace_parent {
+                        let replacement_cwd = replaced.join("a");
+                        fs::create_dir(&replacement_cwd).unwrap();
+                        fs::set_permissions(
+                            replacement_cwd,
+                            fs::Permissions::from_mode(0o700),
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            let error = record_verified_research_directory_with_test_hook(
+                &policy,
+                &anchor,
+                Path::new("runs/a"),
+                &mut hook,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.detail,
+                PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IdentityChanged)
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_discovery_is_scoped_sorted_and_keeps_same_bytes_distinct() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let artifact_root = research_artifact_fixture(&policy, "source-1");
+        for name in ["z.txt", "a.txt"] {
+            let path = artifact_root.join(name);
+            fs::write(&path, b"same bytes").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let unrelated = anchor.canonical_path.join(".git");
+        fs::create_dir(&unrelated).unwrap();
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o700)).unwrap();
+        for index in 0..32 {
+            let path = unrelated.join(format!("unrelated-{index}"));
+            fs::write(&path, b"unrelated").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let discovery = discover_research_checkpoint_files(&policy, &anchor, "source-1").unwrap();
+        assert!(discovery.complete);
+        assert_eq!(discovery.omitted_at_least, 0);
+        assert_eq!(discovery.records.len(), 2);
+        assert!(discovery.records[0].relative_path.ends_with("/a.txt"));
+        assert!(discovery.records[1].relative_path.ends_with("/z.txt"));
+        assert_eq!(discovery.records[0].sha256, discovery.records[1].sha256);
+        assert_ne!(discovery.records[0].relative_path, discovery.records[1].relative_path);
+        assert!(discover_research_checkpoint_files(&policy, &anchor, ".").is_err());
+        assert!(discover_research_checkpoint_files(&policy, &anchor, "../source-1").is_err());
+        let absent = discover_research_checkpoint_files(&policy, &anchor, "other").unwrap();
+        assert!(absent.records.is_empty());
+        assert_eq!(absent.omitted_at_least, 0);
+        assert!(absent.complete);
+    }
+
+    #[test]
+    fn checkpoint_discovery_omits_unsafe_oversize_and_counted_candidates() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let artifact_root = research_artifact_fixture(&policy, "source-2");
+        for index in 0..5 {
+            let path = artifact_root.join(format!("candidate-{index}.txt"));
+            fs::write(&path, format!("candidate-{index}")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let unsafe_path = artifact_root.join("unsafe.txt");
+        fs::write(&unsafe_path, b"unsafe").unwrap();
+        fs::set_permissions(&unsafe_path, fs::Permissions::from_mode(0o622)).unwrap();
+        let oversized = artifact_root.join("oversized.bin");
+        let oversized_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&oversized)
+            .unwrap();
+        oversized_file.set_len(MAX_RESEARCH_CHECKPOINT_FILE_BYTES + 1).unwrap();
+        oversized_file.sync_all().unwrap();
+        fs::set_permissions(&oversized, fs::Permissions::from_mode(0o600)).unwrap();
+        let discovery = discover_research_checkpoint_files(&policy, &anchor, "source-2").unwrap();
+        assert!(!discovery.complete);
+        assert!(discovery.omitted_at_least >= 2);
+        assert_eq!(discovery.records.len(), MAX_RESEARCH_CHECKPOINT_CANDIDATES);
+        assert!(discovery.records.iter().all(|record| !record.relative_path.ends_with("unsafe.txt")));
+        assert!(discovery.records.iter().all(|record| !record.relative_path.ends_with("oversized.bin")));
+    }
+
+    #[test]
+    fn checkpoint_discovery_small_test_limits_bound_entries_and_total_bytes() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let artifact_root = research_artifact_fixture(&policy, "source-3");
+        for (name, bytes) in [("a.txt", b"123456".as_slice()), ("b.txt", b"abcdef".as_slice())] {
+            let path = artifact_root.join(name);
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let limits = ResearchCheckpointLimits {
+            max_files: 4,
+            max_depth: 4,
+            max_entries: 4096,
+            max_file_bytes: 4096,
+            max_total_bytes: 8,
+        };
+        let discovery = discover_research_checkpoint_files_with_test_limits(
+            &policy,
+            &anchor,
+            "source-3",
+            limits,
+        )
+        .unwrap();
+        assert_eq!(discovery.records.len(), 1);
+        assert_eq!(discovery.omitted_at_least, 1);
+        assert!(!discovery.complete);
+
+        let entry_limited = ResearchCheckpointLimits {
+            max_entries: 1,
+            ..limits
+        };
+        assert!(discover_research_checkpoint_files_with_test_limits(
+            &policy,
+            &anchor,
+            "source-3",
+            entry_limited,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn checkpoint_discovery_does_not_refund_a_grown_selected_leaf() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let artifact_root = research_artifact_fixture(&policy, "source-growth");
+        for (name, bytes) in [("a.txt", b"aa".as_slice()), ("b.txt", b"bb".as_slice()),
+            ("c.txt", b"cc".as_slice())]
+        {
+            let path = artifact_root.join(name);
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let limits = ResearchCheckpointLimits {
+            max_files: 4,
+            max_depth: 4,
+            max_entries: 4096,
+            max_file_bytes: 4096,
+            max_total_bytes: 4,
+        };
+        let mut hook = |relative: &Path| {
+            if relative.ends_with("a.txt") {
+                fs::write(anchor.canonical_path.join(relative), b"aaa").unwrap();
+            }
+        };
+
+        let discovery = discover_research_checkpoint_files_with_test_limits_and_hook(
+            &policy,
+            &anchor,
+            "source-growth",
+            limits,
+            &mut hook,
+        )
+        .unwrap();
+
+        assert_eq!(
+            discovery
+                .records
+                .iter()
+                .map(|record| record.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![".pueue-agent/artifacts/source-growth/b.txt"]
+        );
+        assert_eq!(discovery.omitted_at_least, 2);
+        assert!(!discovery.complete);
+        assert!(discovery.records.iter().map(|record| record.logical_bytes).sum::<u64>() <= 4);
+    }
+
+    #[test]
+    fn checkpoint_discovery_omits_same_size_leaf_replacement_without_refund() {
+        let (temporary, policy, anchor) = research_policy_fixture();
+        let artifact_root = research_artifact_fixture(&policy, "source-replacement");
+        let path = artifact_root.join("a.txt");
+        fs::write(&path, b"same").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let retired = temporary.path().join("retired-a.txt");
+        let mut hook = |relative: &Path| {
+            if relative.ends_with("a.txt") {
+                let current = anchor.canonical_path.join(relative);
+                fs::rename(&current, &retired).unwrap();
+                fs::write(&current, b"same").unwrap();
+                fs::set_permissions(current, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        };
+        let limits = ResearchCheckpointLimits {
+            max_files: 4,
+            max_depth: 4,
+            max_entries: 4096,
+            max_file_bytes: 4096,
+            max_total_bytes: 4,
+        };
+
+        let discovery = discover_research_checkpoint_files_with_test_limits_and_hook(
+            &policy,
+            &anchor,
+            "source-replacement",
+            limits,
+            &mut hook,
+        )
+        .unwrap();
+
+        assert!(discovery.records.is_empty());
+        assert_eq!(discovery.omitted_at_least, 1);
+        assert!(!discovery.complete);
+    }
+
+    #[test]
+    fn checkpoint_discovery_rejects_unscannable_empty_subtrees() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let artifact_root = research_artifact_fixture(&policy, "source-depth");
+        let mut deep = artifact_root.clone();
+        for index in 0..4 {
+            deep = deep.join(format!("d{index}"));
+            fs::create_dir(&deep).unwrap();
+            fs::set_permissions(&deep, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let depth_error = discover_research_checkpoint_files(&policy, &anchor, "source-depth")
+            .unwrap_err();
+        assert_eq!(
+            depth_error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::DepthLimit)
+        );
+
+        let path_holder = tempfile::tempdir().unwrap();
+        let path_directory = path_holder.path().join("scope");
+        fs::create_dir(&path_directory).unwrap();
+        fs::set_permissions(&path_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let child = path_directory.join("child");
+        fs::create_dir(&child).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+        let path_directory = File::open(path_directory).unwrap();
+        let mount = directory_mount_identity_at(
+            &path_directory,
+            PolicyViolationStage::RunBoundPreMarker,
+        )
+        .unwrap();
+        let parent_record = research_directory_record_at(
+            &path_directory,
+            mount,
+            PolicyViolationStage::RunBoundPreMarker,
+        )
+        .unwrap();
+        let mut state = AuditState::default();
+        let mut candidates = Vec::new();
+        let mut omitted = 0;
+        let mut complete = true;
+        let path_error = collect_research_checkpoint_candidates(
+            &path_directory,
+            &"x".repeat(4091),
+            0,
+            std::slice::from_ref(&parent_record),
+            mount,
+            ResearchCheckpointLimits {
+                max_files: 4,
+                max_depth: 4,
+                max_entries: 4096,
+                max_file_bytes: 4096,
+                max_total_bytes: 4096,
+            },
+            &mut state,
+            &mut candidates,
+            &mut omitted,
+            &mut complete,
+        )
+        .unwrap_err();
+        assert_eq!(
+            path_error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::ByteLimit)
+        );
+    }
+
+    #[test]
+    fn checkpoint_discovery_missing_scope_components_is_empty() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let missing_namespace = discover_research_checkpoint_files(&policy, &anchor, "source-1")
+            .unwrap();
+        assert!(missing_namespace.records.is_empty());
+        assert_eq!(missing_namespace.omitted_at_least, 0);
+        assert!(missing_namespace.complete);
+
+        let service = anchor.canonical_path.join(PRIVATE_TEMP_ROOT);
+        fs::create_dir(&service).unwrap();
+        fs::set_permissions(&service, fs::Permissions::from_mode(0o700)).unwrap();
+        let missing_artifacts = discover_research_checkpoint_files(&policy, &anchor, "source-1")
+            .unwrap();
+        assert!(missing_artifacts.records.is_empty());
+        assert_eq!(missing_artifacts.omitted_at_least, 0);
+        assert!(missing_artifacts.complete);
+
+        let artifacts = service.join(ARTIFACTS_DIRECTORY);
+        fs::create_dir(&artifacts).unwrap();
+        fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700)).unwrap();
+        let missing_source = discover_research_checkpoint_files(&policy, &anchor, "source-1")
+            .unwrap();
+        assert!(missing_source.records.is_empty());
+        assert_eq!(missing_source.omitted_at_least, 0);
+        assert!(missing_source.complete);
+    }
+
+    #[test]
+    fn checkpoint_discovery_missing_scope_replacement_preserves_prefix_identity() {
+        let (temporary, policy, anchor) = research_policy_fixture();
+        let service = anchor.canonical_path.join(PRIVATE_TEMP_ROOT);
+        let artifacts = service.join(ARTIFACTS_DIRECTORY);
+        fs::create_dir(&service).unwrap();
+        fs::set_permissions(&service, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&artifacts).unwrap();
+        fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700)).unwrap();
+        let retired = temporary.path().join("retired-artifacts-prefix");
+        let mut hook = |relative: &Path| {
+            if relative == Path::new(".pueue-agent/artifacts/source-missing-prefix") {
+                fs::rename(&artifacts, &retired).unwrap();
+                fs::create_dir(&artifacts).unwrap();
+                fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        };
+
+        let error = discover_research_checkpoint_files_with_test_limits_and_hook(
+            &policy,
+            &anchor,
+            "source-missing-prefix",
+            RESEARCH_CHECKPOINT_PRODUCTION_LIMITS,
+            &mut hook,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IdentityChanged)
+        );
+    }
+
+    #[test]
+    fn checkpoint_discovery_rejects_scope_parent_replacement_after_inventory() {
+        let (temporary, policy, anchor) = research_policy_fixture();
+        let artifact_root = research_artifact_fixture(&policy, "source-parent-replacement");
+        let path = artifact_root.join("a.txt");
+        fs::write(&path, b"same").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let retired = temporary.path().join("retired-source-parent");
+        let mut hook = |relative: &Path| {
+            if relative.ends_with("a.txt") {
+                let current = anchor.canonical_path.join(relative);
+                let current_root = current.parent().unwrap();
+                fs::rename(current_root, &retired).unwrap();
+                fs::create_dir(current_root).unwrap();
+                fs::set_permissions(current_root, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(current_root.join("a.txt"), b"same").unwrap();
+                fs::set_permissions(
+                    current_root.join("a.txt"),
+                    fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+            }
+        };
+        let limits = ResearchCheckpointLimits {
+            max_files: 4,
+            max_depth: 4,
+            max_entries: 4096,
+            max_file_bytes: 4096,
+            max_total_bytes: 4096,
+        };
+
+        let error = discover_research_checkpoint_files_with_test_limits_and_hook(
+            &policy,
+            &anchor,
+            "source-parent-replacement",
+            limits,
+            &mut hook,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IdentityChanged)
+        );
+    }
+
+    #[test]
+    fn checkpoint_discovery_rejects_nested_parent_replacement_before_omission() {
+        let (temporary, policy, anchor) = research_policy_fixture();
+        let artifact_root = research_artifact_fixture(&policy, "source-nested-parent-replacement");
+        let nested = artifact_root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = nested.join("a.txt");
+        fs::write(&path, b"same").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let retired = temporary.path().join("retired-nested-parent");
+        let mut hook = |relative: &Path| {
+            if relative.ends_with("nested/a.txt") {
+                fs::rename(&nested, &retired).unwrap();
+                fs::create_dir(&nested).unwrap();
+                fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+                let replacement = nested.join("a.txt");
+                fs::write(&replacement, b"same").unwrap();
+                fs::set_permissions(replacement, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        };
+
+        let error = discover_research_checkpoint_files_with_test_limits_and_hook(
+            &policy,
+            &anchor,
+            "source-nested-parent-replacement",
+            RESEARCH_CHECKPOINT_PRODUCTION_LIMITS,
+            &mut hook,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IdentityChanged)
+        );
+    }
+
+    #[test]
+    fn checkpoint_discovery_omits_leaf_disappearance_after_parent_revalidation() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let artifact_root = research_artifact_fixture(&policy, "source-leaf-disappearance");
+        let path = artifact_root.join("a.txt");
+        fs::write(&path, b"same").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut hook = |relative: &Path| {
+            if relative.ends_with("a.txt") {
+                fs::remove_file(anchor.canonical_path.join(relative)).unwrap();
+            }
+        };
+
+        let discovery = discover_research_checkpoint_files_with_test_limits_and_hook(
+            &policy,
+            &anchor,
+            "source-leaf-disappearance",
+            RESEARCH_CHECKPOINT_PRODUCTION_LIMITS,
+            &mut hook,
+        )
+        .unwrap();
+        assert!(discovery.records.is_empty());
+        assert_eq!(discovery.omitted_at_least, 1);
+        assert!(!discovery.complete);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn checkpoint_discovery_rejects_non_utf8_subtree_but_omits_non_utf8_leaf() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let directory_root = research_artifact_fixture(&policy, "source-non-utf8-directory");
+        let non_utf8_directory = directory_root.join(std::ffi::OsString::from_vec(vec![
+            b'd', 0xff,
+        ]));
+        fs::create_dir(&non_utf8_directory).unwrap();
+        fs::set_permissions(&non_utf8_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = discover_research_checkpoint_files(&policy, &anchor, "source-non-utf8-directory")
+            .unwrap_err();
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::InvalidEntry)
+        );
+
+        let leaf_root = research_artifact_fixture(&policy, "source-non-utf8-leaf");
+        let non_utf8_leaf = leaf_root.join(std::ffi::OsString::from_vec(vec![b'f', 0xff]));
+        fs::write(&non_utf8_leaf, b"leaf").unwrap();
+        fs::set_permissions(&non_utf8_leaf, fs::Permissions::from_mode(0o600)).unwrap();
+        let discovery = discover_research_checkpoint_files(
+            &policy,
+            &anchor,
+            "source-non-utf8-leaf",
+        )
+        .unwrap();
+        assert!(discovery.records.is_empty());
+        assert_eq!(discovery.omitted_at_least, 1);
+        assert!(!discovery.complete);
+    }
+
+    #[test]
+    fn checkpoint_discovery_omits_symlink_and_fifo_leaves() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let artifact_root = research_artifact_fixture(&policy, "source-types");
+        let regular = artifact_root.join("regular.txt");
+        fs::write(&regular, b"regular").unwrap();
+        fs::set_permissions(&regular, fs::Permissions::from_mode(0o600)).unwrap();
+        let symlink_path = artifact_root.join("symlink");
+        symlink(&regular, &symlink_path).unwrap();
+        let fifo = artifact_root.join("fifo");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+
+        let discovery = discover_research_checkpoint_files(&policy, &anchor, "source-types")
+            .unwrap();
+        assert_eq!(discovery.records.len(), 1);
+        assert!(discovery.records[0].relative_path.ends_with("regular.txt"));
+        assert!(discovery.omitted_at_least >= 2);
+        assert!(!discovery.complete);
+    }
+
+    #[test]
+    fn checkpoint_discovery_rejects_symlinked_scope_component() {
+        let (temporary, policy, anchor) = research_policy_fixture();
+        let outside = temporary.path().join("outside-scope");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+        let service = anchor.canonical_path.join(PRIVATE_TEMP_ROOT);
+        symlink(&outside, &service).unwrap();
+
+        let error = discover_research_checkpoint_files(&policy, &anchor, "source-unsafe")
+            .unwrap_err();
+        assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+        assert!(matches!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(
+                TempUnsafeReason::MountBoundary
+                    | TempUnsafeReason::InvalidEntry
+                    | TempUnsafeReason::IoFailure
+            )
+        ));
+    }
+
     fn assert_retention_review_has_no_outputs(
         policy: &crate::execution_policy::ResolvedExecutionPolicy,
         campaign_id: &str,
@@ -7643,7 +9098,16 @@ mod tests {
         drop(retained);
         fs::write(&source_path, b"second").unwrap();
         let source2 = open_verified_research_file(&policy, &anchor, Path::new("source.txt"), 128).unwrap();
-        assert!(retain_verified_research_file(&policy, "campaign-a", "review-a", &source2).is_err());
+        let overwrite_error = expect_retention_error(retain_verified_research_file(
+            &policy,
+            "campaign-a",
+            "review-a",
+            &source2,
+        ));
+        assert_eq!(
+            overwrite_error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::ExistingEntry)
+        );
 
         let mut tampered = expected.clone();
         tampered.sha256 = "0".repeat(64);
@@ -8025,7 +9489,9 @@ mod tests {
         ));
         assert!(matches!(
             error.detail,
-            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure)
+            PolicyViolationDetail::TempUnsafe(
+                TempUnsafeReason::RetainedPublicationRecoveryRequired
+            )
         ));
         assert!(!hooks.fail_downgrade);
         assert!(hooks.competing_reader.is_some());
@@ -8109,6 +9575,47 @@ mod tests {
         let expected = retained.record().clone();
         drop(retained);
         cleanup_retained_research_file(&policy, "campaign-late-retry", "review-a", &expected).unwrap();
+    }
+
+    #[test]
+    fn retained_publication_removal_durability_failure_requires_recovery() {
+        let (_temporary, policy, anchor) = research_policy_fixture();
+        let source_path = anchor.canonical_path.join("source.txt");
+        fs::write(&source_path, b"checkpoint bytes\n").unwrap();
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let source = open_verified_research_file(&policy, &anchor, Path::new("source.txt"), 1 << 20).unwrap();
+        let mut hooks = RetentionTestHooks {
+            fail_after_publication_validation: true,
+            fail_rollback_parent_sync: true,
+            ..RetentionTestHooks::default()
+        };
+        let error = expect_retention_error(retain_verified_research_file_with_test_hooks(
+            &policy,
+            "campaign-durability",
+            "review-a",
+            &source,
+            &mut hooks,
+        ));
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(
+                TempUnsafeReason::RetainedPublicationRecoveryRequired
+            )
+        );
+        assert!(!hooks.fail_after_publication_validation);
+        assert!(!hooks.fail_rollback_parent_sync);
+        assert_retention_review_has_no_outputs(&policy, "campaign-durability", "review-a");
+        let retained = retain_verified_research_file_with_test_hooks(
+            &policy,
+            "campaign-durability",
+            "review-a",
+            &source,
+            &mut hooks,
+        )
+        .unwrap();
+        let expected = retained.record().clone();
+        drop(retained);
+        cleanup_retained_research_file(&policy, "campaign-durability", "review-a", &expected).unwrap();
     }
 
     #[test]
