@@ -28,6 +28,8 @@ pub use research::{
 };
 pub(crate) use research::{
     bind_research_termination_intent_in_transaction, complete_research_continue_in_transaction,
+    checkpoint_source_authority_for_preparation, CheckpointSourceAuthority,
+    CheckpointSourceAuthorityRead,
     completed_research_handoff_in_transaction,
     CheckpointJsonState, CheckpointSqliteStorageClass,
     discard_ready_research_action_in_transaction,

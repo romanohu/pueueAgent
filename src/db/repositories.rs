@@ -721,6 +721,22 @@ impl<'db> ProjectRepository<'db> {
     }
 }
 
+pub(super) fn find_project_by_id_in_connection(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Option<Project>, AppError> {
+    connection
+        .query_row(
+            "SELECT project_id, root_path, pueue_group, config_path, enabled, paused,
+                    halted_reason, created_at, updated_at
+             FROM projects WHERE project_id = ?1",
+            [project_id],
+            project_from_row,
+        )
+        .optional()
+        .map_err(database_error("find project by ID in connection"))
+}
+
 fn insert_operator_log(
     transaction: &Transaction<'_>,
     project: &Project,
@@ -7223,6 +7239,53 @@ impl<'db> TaskObservationRepository<'db> {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(database_error("read Pueue task observations"))
     }
+}
+
+pub(super) fn read_latest_task_observations_in_connection(
+    connection: &Connection,
+    project_id: &str,
+    pueue_task_id: i64,
+) -> Result<Vec<TaskObservation>, AppError> {
+    let mut statement = connection
+        .prepare(&format!(
+            "{} WHERE project_id = ?1 AND pueue_task_id = ?2
+               AND observed_at = (
+                   SELECT MAX(observed_at) FROM task_observations
+                   WHERE project_id = ?1 AND pueue_task_id = ?2
+               )
+             ORDER BY task_signature
+             LIMIT 2",
+            TASK_OBSERVATION_SELECT
+        ))
+        .map_err(database_error("prepare latest source task observation query"))?;
+    let rows = statement
+        .query_map(
+            params![project_id, pueue_task_id],
+            task_observation_from_row,
+        )
+        .map_err(database_error("query latest source task observations"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(database_error("read latest source task observations"))
+}
+
+pub(super) fn read_task_observation_by_pueue_task_and_signature_in_connection(
+    connection: &Connection,
+    project_id: &str,
+    pueue_task_id: i64,
+    task_signature: &str,
+) -> Result<Option<TaskObservation>, AppError> {
+    connection
+        .query_row(
+            &format!(
+                "{} WHERE project_id = ?1 AND pueue_task_id = ?2
+                   AND task_signature = ?3",
+                TASK_OBSERVATION_SELECT
+            ),
+            params![project_id, pueue_task_id, task_signature],
+            task_observation_from_row,
+        )
+        .optional()
+        .map_err(database_error("read historical source task observation"))
 }
 
 pub(crate) fn insert_event_idempotent_in_transaction(

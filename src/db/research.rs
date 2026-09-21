@@ -15,20 +15,26 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     environment::{
-        PrivateRunTempRecoveryIdentityV1, PrivateRunTempRecoveryRootIdentity,
+        campaign_experiment_runtime_argv, PrivateRunTempRecoveryIdentityV1, PrivateRunTempRecoveryRootIdentity,
         PrivateRunTempRecoveryTempIdentity,
-        RecoveredPrivateRunTempCleanup,
+        RecoveredPrivateRunTempCleanup, validate_research_id,
     },
-    models::{EventStatus, Incident, TaskObservation, TerminationRequest},
+    models::{
+        CampaignState, EventStatus, ExperimentStatus, Incident, ProposalKind, ProposalStatus,
+        Project, SubmissionKind, SubmissionStatus, TaskObservation, TerminationRequest,
+    },
     pueue::PueueTask,
+    proposals::{self, ProposalInput},
     reconcile::{
         managed_task_run_signature, managed_task_run_signature_for_observation, task_signature,
+        try_canonical_command_display_os,
     },
     research_checkpoint::{
-        checkpoint_support_from_persisted_context, select_checkpoint_support,
-        CheckpointSupportEvidenceV1,
+        checkpoint_source_layout, checkpoint_support_from_persisted_context,
+        parse_prepared_checkpoint, select_checkpoint_support, CheckpointSupportEvidenceV1,
+        PreparedCheckpoint,
     },
-    research_protocol::{parse_research_answer, ResearchAnswer},
+    research_protocol::{parse_research_answer, CheckpointRequest, ResearchAnswer},
     AppError,
 };
 
@@ -192,6 +198,36 @@ pub(crate) struct ReadyResearchAction {
     pub notes_json: String,
     pub campaign_objective_digest: String,
     pub raw_task_signature: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CheckpointSourceAuthority {
+    pub(crate) project: Project,
+    pub(crate) source: super::campaigns::ManagedSubmissionIntent,
+    pub(crate) observation: TaskObservation,
+    pub(crate) support: CheckpointSupportEvidenceV1,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointSourceAuthorityRead {
+    Supported(CheckpointSourceAuthority),
+    Unsupported { reason: String },
+}
+
+enum SourceAuthorityExpectation<'a> {
+    Fresh {
+        expected: &'a ReadyResearchAction,
+        request: &'a CheckpointRequest,
+    },
+    Historical {
+        checkpoint: &'a PreparedCheckpoint,
+    },
+}
+
+fn source_authority_owner_fields_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<(Option<i64>, Option<String>, Option<String>)> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
 }
 
 #[derive(Debug)]
@@ -4951,6 +4987,714 @@ pub(crate) fn ready_research_action_in_transaction(
     }))
 }
 
+pub(crate) fn checkpoint_source_authority_for_preparation(
+    db: &Db,
+    expected: &ReadyResearchAction,
+    request: &CheckpointRequest,
+) -> Result<CheckpointSourceAuthorityRead, AppError> {
+    let mut connection = db.connect()?;
+    let transaction = connection
+        .transaction()
+        .map_err(database_error("begin source authority read"))?;
+    let authority = checkpoint_source_authority_in_connection(
+        &transaction,
+        SourceAuthorityExpectation::Fresh { expected, request },
+    )?;
+    transaction
+        .commit()
+        .map_err(database_error("commit source authority read"))?;
+    Ok(authority)
+}
+
+pub(super) fn checkpoint_source_authority_for_ready_in_connection(
+    connection: &Connection,
+    expected: &ReadyResearchAction,
+    request: &CheckpointRequest,
+) -> Result<CheckpointSourceAuthorityRead, AppError> {
+    checkpoint_source_authority_in_connection(
+        connection,
+        SourceAuthorityExpectation::Fresh { expected, request },
+    )
+}
+
+pub(super) fn prepared_checkpoint_source_authority_in_connection(
+    connection: &Connection,
+    checkpoint: &PreparedCheckpoint,
+) -> Result<CheckpointSourceAuthority, AppError> {
+    match checkpoint_source_authority_in_connection(
+        connection,
+        SourceAuthorityExpectation::Historical { checkpoint },
+    )? {
+        CheckpointSourceAuthorityRead::Supported(authority) => Ok(authority),
+        CheckpointSourceAuthorityRead::Unsupported { .. } => Err(validation_error(
+            "checkpoint.source",
+            "prepared checkpoint source is unsupported",
+        )),
+    }
+}
+
+fn checkpoint_source_authority_in_connection(
+    connection: &Connection,
+    expectation: SourceAuthorityExpectation<'_>,
+) -> Result<CheckpointSourceAuthorityRead, AppError> {
+    let (
+        review_id,
+        expected_project_id,
+        expected_campaign_id,
+        expected_experiment_id,
+        expected_managed_signature,
+        expected_attempt,
+        expected_session_generation,
+        expected_agent_run_id,
+        expected_event_id,
+        expected_source_task_id,
+        expected_raw_signature,
+        expected_objective_digest,
+    ) = match &expectation {
+        SourceAuthorityExpectation::Fresh { expected, .. } => (
+            expected.owner.review_id.as_str(),
+            expected.owner.project_id.as_str(),
+            expected.owner.campaign_id.as_str(),
+            expected.owner.source_experiment_id.as_str(),
+            expected.owner.managed_task_signature.as_str(),
+            expected.owner.attempt,
+            expected.owner.session_generation,
+            expected.owner.agent_run_id,
+            expected.owner.event_id,
+            expected.owner.source_task_id,
+            expected.raw_task_signature.as_str(),
+            expected.campaign_objective_digest.as_str(),
+        ),
+        SourceAuthorityExpectation::Historical { checkpoint } => (
+            checkpoint.review_id.as_str(),
+            checkpoint.project_id.as_str(),
+            checkpoint.campaign_id.as_str(),
+            checkpoint.source_experiment_id.as_str(),
+            checkpoint.source_managed_task_signature.as_str(),
+            checkpoint.review_attempt,
+            checkpoint.review_session_generation,
+            Some(checkpoint.review_agent_run_id),
+            Some(checkpoint.review_event_id),
+            Some(checkpoint.source_task_id),
+            checkpoint.source_raw_task_signature.as_str(),
+            checkpoint.campaign_objective_digest.as_str(),
+        ),
+    };
+
+    let review = connection
+        .query_row(
+            &format!("{REVIEW_SELECT} WHERE review_id = ?1"),
+            [review_id],
+            review_from_row,
+        )
+        .optional()
+        .map_err(database_error("read source authority review"))?
+        .ok_or_else(|| validation_error("research.review", "does not exist"))?;
+    let (persisted_event_id, persisted_notes_json, persisted_decision_cycle_id) = connection
+        .query_row(
+            "SELECT event_id, notes_json, decision_cycle_id
+             FROM research_reviews WHERE review_id = ?1",
+            [review_id],
+            source_authority_owner_fields_from_row,
+        )
+        .map_err(database_error("read source authority owner fields"))?;
+
+    if review.review_id != review_id
+        || review.campaign_id != expected_campaign_id
+        || review.experiment_id != expected_experiment_id
+        || review.task_signature != expected_managed_signature
+        || review.attempt != expected_attempt
+        || review.session_generation != expected_session_generation
+        || review.agent_run_id != expected_agent_run_id
+        || persisted_event_id != expected_event_id
+    {
+        return Err(validation_error(
+            "research.review",
+            "does not match the source authority expectation",
+        ));
+    }
+
+    match &expectation {
+        SourceAuthorityExpectation::Fresh { expected, .. } => {
+            if review.state != "ready"
+                || review.operation_stage.is_some()
+                || review.termination_request_id.is_some()
+                || review.successor_experiment_id.is_some()
+                || persisted_decision_cycle_id.is_some()
+                || !matches!(review.checkpoint_json_state, CheckpointJsonState::Missing)
+                || expected.owner.operation_stage.is_some()
+                || expected.owner.termination_request_id.is_some()
+                || expected.owner.successor_experiment_id.is_some()
+                || expected.owner.decision_cycle_id.is_some()
+                || expected.owner.recovery_required
+                || expected.owner.attempt <= 0
+                || expected.owner.session_generation < 0
+                || expected.owner.agent_run_id.is_none_or(|run_id| run_id <= 0)
+                || expected.owner.event_id.is_none_or(|event_id| event_id <= 0)
+                || expected.owner.source_task_id.is_none_or(|task_id| task_id < 0)
+                || review.context_json.as_deref() != Some(expected.context_json.as_str())
+                || review.context_digest.as_deref() != Some(expected.context_digest.as_str())
+                || review.response_json.as_deref() != Some(expected.response_json.as_str())
+                || persisted_notes_json.as_deref().unwrap_or("{}") != expected.notes_json
+            {
+                return Err(validation_error(
+                    "research.review",
+                    "is stale or differs from the ready authority",
+                ));
+            }
+        }
+        SourceAuthorityExpectation::Historical { checkpoint } => {
+            if review.context_digest.as_deref() != Some(checkpoint.context_digest.as_str()) {
+                return Err(validation_error(
+                    "research.context_digest",
+                    "does not match the prepared checkpoint",
+                ));
+            }
+        }
+    }
+
+    if let SourceAuthorityExpectation::Historical { checkpoint } = &expectation {
+        let Some(stored_json) = review.checkpoint_json.as_deref() else {
+            return Err(validation_error(
+                "research.checkpoint_json",
+                "is missing from the historical review",
+            ));
+        };
+        if !matches!(review.checkpoint_json_state, CheckpointJsonState::BoundedText) {
+            return Err(validation_error(
+                "research.checkpoint_json",
+                "is not bounded text",
+            ));
+        }
+        let stored_checkpoint = parse_prepared_checkpoint(stored_json)?;
+        if stored_checkpoint != **checkpoint {
+            return Err(validation_error(
+                "research.checkpoint_json",
+                "does not parse to the supplied prepared checkpoint",
+            ));
+        }
+    }
+
+    let source = super::campaigns::read_intent_by_experiment(connection, &review.experiment_id)?;
+    if source.campaign.campaign_id != review.campaign_id
+        || source.experiment.experiment_id != review.experiment_id
+        || source.experiment.campaign_id != source.campaign.campaign_id
+        || source.experiment.proposal_id != source.proposal.proposal_id
+        || source.experiment.submission_id != source.submission.submission_id
+        || source.proposal.campaign_id != source.campaign.campaign_id
+        || source.submission.project_id != source.campaign.project_id
+    {
+        return Err(validation_error(
+            "research.source",
+            "does not form one coherent campaign graph",
+        ));
+    }
+    if source.campaign.project_id != expected_project_id {
+        return Err(validation_error(
+            "research.project_id",
+            "does not match the source authority",
+        ));
+    }
+    let project = super::repositories::find_project_by_id_in_connection(
+        connection,
+        &source.campaign.project_id,
+    )?
+    .ok_or_else(|| validation_error("research.project_id", "does not identify a project"))?;
+    if project.project_id != expected_project_id
+        || source.campaign.objective_digest != expected_objective_digest
+    {
+        return Err(validation_error(
+            "research.project",
+            "does not match the source authority",
+        ));
+    }
+
+    validate_research_id(&review.review_id).map_err(AppError::from)?;
+    validate_research_id(&project.project_id).map_err(AppError::from)?;
+    validate_research_id(&source.campaign.campaign_id).map_err(AppError::from)?;
+    validate_research_id(&source.experiment.experiment_id).map_err(AppError::from)?;
+    validate_research_id(&source.proposal.proposal_id).map_err(AppError::from)?;
+    validate_research_id(&source.submission.submission_id).map_err(AppError::from)?;
+    if source.proposal.status != ProposalStatus::Accepted {
+        return Err(validation_error(
+            "proposal_id",
+            "does not identify an accepted proposal",
+        ));
+    }
+    let validated = proposals::validate(
+        ProposalInput {
+            kind: source.proposal.kind,
+            hypothesis: source.proposal.hypothesis.clone(),
+            source_experiment_id: source.proposal.source_experiment_id.clone(),
+            argv: source.proposal.argv.clone(),
+            working_directory: source.proposal.working_directory.clone(),
+            expected_evidence: source.proposal.expected_evidence.clone(),
+        },
+        &source.campaign.objective_digest,
+    )?;
+    if validated.canonical_digest() != source.proposal.canonical_digest
+        || validated.kind() != source.proposal.kind
+        || validated.hypothesis() != source.proposal.hypothesis
+        || validated.source_experiment_id() != source.proposal.source_experiment_id.as_deref()
+        || validated.argv() != source.proposal.argv.as_slice()
+        || validated.working_directory() != source.proposal.working_directory
+        || validated.expected_evidence() != source.proposal.expected_evidence.as_slice()
+    {
+        return Err(validation_error(
+            "proposal.canonical_digest",
+            "does not match the durable proposal fields",
+        ));
+    }
+    if source.submission.kind != SubmissionKind::Experiment
+        || source.submission.status != SubmissionStatus::Accepted
+        || source.submission.project_id != project.project_id
+        || source.submission.argv != source.proposal.argv
+        || source.submission.pueue_task_id != source.experiment.pueue_task_id
+        || source.submission.task_signature != source.experiment.task_signature
+    {
+        return Err(validation_error(
+            "submission_id",
+            "does not prove the selected experiment submission",
+        ));
+    }
+    source_authority_require_submission_metadata(
+        &source.submission.metadata,
+        "campaign_id",
+        &source.campaign.campaign_id,
+    )?;
+    source_authority_require_submission_metadata(
+        &source.submission.metadata,
+        "proposal_id",
+        &source.proposal.proposal_id,
+    )?;
+    source_authority_require_submission_metadata(
+        &source.submission.metadata,
+        "experiment_id",
+        &source.experiment.experiment_id,
+    )?;
+
+    let resume_of_experiment_id: Option<String> = connection
+        .query_row(
+            "SELECT resume_of_experiment_id FROM experiments WHERE experiment_id = ?1",
+            [&source.experiment.experiment_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("read source checkpoint lineage"))?;
+    let incoming_checkpoint_successor: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM research_reviews
+                 WHERE successor_experiment_id = ?1
+                   AND checkpoint_json IS NOT NULL
+             )",
+            [&source.experiment.experiment_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error("check incoming checkpoint lineage"))?;
+    let skip_ordinary_source_checks = source.experiment.code_change_run_id.is_some()
+        || source.experiment.code_revision_sha.is_some()
+        || source.proposal.kind == ProposalKind::CodeChange;
+    let mut unsupported_reason = if source.experiment.code_change_run_id.is_some()
+        || source.experiment.code_revision_sha.is_some()
+        || source.proposal.kind == ProposalKind::CodeChange
+    {
+        Some("code-change experiments have no ordinary trainer source".to_owned())
+    } else if source_authority_has_prior_checkpoint_source(&source.proposal.argv)
+        || resume_of_experiment_id.is_some()
+        || incoming_checkpoint_successor
+    {
+        Some("prior checkpoint sources require a durable checkpoint authority".to_owned())
+    } else {
+        None
+    };
+    let source_layout = match checkpoint_source_layout(
+        &source.proposal.argv,
+        &source.proposal.working_directory,
+    ) {
+        Ok(layout) => Some(layout),
+        Err(_) => {
+            if unsupported_reason.is_none() {
+                unsupported_reason = Some("trainer source command shape is unsupported".to_owned());
+            }
+            None
+        }
+    };
+
+    let source_task_id = source.experiment.pueue_task_id.ok_or_else(|| {
+        validation_error("source_task_id", "is missing from the accepted experiment")
+    })?;
+    let source_managed_signature = source
+        .experiment
+        .task_signature
+        .as_deref()
+        .ok_or_else(|| validation_error("source_task_signature", "is missing"))?;
+    if matches!(&expectation, SourceAuthorityExpectation::Fresh { .. })
+        && (expected_attempt <= 0
+            || expected_session_generation < 0
+            || expected_agent_run_id.is_none_or(|run_id| run_id <= 0)
+            || expected_event_id.is_none_or(|event_id| event_id <= 0)
+            || expected_source_task_id.is_none_or(|task_id| task_id < 0)
+            || source_task_id < 0)
+    {
+        return Err(validation_error(
+            "research.source",
+            "has invalid numeric authority identity",
+        ));
+    }
+    if source_task_id != expected_source_task_id.unwrap_or(source_task_id)
+        || source_managed_signature != expected_managed_signature
+    {
+        return Err(validation_error(
+            "research.source",
+            "does not match the expected task identity",
+        ));
+    }
+
+    if let SourceAuthorityExpectation::Fresh { expected, .. } = &expectation {
+        if source.experiment.status != ExperimentStatus::Accepted
+            || source.campaign.state != CampaignState::Active
+            || !project.enabled
+            || project.paused
+            || project.halted_reason.is_some()
+        {
+            return Err(validation_error(
+                "research.source",
+                "is not currently eligible for fresh preparation",
+            ));
+        }
+        if expected.owner.source_task_id != Some(source_task_id) {
+            return Err(validation_error(
+                "research.source_task_id",
+                "does not match the accepted experiment",
+            ));
+        }
+    } else if !matches!(
+        source.experiment.status,
+        ExperimentStatus::Accepted
+            | ExperimentStatus::Succeeded
+            | ExperimentStatus::Failed
+            | ExperimentStatus::Cancelled
+    ) {
+        return Err(validation_error(
+            "research.source",
+            "has an unsupported lifecycle status",
+        ));
+    }
+
+    if let SourceAuthorityExpectation::Historical { checkpoint } = &expectation {
+        if checkpoint.project_id != project.project_id
+            || checkpoint.campaign_id != source.campaign.campaign_id
+            || checkpoint.source_experiment_id != source.experiment.experiment_id
+            || checkpoint.source_proposal_id != source.proposal.proposal_id
+            || checkpoint.source_submission_id != source.submission.submission_id
+            || checkpoint.source_task_id != source_task_id
+            || checkpoint.source_managed_task_signature != source_managed_signature
+            || checkpoint.campaign_objective_digest != source.campaign.objective_digest
+            || checkpoint.source_proposal_canonical_digest != source.proposal.canonical_digest
+            || project.root_path.to_str() != Some(checkpoint.source_root_canonical_path.as_str())
+            || source.proposal.argv != checkpoint.source_argv
+            || source.proposal.working_directory != checkpoint.source_working_directory
+        {
+            return Err(validation_error(
+                "checkpoint.source",
+                "does not match the durable source graph",
+            ));
+        }
+    }
+
+    let context_json = review
+        .context_json
+        .clone()
+        .ok_or_else(|| validation_error("research.context", "is missing"))?;
+    let context_digest = review
+        .context_digest
+        .clone()
+        .ok_or_else(|| validation_error("research.context_digest", "is missing"))?;
+    if format!("{:x}", Sha256::digest(context_json.as_bytes())) != context_digest {
+        return Err(validation_error(
+            "research.context_digest",
+            "does not match the persisted context",
+        ));
+    }
+    if let SourceAuthorityExpectation::Historical { checkpoint } = &expectation {
+        if context_digest != checkpoint.context_digest {
+            return Err(validation_error(
+                "research.context_digest",
+                "does not match the prepared checkpoint",
+            ));
+        }
+    }
+    let support = checkpoint_support_from_persisted_context(&context_json, &context_digest)?;
+    let context: Value = serde_json::from_str(&context_json).map_err(|source| {
+        AppError::Serialization {
+            operation: "parse source authority context",
+            source,
+        }
+    })?;
+    if !research_context_identity_matches(
+        &context,
+        &project.project_id,
+        &source.campaign.campaign_id,
+        &review.review_id,
+        &source.experiment.experiment_id,
+        source_managed_signature,
+        Some(source_task_id),
+        &source.campaign.objective_digest,
+    ) {
+        return Err(validation_error(
+            "research.context",
+            "does not bind the source graph",
+        ));
+    }
+
+    let response_json = review
+        .response_json
+        .clone()
+        .ok_or_else(|| validation_error("research.response", "is missing"))?;
+    if let SourceAuthorityExpectation::Fresh { expected, .. } = &expectation {
+        if response_json != expected.response_json {
+            return Err(validation_error(
+                "research.response",
+                "does not match the ready authority",
+            ));
+        }
+    }
+    if let SourceAuthorityExpectation::Historical { checkpoint } = &expectation {
+        if format!("{:x}", Sha256::digest(response_json.as_bytes())) != checkpoint.response_digest
+        {
+            return Err(validation_error(
+                "research.response_digest",
+                "does not match the prepared checkpoint",
+            ));
+        }
+    }
+    let answer = parse_research_answer(response_json.as_bytes())?;
+    let expected_request = match &expectation {
+        SourceAuthorityExpectation::Fresh { request, .. } => *request,
+        SourceAuthorityExpectation::Historical { checkpoint } => &checkpoint.request,
+    };
+    if let SourceAuthorityExpectation::Fresh { expected, .. } = &expectation {
+        if !source_authority_answers_equal(&answer, &expected.answer) {
+            return Err(validation_error(
+                "research.response",
+                "does not equal the ready authority answer",
+            ));
+        }
+    }
+    if answer.review_id != review.review_id
+        || answer.experiment_id != source.experiment.experiment_id
+        || answer.context_digest != context_digest
+        || answer.action != "resume_from_checkpoint"
+        || answer.checkpoint.as_ref() != Some(expected_request)
+    {
+        return Err(validation_error(
+            "research.response",
+            "does not bind the requested checkpoint action",
+        ));
+    }
+
+    let selected = match &support {
+        CheckpointSupportEvidenceV1::Unavailable { reason, .. } => {
+            if unsupported_reason.is_none() {
+                unsupported_reason = Some(reason.clone());
+            }
+            None
+        }
+        CheckpointSupportEvidenceV1::Available {
+            support_version,
+            source_experiment_id,
+            source_proposal_id,
+            source_submission_id,
+            normalized_working_directory,
+            working_directory_record,
+            loader_support,
+            checkpoint_candidates,
+            ..
+        } => {
+            if *support_version != crate::research_checkpoint::CHECKPOINT_SUPPORT_VERSION
+                || source_experiment_id != &source.experiment.experiment_id
+                || source_proposal_id != &source.proposal.proposal_id
+                || source_submission_id != &source.submission.submission_id
+                || normalized_working_directory != &source.proposal.working_directory
+                || loader_support.len() != 1
+                || checkpoint_candidates.is_empty()
+            {
+                return Err(validation_error(
+                    "checkpoint_support",
+                    "does not bind the durable source graph",
+                ));
+            }
+            let loader = &loader_support[0];
+            if !skip_ordinary_source_checks {
+                if let Some(source_layout) = source_layout.as_ref() {
+                    if loader.argv_index != source_layout.entrypoint_index
+                        || loader.argv_token != source_layout.entrypoint_token
+                        || loader.root_relative_path
+                            != source_layout.entrypoint_root_relative_path
+                    {
+                        return Err(validation_error(
+                            "checkpoint_support.loader",
+                            "does not match the source command layout",
+                        ));
+                    }
+                }
+            }
+            if !research_answer_evidence_refs_are_bound(
+                &context,
+                &context_json,
+                &context_digest,
+                &answer,
+            )? {
+                return Err(validation_error(
+                    "research.response",
+                    "cites evidence outside the persisted support packet",
+                ));
+            }
+            let selected = select_checkpoint_support(&support, expected_request)?;
+            if let SourceAuthorityExpectation::Historical { checkpoint } = &expectation {
+                if working_directory_record != &checkpoint.source_working_directory_record
+                    || normalized_working_directory != &checkpoint.source_working_directory
+                    || selected.loader != &checkpoint.loader
+                    || selected.candidate != &checkpoint.source_checkpoint
+                    || checkpoint.support_version != *support_version
+                {
+                    return Err(validation_error(
+                        "checkpoint_support",
+                        "does not match the prepared checkpoint evidence",
+                    ));
+                }
+            }
+            Some(selected)
+        }
+    };
+
+    let observation = match &expectation {
+        SourceAuthorityExpectation::Fresh { .. } => {
+            let latest = super::repositories::read_latest_task_observations_in_connection(
+                connection,
+                &project.project_id,
+                source_task_id,
+            )?;
+            if latest.len() != 1 {
+                return Err(validation_error(
+                    "task_signature",
+                    "has ambiguous current task observations",
+                ));
+            }
+            latest.into_iter().next().expect("one latest observation")
+        }
+        SourceAuthorityExpectation::Historical { .. } => {
+            super::repositories::read_task_observation_by_pueue_task_and_signature_in_connection(
+                connection,
+                &project.project_id,
+                source_task_id,
+                expected_raw_signature,
+            )?
+            .ok_or_else(|| {
+                validation_error(
+                    "task_signature",
+                    "does not identify one historical source observation",
+                )
+            })?
+        }
+    };
+    if observation.task_signature != expected_raw_signature
+        || observation.pueue_task_id != source_task_id
+        || observation.project_id != project.project_id
+        || observation.pueue_group != project.pueue_group
+        || !observation.state.eq_ignore_ascii_case("running")
+        || managed_task_run_signature_for_observation(&observation, &project.pueue_group)
+            .as_deref()
+            != Some(source_managed_signature)
+    {
+        return Err(validation_error(
+            "task_signature",
+            "does not identify the persisted managed running source",
+        ));
+    }
+
+    if !skip_ordinary_source_checks {
+        let runtime_argv = campaign_experiment_runtime_argv(
+            &project.root_path,
+            &source.campaign.campaign_id,
+            &source.experiment.experiment_id,
+            &source.proposal.argv,
+        );
+        let expected_command = try_canonical_command_display_os(&runtime_argv)?;
+        if observation.command.len() != 1 || observation.command[0] != expected_command {
+            return Err(validation_error(
+                "task_observation.command",
+                "does not match the selected experiment runtime command",
+            ));
+        }
+    }
+    if let Some(reason) = unsupported_reason {
+        return Ok(CheckpointSourceAuthorityRead::Unsupported { reason });
+    }
+
+    if source_layout.is_none() {
+        return Err(validation_error(
+            "checkpoint_source",
+            "has no validated trainer source layout",
+        ));
+    }
+
+    if let SourceAuthorityExpectation::Historical { checkpoint } = &expectation {
+        if checkpoint.source_raw_task_signature != observation.task_signature
+            || checkpoint.source_task_id != observation.pueue_task_id
+        {
+            return Err(validation_error(
+                "checkpoint.source_raw_task_signature",
+                "does not match the captured source observation",
+            ));
+        }
+    }
+    let _ = selected;
+    Ok(CheckpointSourceAuthorityRead::Supported(
+        CheckpointSourceAuthority {
+            project,
+            source,
+            observation,
+            support,
+        },
+    ))
+}
+
+fn source_authority_require_submission_metadata(
+    metadata: &Value,
+    key: &'static str,
+    expected: &str,
+) -> Result<(), AppError> {
+    let object = metadata.as_object().ok_or_else(|| {
+        validation_error("submission.metadata", "must be an object with campaign lineage")
+    })?;
+    if object.get(key).and_then(Value::as_str) != Some(expected) {
+        return Err(validation_error(
+            "submission.metadata",
+            "does not prove the selected campaign lineage",
+        ));
+    }
+    Ok(())
+}
+
+fn source_authority_answers_equal(left: &ResearchAnswer, right: &ResearchAnswer) -> bool {
+    left.schema_version == right.schema_version
+        && left.review_id == right.review_id
+        && left.experiment_id == right.experiment_id
+        && left.context_digest == right.context_digest
+        && left.action == right.action
+        && left.reason == right.reason
+        && left.evidence_refs == right.evidence_refs
+        && left.notes == right.notes
+        && left.next_direction == right.next_direction
+        && left.checkpoint == right.checkpoint
+}
+
+fn source_authority_has_prior_checkpoint_source(argv: &[String]) -> bool {
+    argv.iter()
+        .any(|argument| argument == "--resume" || argument.starts_with("--resume="))
+}
+
 /// Discard a ready answer whose source task has naturally terminated or whose
 /// live numeric identity no longer matches the persisted managed target.  The
 /// project and campaign gates are repeated in this CAS so a pause or disable
@@ -6972,6 +7716,7 @@ mod tests {
         (temp, db, run.run_id, project_id.to_owned())
     }
 
+
     fn available_checkpoint_context_response(
         project_id: &str,
         campaign_id: &str,
@@ -8268,5 +9013,1548 @@ mod tests {
             )
             .unwrap();
         assert_eq!(persisted, ("ready".to_owned(), None, None));
+    }
+
+
+    struct SourceAuthorityFixture {
+        _temp: tempfile::TempDir,
+        db: Db,
+        project_id: String,
+        campaign_id: String,
+        experiment_id: String,
+        review_id: String,
+        proposal_id: String,
+        submission_id: String,
+        live_task: PueueTask,
+        wrapped_command: String,
+        request: CheckpointRequest,
+        expected: ReadyResearchAction,
+        checkpoint: crate::research_checkpoint::PreparedCheckpoint,
+        candidate_reference: String,
+    }
+
+    fn source_authority_file(
+        relative_path: &str,
+        bytes: &[u8],
+        root: &crate::environment::ResearchDirectoryRecord,
+        parent: &crate::environment::ResearchDirectoryRecord,
+        device: u64,
+        inode: u64,
+    ) -> crate::environment::ResearchFileRecord {
+        crate::environment::ResearchFileRecord {
+            relative_path: relative_path.to_owned(),
+            root: root.clone(),
+            parent: parent.clone(),
+            device,
+            inode,
+            owner: 3,
+            mode: 0o600,
+            mount_identity: root.mount_identity,
+            logical_bytes: bytes.len() as u64,
+            allocated_bytes: 512,
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }
+    }
+
+    fn source_authority_fixture() -> SourceAuthorityFixture {
+        source_authority_fixture_with_layout(41, ".", "train.py")
+    }
+
+    fn source_authority_nested_fixture() -> SourceAuthorityFixture {
+        source_authority_fixture_with_layout(41, ".pueue-agent", "trainer/train.py")
+    }
+
+    fn source_authority_fixture_with_layout(
+        task_id: i64,
+        working_directory: &str,
+        loader_path: &str,
+    ) -> SourceAuthorityFixture {
+        let temp = tempfile::tempdir().expect("source authority tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("source authority project");
+        let root = fs::canonicalize(&root).expect("source authority canonical project");
+        let config_path = root.join("config.toml");
+        fs::write(&config_path, "fixture").expect("source authority config");
+        let db = Db::open(&temp.path().join("state.sqlite3")).expect("source authority db");
+        let project_id = "source-authority-project".to_owned();
+        let campaign_id = "source-authority-campaign".to_owned();
+        let experiment_id = "source-authority-experiment".to_owned();
+        let proposal_id = "source-authority-proposal".to_owned();
+        let submission_id = "source-authority-submission".to_owned();
+        let group = "source-authority-group";
+        let argv = vec!["python".to_owned(), loader_path.to_owned()];
+        let runtime_argv = campaign_experiment_runtime_argv(
+            &root,
+            &campaign_id,
+            &experiment_id,
+            &argv,
+        );
+        let wrapped_command = try_canonical_command_display_os(&runtime_argv)
+            .expect("source authority wrapped command");
+        let live_task = PueueTask {
+            id: task_id,
+            group: group.to_owned(),
+            command: wrapped_command.clone(),
+            state: "Running".to_owned(),
+            enqueued_at: Some("900".to_owned()),
+            started_at: Some("1000".to_owned()),
+            ended_at: None,
+            result: None,
+        };
+        let raw_task_signature = task_signature(&live_task);
+        let managed_task_signature = managed_task_run_signature(&live_task)
+            .expect("source authority managed task signature");
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                &project_id,
+                root.clone(),
+                group,
+                config_path,
+                900,
+            ))
+            .expect("source authority project registration");
+        let objective = ObjectiveSnapshot {
+            text: "source authority objective".to_owned(),
+            digest: "a".repeat(64),
+        };
+        let baseline = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "tokenized source authority baseline".to_owned(),
+                source_experiment_id: None,
+                argv: argv.clone(),
+                working_directory: working_directory.to_owned(),
+                expected_evidence: vec!["loss".to_owned()],
+            },
+            &objective.digest,
+        )
+        .expect("source authority baseline proposal");
+        CampaignRepository::new(&db)
+            .start_with_baseline(
+                StartCampaignRequest {
+                    campaign_id: &campaign_id,
+                    project_id: &project_id,
+                    objective: &objective,
+                    initial_argv: &argv,
+                    baseline: &baseline,
+                    submission_id: &submission_id,
+                    experiment_id: &experiment_id,
+                    proposal_id: &proposal_id,
+                    metadata: &json!({"fixture": "source-authority"}),
+                    origin_agent_run_id: None,
+                    objective_metric: None,
+                    now: 900,
+                },
+                &CampaignLimits::default(),
+            )
+            .expect("source authority campaign");
+        ExperimentRepository::new(&db)
+            .mark_submitting(&experiment_id, 901)
+            .expect("source authority submitting");
+        ExperimentRepository::new(&db)
+            .mark_accepted(&experiment_id, live_task.id, &managed_task_signature, 902)
+            .expect("source authority accepted experiment");
+        TaskObservationRepository::new(&db)
+            .upsert(&NewTaskObservation::new(
+                &project_id,
+                &raw_task_signature,
+                live_task.id,
+                group,
+                vec![wrapped_command.clone()],
+                "Running",
+                Some(900),
+                Some(1_000),
+                None,
+                None,
+                1_001,
+            ))
+            .expect("source authority wrapped observation");
+        let repository = ResearchRepository::new(&db);
+        repository
+            .ensure_campaign(&campaign_id)
+            .expect("source authority state");
+        repository
+            .schedule_running(&campaign_id, 1_000, 30, 2_799)
+            .expect("source authority schedule");
+        let review = repository
+            .claim_due(&campaign_id, &experiment_id, &managed_task_signature, 2_800)
+            .expect("source authority claim")
+            .expect("source authority review");
+        let event_id = repository
+            .event_id(&review.review_id)
+            .expect("source authority event");
+        EventRepository::new(&db)
+            .claim_by_id(&project_id, event_id, 2_900)
+            .expect("source authority event claim")
+            .expect("source authority event row");
+        let run = AgentRunRepository::new(&db)
+            .insert_with_events(
+                &NewAgentRun::with_context(
+                    &project_id,
+                    event_id,
+                    None,
+                    AgentRunStatus::Starting,
+                    2_901,
+                    temp.path().join("agent.log"),
+                    AgentContextMode::Fresh,
+                    None,
+                    Vec::new(),
+                )
+                .with_execution(
+                    ExecutionProjection::new("campaign_research", "/bin/sh", "fixture")
+                        .expect("source authority execution"),
+                ),
+                &[event_id],
+            )
+            .expect("source authority run");
+        let session_id = "11111111-1111-4111-8111-111111111111";
+        let native_authority = json!({
+            "version": 1,
+            "run_id": run.run_id,
+            "review_id": review.review_id,
+            "campaign_id": campaign_id,
+            "experiment_id": experiment_id,
+            "attempt": 1,
+            "session_generation": 0,
+            "fresh_launch": true,
+            "session_id": session_id,
+            "service_root_identity": {
+                "device": 1, "inode": 2, "owner": 3, "mode": 448,
+                "resolution": "fixture-root"
+            },
+            "temp_identity": {
+                "device": 1, "inode": 4, "owner": 3, "mode": 448,
+                "mount": [1, 2],
+                "service_identity": {"device": 1, "inode": 5, "owner": 3, "mode": 448},
+                "parent_identity": {"device": 1, "inode": 6, "owner": 3, "mode": 448}
+            },
+            "cleanup": {"phase": "complete", "completed_at": 3_000}
+        });
+        let retry_notes = json!({
+            "retry_history": [{
+                "attempt": 1,
+                "agent_run_id": run.run_id,
+                "failure_code": "research_output_invalid",
+                "planned_session_id": session_id,
+                "confirmed_session_id": session_id,
+                "session_binding": "confirmed",
+                "native_recovery": native_authority
+            }]
+        });
+        let connection = db
+            .connect()
+            .expect("source authority setup connection");
+        connection
+            .execute(
+                "UPDATE agent_runs
+                 SET status = 'failed', finished_at = 3_001,
+                     launch_gate_state = 'failed'
+                 WHERE run_id = ?1",
+                [run.run_id],
+            )
+            .expect("source authority terminal run");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'retry_wait', attempt = 2, agent_run_id = NULL,
+                     failure_code = 'research_output_invalid', notes_json = ?1
+                 WHERE review_id = ?2",
+                rusqlite::params![retry_notes.to_string(), review.review_id],
+            )
+            .expect("source authority retry review");
+        connection
+            .execute(
+                "UPDATE events SET status = 'retry_wait', lease_until = NULL,
+                     not_before = 3_001, last_error = 'research_output_invalid'
+                 WHERE event_id = ?1",
+                [event_id],
+            )
+            .expect("source authority retry event");
+
+        let root_record = crate::environment::ResearchDirectoryRecord {
+            device: 1,
+            inode: 2,
+            owner: 3,
+            mode: 0o700,
+            mount_identity: [4, 5],
+        };
+        let working_directory_record = if working_directory == "." {
+            root_record.clone()
+        } else {
+            crate::environment::ResearchDirectoryRecord {
+                device: 1,
+                inode: 10,
+                owner: 3,
+                mode: 0o700,
+                mount_identity: [4, 5],
+            }
+        };
+        let loader_bytes = b"print('trainer')\n";
+        let loader_root_path = if working_directory == "." {
+            loader_path.to_owned()
+        } else {
+            format!("{working_directory}/{loader_path}")
+        };
+        let loader_parent_record = if working_directory == "." {
+            working_directory_record.clone()
+        } else {
+            crate::environment::ResearchDirectoryRecord {
+                device: 1,
+                inode: 11,
+                owner: 3,
+                mode: 0o700,
+                mount_identity: [4, 5],
+            }
+        };
+        let loader_file = source_authority_file(
+            &loader_root_path,
+            loader_bytes,
+            &root_record,
+            &loader_parent_record,
+            6,
+            7,
+        );
+        let loader_digest = loader_file.sha256.clone();
+        let loader_reference = format!("loader-source:{loader_digest}");
+        let mut candidates = Vec::new();
+        for (ordinal, bytes) in [(0_usize, b"checkpoint-zero".as_slice()), (1, b"checkpoint-one")] {
+            let path = format!(
+                ".pueue-agent/artifacts/{experiment_id}/checkpoint-{ordinal}.json"
+            );
+            let argv_path = if working_directory == "." {
+                path.clone()
+            } else {
+                path.strip_prefix(&format!("{working_directory}/"))
+                    .expect("source authority nested candidate path")
+                    .to_owned()
+            };
+            let file = source_authority_file(&path, bytes, &root_record, &root_record, 8 + ordinal as u64, 9 + ordinal as u64);
+            candidates.push(crate::research_checkpoint::CheckpointCandidateEvidenceV1 {
+                reference: format!("checkpoint:{experiment_id}:{ordinal}:{}", file.sha256),
+                source_experiment_id: experiment_id.clone(),
+                argv_path,
+                root_relative_path: path,
+                length: file.logical_bytes,
+                sha256: file.sha256.clone(),
+                file,
+            });
+        }
+        let candidate_reference = candidates[1].reference.clone();
+        let request = CheckpointRequest {
+            path: candidates[1].argv_path.clone(),
+            argv: vec![
+                argv[0].clone(),
+                loader_path.to_owned(),
+                "--resume".to_owned(),
+                candidates[1].argv_path.clone(),
+            ],
+            working_directory: working_directory.to_owned(),
+            support_evidence_refs: vec![loader_reference.clone(), candidate_reference.clone()],
+        };
+        let support = crate::research_checkpoint::CheckpointSupportEvidenceV1::Available {
+            support_version: crate::research_checkpoint::CHECKPOINT_SUPPORT_VERSION,
+            source_experiment_id: experiment_id.clone(),
+            source_proposal_id: proposal_id.clone(),
+            source_submission_id: submission_id.clone(),
+            normalized_working_directory: working_directory.to_owned(),
+            working_directory_record: working_directory_record.clone(),
+            loader_support: vec![crate::research_checkpoint::CheckpointLoaderEvidenceV1 {
+                reference: loader_reference,
+                role: crate::research_checkpoint::CheckpointLoaderRole::Entrypoint,
+                argv_index: 1,
+                argv_token: loader_path.to_owned(),
+                root_relative_path: loader_root_path,
+                length: loader_bytes.len() as u64,
+                sha256: loader_digest,
+                file: loader_file,
+                content: String::from_utf8(loader_bytes.to_vec()).expect("loader evidence text"),
+            }],
+            checkpoint_candidates: candidates,
+            candidates_complete: true,
+            candidates_omitted_at_least: 0,
+            candidate_limit: crate::research_checkpoint::MAX_CHECKPOINT_CANDIDATES,
+        };
+        let context = json!({
+            "schema_version": crate::research_evidence::RESEARCH_CONTEXT_SCHEMA_VERSION,
+            "facts": {
+                "review": {
+                    "review_id": review.review_id,
+                    "experiment_id": experiment_id,
+                    "task_signature": managed_task_signature,
+                },
+                "campaign": {"campaign_id": campaign_id},
+                "project": {"project_id": project_id},
+                "objective": {"digest": objective.digest},
+                "target": {
+                    "experiment_id": experiment_id,
+                    "pueue_task_id": live_task.id,
+                    "task_signature": managed_task_signature,
+                    "proposal_id": proposal_id,
+                    "submission_id": submission_id,
+                }
+            },
+            "operations": {"checkpoint_support": support}
+        });
+        let context_json = context.to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let response_json = json!({
+            "schema_version": 1,
+            "review_id": review.review_id,
+            "experiment_id": experiment_id,
+            "context_digest": context_digest,
+            "action": "resume_from_checkpoint",
+            "reason": "use the verified checkpoint evidence",
+            "evidence_refs": request.support_evidence_refs.clone(),
+            "notes": "verified support",
+            "checkpoint": request,
+        })
+        .to_string();
+        let native_recovery = connection
+            .query_row(
+                "SELECT json_extract(notes_json, '$.retry_history[0].native_recovery')
+                 FROM research_reviews WHERE review_id = ?1",
+                [&review.review_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("source authority native recovery");
+        let ready_notes = json!({
+            "native_recovery": serde_json::from_str::<Value>(&native_recovery)
+                .expect("source authority native recovery JSON"),
+            "planned_session_id": session_id,
+            "confirmed_session_id": session_id,
+            "session_binding": "confirmed",
+        })
+        .to_string();
+        connection
+            .execute(
+                "UPDATE campaign_research
+                 SET session_id = ?1, session_generation = 0
+                 WHERE campaign_id = ?2",
+                rusqlite::params![session_id, campaign_id],
+            )
+            .expect("source authority session");
+        connection
+            .execute(
+                "UPDATE events
+                 SET status = 'completed', lease_until = NULL,
+                     completed_at = 3_002
+                 WHERE event_id = ?1",
+                [event_id],
+            )
+            .expect("source authority completed event");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'ready', attempt = 1, operation_stage = NULL,
+                     agent_run_id = ?1, context_json = ?2, context_digest = ?3,
+                     response_json = ?4, termination_request_id = NULL,
+                     failure_code = NULL, notes_json = ?5, checkpoint_json = NULL,
+                     not_before = 3_003, finished_at = NULL, updated_at = 3_003
+                 WHERE review_id = ?6",
+                rusqlite::params![
+                    run.run_id,
+                    context_json,
+                    context_digest,
+                    response_json,
+                    ready_notes,
+                    review.review_id,
+                ],
+            )
+            .expect("source authority ready review");
+        drop(connection);
+
+        let mut connection = db.connect().expect("source authority action connection");
+        let transaction = connection
+            .transaction()
+            .expect("source authority action transaction");
+        let expected = ready_research_action_in_transaction(
+            &transaction,
+            &project_id,
+            &review.review_id,
+            &live_task,
+        )
+        .expect("source authority ready action query")
+        .expect("source authority ready action");
+        transaction.commit().expect("source authority action commit");
+
+        let source_authority = match checkpoint_source_authority_for_preparation(
+            &db,
+            &expected,
+            &request,
+        )
+        .expect("source authority preparation read")
+        {
+            CheckpointSourceAuthorityRead::Supported(authority) => authority,
+            CheckpointSourceAuthorityRead::Unsupported { reason } => {
+                panic!("source authority fixture unexpectedly unsupported: {reason}")
+            }
+        };
+        let selected = select_checkpoint_support(&source_authority.support, &request)
+            .expect("source authority selected support");
+        assert_eq!(selected.candidate.reference, candidate_reference);
+        let proposal_digest: String = db
+            .connect()
+            .expect("source authority proposal digest connection")
+            .query_row(
+                "SELECT canonical_digest FROM proposals WHERE proposal_id = ?1",
+                [&proposal_id],
+                |row| row.get(0),
+            )
+            .expect("source authority proposal digest");
+        let checkpoint = source_authority_prepared_checkpoint(
+            &expected,
+            &source_authority,
+            &request,
+            &proposal_digest,
+        );
+
+        SourceAuthorityFixture {
+            _temp: temp,
+            db,
+            project_id,
+            campaign_id,
+            experiment_id,
+            review_id: review.review_id,
+            proposal_id,
+            submission_id,
+            live_task,
+            wrapped_command,
+            request,
+            expected,
+            checkpoint,
+            candidate_reference,
+        }
+    }
+
+    fn source_authority_prepared_checkpoint(
+        expected: &ReadyResearchAction,
+        authority: &CheckpointSourceAuthority,
+        request: &CheckpointRequest,
+        proposal_digest: &str,
+    ) -> crate::research_checkpoint::PreparedCheckpoint {
+        let selected = select_checkpoint_support(&authority.support, request)
+            .expect("source authority checkpoint selection");
+        let source_argv = authority.source.proposal.argv.clone();
+        let delta = crate::research_checkpoint::validate_checkpoint_argv_delta(
+            &source_argv,
+            &request.argv,
+            &request.path,
+        )
+        .expect("source authority checkpoint argv delta");
+        let retained_path = format!(
+            "/private/state/research-checkpoints/{}/{}/checkpoint",
+            authority.source.campaign.campaign_id,
+            expected.owner.review_id
+        );
+        let mut retained_argv = request.argv.clone();
+        match delta.form() {
+            crate::research_checkpoint::CheckpointArgvDeltaForm::Pair => {
+                retained_argv[delta.index() + 1] = retained_path;
+            }
+            crate::research_checkpoint::CheckpointArgvDeltaForm::Equals => {
+                retained_argv[delta.index()] = format!("{}={retained_path}", delta.flag());
+            }
+        }
+        let retained_root = crate::environment::ResearchDirectoryRecord {
+            device: 11,
+            inode: 12,
+            owner: 3,
+            mode: 0o700,
+            mount_identity: [14, 15],
+        };
+        let retained_parent = crate::environment::ResearchDirectoryRecord {
+            device: 11,
+            inode: 13,
+            owner: 3,
+            mode: 0o700,
+            mount_identity: retained_root.mount_identity,
+        };
+        let response_digest = format!("{:x}", Sha256::digest(expected.response_json.as_bytes()));
+        crate::research_checkpoint::PreparedCheckpoint {
+            schema_version: crate::research_checkpoint::PREPARED_CHECKPOINT_VERSION,
+            project_id: authority.project.project_id.clone(),
+            campaign_id: authority.source.campaign.campaign_id.clone(),
+            review_id: expected.owner.review_id.clone(),
+            review_attempt: expected.owner.attempt,
+            review_session_generation: expected.owner.session_generation,
+            review_agent_run_id: expected.owner.agent_run_id.expect("fixture agent run"),
+            review_event_id: expected.owner.event_id.expect("fixture event"),
+            source_experiment_id: authority.source.experiment.experiment_id.clone(),
+            source_proposal_id: authority.source.proposal.proposal_id.clone(),
+            source_submission_id: authority.source.submission.submission_id.clone(),
+            source_task_id: expected.owner.source_task_id.expect("fixture source task"),
+            source_managed_task_signature: expected.owner.managed_task_signature.clone(),
+            source_raw_task_signature: expected.raw_task_signature.clone(),
+            context_digest: expected.context_digest.clone(),
+            response_digest,
+            campaign_objective_digest: expected.campaign_objective_digest.clone(),
+            source_proposal_canonical_digest: proposal_digest.to_owned(),
+            learning_spec_digest: crate::research_checkpoint::checkpoint_learning_spec_digest(
+                &source_argv,
+                &authority.source.proposal.working_directory,
+            )
+            .expect("fixture learning digest"),
+            source_runtime: crate::research_checkpoint::CheckpointSourceRuntimeV1::OriginalProjectRoot,
+            source_root_canonical_path: authority
+                .project
+                .root_path
+                .to_str()
+                .expect("fixture root path")
+                .to_owned(),
+            source_root_resolution_fingerprint: "fixture-root-fingerprint".to_owned(),
+            source_root_record: selected.loader.file.root.clone(),
+            source_working_directory_record: match &authority.support {
+                CheckpointSupportEvidenceV1::Available {
+                    working_directory_record,
+                    ..
+                } => working_directory_record.clone(),
+                CheckpointSupportEvidenceV1::Unavailable { .. } => {
+                    panic!("fixture support must be available")
+                }
+            },
+            support_version: crate::research_checkpoint::CHECKPOINT_SUPPORT_VERSION,
+            loader: selected.loader.clone(),
+            source_checkpoint: selected.candidate.clone(),
+            retained_checkpoint: crate::environment::ResearchFileRecord {
+                relative_path: format!(
+                    "research-checkpoints/{}/{}/checkpoint",
+                    authority.source.campaign.campaign_id,
+                    expected.owner.review_id
+                ),
+                root: retained_root.clone(),
+                parent: retained_parent,
+                device: 16,
+                inode: 17,
+                owner: 3,
+                mode: 0o600,
+                mount_identity: retained_root.mount_identity,
+                logical_bytes: selected.candidate.length,
+                allocated_bytes: 512,
+                sha256: selected.candidate.sha256.clone(),
+            },
+            source_argv,
+            source_working_directory: authority.source.proposal.working_directory.clone(),
+            request: request.clone(),
+            delta,
+            retained_argv,
+            successor_ids: crate::research_checkpoint::checkpoint_successor_ids(
+                &expected.owner.review_id,
+                expected.owner.attempt,
+            )
+            .expect("fixture successor IDs"),
+        }
+    }
+
+    fn assert_source_authority_fresh_error<F>(label: &str, mutate: F)
+    where
+        F: FnOnce(&mut SourceAuthorityFixture, &Connection),
+    {
+        let mut fixture = source_authority_fixture();
+        let connection = fixture
+            .db
+            .connect()
+            .expect("fresh source authority mutation connection");
+        mutate(&mut fixture, &connection);
+        let result = checkpoint_source_authority_for_ready_in_connection(
+            &connection,
+            &fixture.expected,
+            &fixture.request,
+        );
+        assert!(result.is_err(), "{label}: fresh source authority mutation unexpectedly passed");
+    }
+
+    #[test]
+    fn source_authority_fixture_proves_ready_available_and_codec_roundtrip() {
+        let fixture = source_authority_fixture();
+        assert_eq!(fixture.project_id, "source-authority-project");
+        assert_eq!(fixture.campaign_id, "source-authority-campaign");
+        assert_eq!(fixture.experiment_id, "source-authority-experiment");
+        assert_eq!(fixture.review_id, fixture.expected.owner.review_id);
+        assert_eq!(fixture.proposal_id, "source-authority-proposal");
+        assert_eq!(fixture.submission_id, "source-authority-submission");
+        assert_eq!(fixture.live_task.id, 41);
+        assert_eq!(fixture.expected.owner.source_task_id, Some(41));
+        assert!(fixture.expected.answer.checkpoint.is_some());
+        let support = checkpoint_support_from_persisted_context(
+            &fixture.expected.context_json,
+            &fixture.expected.context_digest,
+        )
+        .expect("fixture persisted support");
+        let selected = select_checkpoint_support(&support, &fixture.request)
+            .expect("fixture candidate selection");
+        assert_eq!(selected.candidate.reference, fixture.candidate_reference);
+        assert!(selected.candidate.reference.starts_with(
+            "checkpoint:source-authority-experiment:1:"
+        ));
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
+            &fixture.checkpoint,
+        )
+        .expect("fixture prepared checkpoint serialization");
+        assert_eq!(
+            crate::research_checkpoint::parse_prepared_checkpoint(&encoded)
+                .expect("fixture prepared checkpoint parsing"),
+            fixture.checkpoint
+        );
+        let fresh = checkpoint_source_authority_for_preparation(
+            &fixture.db,
+            &fixture.expected,
+            &fixture.request,
+        )
+        .expect("fixture fresh source authority");
+        let CheckpointSourceAuthorityRead::Supported(fresh) = fresh else {
+            panic!("fixture source authority unexpectedly unsupported")
+        };
+        assert_eq!(fresh.observation.command, vec![fixture.wrapped_command]);
+
+        let connection = fixture
+            .db
+            .connect()
+            .expect("fixture caller source authority connection");
+        let caller = checkpoint_source_authority_for_ready_in_connection(
+            &connection,
+            &fixture.expected,
+            &fixture.request,
+        )
+        .expect("fixture caller source authority");
+        assert!(matches!(
+            caller,
+            CheckpointSourceAuthorityRead::Supported(_)
+        ));
+    }
+
+    #[test]
+    fn source_authority_fresh_reader_rejects_owner_mutation_and_ambiguous_latest() {
+        let fixture = source_authority_fixture();
+        let connection = fixture
+            .db
+            .connect()
+            .expect("fresh mutation source authority connection");
+        connection
+            .execute(
+                "UPDATE research_reviews SET operation_stage = 'intent'
+                 WHERE review_id = ?1",
+                [&fixture.review_id],
+            )
+            .expect("fresh mutation operation stage");
+        let owner_mutation = checkpoint_source_authority_for_ready_in_connection(
+            &connection,
+            &fixture.expected,
+            &fixture.request,
+        );
+        assert!(matches!(
+            owner_mutation,
+            Err(AppError::Validation {
+                field: "research.review",
+                ..
+            })
+        ));
+        connection
+            .execute(
+                "UPDATE research_reviews SET operation_stage = NULL
+                 WHERE review_id = ?1",
+                [&fixture.review_id],
+            )
+            .expect("restore fresh mutation operation stage");
+
+        let mut ambiguous_task = fixture.live_task.clone();
+        ambiguous_task.started_at = Some("1001".to_owned());
+        let ambiguous_signature = task_signature(&ambiguous_task);
+        TaskObservationRepository::new(&fixture.db)
+            .upsert(&NewTaskObservation::new(
+                &fixture.project_id,
+                &ambiguous_signature,
+                ambiguous_task.id,
+                &ambiguous_task.group,
+                vec![fixture.wrapped_command.clone()],
+                "Running",
+                Some(900),
+                Some(1_001),
+                None,
+                None,
+                1_001,
+            ))
+            .expect("fresh mutation ambiguous observation");
+        let ambiguous = checkpoint_source_authority_for_ready_in_connection(
+            &connection,
+            &fixture.expected,
+            &fixture.request,
+        );
+        assert!(matches!(
+            ambiguous,
+            Err(AppError::Validation {
+                field: "task_signature",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn source_authority_fresh_reader_rejects_graph_phase_and_observation_mutations() {
+        assert_source_authority_fresh_error("proposal fields", |fixture, connection| {
+            connection
+                .execute(
+                    "UPDATE proposals SET hypothesis = ?1 WHERE proposal_id = ?2",
+                    rusqlite::params!["changed hypothesis", fixture.proposal_id],
+                )
+                .unwrap();
+        });
+        assert_source_authority_fresh_error("submission argv", |fixture, connection| {
+            connection
+                .execute(
+                    "UPDATE submissions SET argv_json = ?1 WHERE submission_id = ?2",
+                    rusqlite::params![
+                        serde_json::to_string(&vec!["python", "other.py"]).unwrap(),
+                        fixture.submission_id
+                    ],
+                )
+                .unwrap();
+        });
+        assert_source_authority_fresh_error("submission metadata", |fixture, connection| {
+            connection
+                .execute(
+                    "UPDATE submissions SET metadata_json = ?1 WHERE submission_id = ?2",
+                    rusqlite::params!["{}", fixture.submission_id],
+                )
+                .unwrap();
+        });
+        assert_source_authority_fresh_error("graph ids", |fixture, _connection| {
+            fixture.expected.owner.campaign_id = "wrong-campaign".to_owned();
+        });
+        assert_source_authority_fresh_error("context digest", |fixture, connection| {
+            connection
+                .execute(
+                    "UPDATE research_reviews SET context_digest = ?1 WHERE review_id = ?2",
+                    rusqlite::params!["b".repeat(64), fixture.review_id],
+                )
+                .unwrap();
+        });
+        assert_source_authority_fresh_error("response bytes", |fixture, connection| {
+            connection
+                .execute(
+                    "UPDATE research_reviews SET response_json = ?1 WHERE review_id = ?2",
+                    rusqlite::params!["{}", fixture.review_id],
+                )
+                .unwrap();
+        });
+        assert_source_authority_fresh_error("request path", |fixture, _connection| {
+            fixture.request.path = "wrong-path".to_owned();
+        });
+        assert_source_authority_fresh_error("review phase", |fixture, connection| {
+            connection
+                .execute(
+                    "UPDATE research_reviews SET state = 'completed' WHERE review_id = ?1",
+                    [&fixture.review_id],
+                )
+                .unwrap();
+        });
+        assert_source_authority_fresh_error("checkpoint column", |fixture, connection| {
+            connection
+                .execute(
+                    "UPDATE research_reviews SET checkpoint_json = ?1 WHERE review_id = ?2",
+                    rusqlite::params!["{}", fixture.review_id],
+                )
+                .unwrap();
+        });
+        assert_source_authority_fresh_error("successor link", |fixture, connection| {
+            connection
+                .execute(
+                "UPDATE research_reviews SET successor_experiment_id = ?1
+                     WHERE review_id = ?2",
+                    rusqlite::params![fixture.experiment_id, fixture.review_id],
+                )
+                .unwrap();
+        });
+        assert_source_authority_fresh_error("raw signature", |fixture, _connection| {
+            fixture.expected.raw_task_signature = "wrong-raw-signature".to_owned();
+        });
+        assert_source_authority_fresh_error("managed signature", |fixture, _connection| {
+            fixture.expected.owner.managed_task_signature = "wrong-managed-signature".to_owned();
+        });
+        assert_source_authority_fresh_error("observation group", |fixture, connection| {
+            connection
+                .execute(
+                    "UPDATE task_observations SET pueue_group = 'wrong-group'
+                     WHERE project_id = ?1 AND task_signature = ?2",
+                    rusqlite::params![
+                        fixture.project_id,
+                        fixture.expected.raw_task_signature
+                    ],
+                )
+                .unwrap();
+        });
+        assert_source_authority_fresh_error("stale latest observation", |fixture, _connection| {
+            let terminal_task = PueueTask {
+                state: "Succeeded".to_owned(),
+                ended_at: Some("1_100".to_owned()),
+                ..fixture.live_task.clone()
+            };
+            let terminal_signature = task_signature(&terminal_task);
+            TaskObservationRepository::new(&fixture.db)
+                .upsert(&NewTaskObservation::new(
+                    &fixture.project_id,
+                    &terminal_signature,
+                    terminal_task.id,
+                    &terminal_task.group,
+                    vec![fixture.wrapped_command.clone()],
+                    "Succeeded",
+                    terminal_task
+                        .enqueued_at
+                        .as_deref()
+                        .and_then(|value| value.parse().ok()),
+                    terminal_task
+                        .started_at
+                        .as_deref()
+                        .and_then(|value| value.parse().ok()),
+                    terminal_task
+                        .ended_at
+                        .as_deref()
+                        .and_then(|value| value.parse().ok()),
+                    Some("0".to_owned()),
+                    1_100,
+                ))
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn source_authority_fresh_reader_accepts_pueue_task_zero() {
+        let fixture = source_authority_fixture_with_layout(0, ".", "train.py");
+        let result = checkpoint_source_authority_for_preparation(
+            &fixture.db,
+            &fixture.expected,
+            &fixture.request,
+        )
+        .expect("task zero source authority");
+        assert!(matches!(
+            result,
+            CheckpointSourceAuthorityRead::Supported(_)
+        ));
+    }
+
+    #[test]
+    fn source_authority_preparation_then_new_caller_snapshot_rejects_mutation() {
+        let fixture = source_authority_fixture();
+        let prepared = checkpoint_source_authority_for_preparation(
+            &fixture.db,
+            &fixture.expected,
+            &fixture.request,
+        )
+        .expect("prepared source authority");
+        assert!(matches!(
+            prepared,
+            CheckpointSourceAuthorityRead::Supported(_)
+        ));
+
+        let mut connection = fixture
+            .db
+            .connect()
+            .expect("caller mutation connection");
+        connection
+            .execute(
+                "UPDATE research_reviews SET response_json = ?1 WHERE review_id = ?2",
+                rusqlite::params!["mutated-response", fixture.review_id],
+            )
+            .expect("caller mutation response");
+        let transaction = connection
+            .transaction()
+            .expect("caller mutation transaction");
+        let reread = checkpoint_source_authority_for_ready_in_connection(
+            &transaction,
+            &fixture.expected,
+            &fixture.request,
+        );
+        assert!(matches!(reread, Err(AppError::Validation { .. })));
+        transaction.rollback().expect("caller mutation rollback");
+    }
+
+    #[test]
+    fn source_authority_prior_source_checks_command_before_unsupported() {
+        let fixture = source_authority_fixture();
+        let objective_digest = "a".repeat(64);
+        let prior_argv = vec![
+            "python".to_owned(),
+            "train.py".to_owned(),
+            "--steps".to_owned(),
+            "200".to_owned(),
+        ];
+        let prior = proposals::validate_initial_baseline(
+            ProposalInput {
+                kind: ProposalKind::Experiment,
+                hypothesis: "tokenized source authority baseline".to_owned(),
+                source_experiment_id: None,
+                argv: prior_argv.clone(),
+                working_directory: ".".to_owned(),
+                expected_evidence: vec!["loss".to_owned()],
+            },
+            &objective_digest,
+        )
+        .expect("prior source proposal");
+        let argv_json = serde_json::to_string(&prior_argv).expect("prior source argv JSON");
+        let connection = fixture
+            .db
+            .connect()
+            .expect("prior source authority connection");
+        connection
+            .execute(
+                "UPDATE experiments SET resume_of_experiment_id = ?1
+                 WHERE experiment_id = ?1",
+                [&fixture.experiment_id],
+            )
+            .expect("prior source lineage update");
+
+        let coherent_unsupported = checkpoint_source_authority_for_preparation(
+            &fixture.db,
+            &fixture.expected,
+            &fixture.request,
+        )
+        .expect("coherent prior source authority");
+        assert!(matches!(
+            coherent_unsupported,
+            CheckpointSourceAuthorityRead::Unsupported { .. }
+        ));
+
+        connection
+            .execute(
+                "UPDATE proposals
+                 SET argv_json = ?1, canonical_digest = ?2
+                 WHERE proposal_id = ?3",
+                rusqlite::params![argv_json, prior.canonical_digest(), fixture.proposal_id],
+            )
+            .expect("prior source proposal update");
+        connection
+            .execute(
+                "UPDATE submissions SET argv_json = ?1 WHERE submission_id = ?2",
+                rusqlite::params![
+                    serde_json::to_string(&prior_argv).unwrap(),
+                    fixture.submission_id
+                ],
+            )
+            .expect("prior source submission update");
+
+        let corrupt = checkpoint_source_authority_for_ready_in_connection(
+            &connection,
+            &fixture.expected,
+            &fixture.request,
+        );
+        assert!(matches!(
+            corrupt,
+            Err(AppError::Validation {
+                field: "task_observation.command",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn source_authority_fresh_reader_classifies_unavailable_support() {
+        let mut fixture = source_authority_fixture();
+        let mut context: Value = serde_json::from_str(&fixture.expected.context_json)
+            .expect("unavailable source context");
+        context["operations"]["checkpoint_support"] = serde_json::to_value(
+            CheckpointSupportEvidenceV1::Unavailable {
+                support_version: crate::research_checkpoint::CHECKPOINT_SUPPORT_VERSION,
+                reason: "fixture unavailable".to_owned(),
+                loader_support: Vec::new(),
+                checkpoint_candidates: Vec::new(),
+                candidates_complete: false,
+                candidates_omitted_at_least: 0,
+                candidate_limit: crate::research_checkpoint::MAX_CHECKPOINT_CANDIDATES,
+            },
+        )
+        .expect("unavailable source support JSON");
+        let context_json = context.to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let mut response: Value = serde_json::from_str(&fixture.expected.response_json)
+            .expect("unavailable source response");
+        response["context_digest"] = Value::String(context_digest.clone());
+        let response_json = response.to_string();
+        let answer = parse_research_answer(response_json.as_bytes())
+            .expect("unavailable source answer");
+        fixture.expected.context_json = context_json.clone();
+        fixture.expected.context_digest = context_digest.clone();
+        fixture.expected.response_json = response_json.clone();
+        fixture.expected.answer = answer;
+        let connection = fixture
+            .db
+            .connect()
+            .expect("unavailable source connection");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET context_json = ?1, context_digest = ?2, response_json = ?3
+                 WHERE review_id = ?4",
+                rusqlite::params![
+                    context_json,
+                    context_digest,
+                    response_json,
+                    fixture.review_id
+                ],
+            )
+            .expect("unavailable source persisted proof");
+        let result = checkpoint_source_authority_for_ready_in_connection(
+            &connection,
+            &fixture.expected,
+            &fixture.request,
+        )
+        .expect("unavailable source classification");
+        match result {
+            CheckpointSourceAuthorityRead::Unsupported { reason } => {
+                assert_eq!(reason, "fixture unavailable")
+            }
+            CheckpointSourceAuthorityRead::Supported(_) => {
+                panic!("unavailable source was treated as supported")
+            }
+        }
+    }
+
+    #[test]
+    fn source_authority_fresh_reader_rejects_valid_but_wrong_loader_record() {
+        let mut fixture = source_authority_fixture();
+        let connection = fixture
+            .db
+            .connect()
+            .expect("wrong loader prior source connection");
+        connection
+            .execute(
+                "UPDATE experiments SET resume_of_experiment_id = ?1
+                 WHERE experiment_id = ?1",
+                [&fixture.experiment_id],
+            )
+            .expect("wrong loader prior source lineage");
+        let mut context: Value = serde_json::from_str(&fixture.expected.context_json)
+            .expect("wrong loader source context");
+        let loader = &mut context["operations"]["checkpoint_support"]["loader_support"][0];
+        loader["argv_token"] = Value::String("trainer.py".to_owned());
+        loader["root_relative_path"] = Value::String("trainer.py".to_owned());
+        loader["file"]["relative_path"] = Value::String("trainer.py".to_owned());
+        let context_json = context.to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let mut response: Value = serde_json::from_str(&fixture.expected.response_json)
+            .expect("wrong loader source response");
+        response["context_digest"] = Value::String(context_digest.clone());
+        let response_json = response.to_string();
+        fixture.expected.context_json = context_json.clone();
+        fixture.expected.context_digest = context_digest.clone();
+        fixture.expected.response_json = response_json.clone();
+        fixture.expected.answer = parse_research_answer(response_json.as_bytes())
+            .expect("wrong loader source answer");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET context_json = ?1, context_digest = ?2, response_json = ?3
+                 WHERE review_id = ?4",
+                rusqlite::params![
+                    context_json,
+                    context_digest,
+                    response_json,
+                    fixture.review_id
+                ],
+            )
+            .expect("wrong loader source persisted proof");
+        let result = checkpoint_source_authority_for_ready_in_connection(
+            &connection,
+            &fixture.expected,
+            &fixture.request,
+        );
+        assert!(matches!(
+            result,
+            Err(AppError::Validation {
+                field: "checkpoint_support.loader",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn source_authority_fresh_reader_classifies_candidate_runtime_before_source_checks() {
+        let mut fixture = source_authority_fixture();
+        let revision = "a".repeat(64);
+        let mut candidate_task = fixture.live_task.clone();
+        candidate_task.command = format!("{} --candidate-runtime", fixture.wrapped_command);
+        let candidate_managed_signature = managed_task_run_signature(&candidate_task)
+            .expect("candidate managed task signature");
+        let mut context: Value = serde_json::from_str(&fixture.expected.context_json)
+            .expect("candidate source context");
+        context["facts"]["review"]["task_signature"] =
+            Value::String(candidate_managed_signature.clone());
+        context["facts"]["target"]["task_signature"] =
+            Value::String(candidate_managed_signature.clone());
+        let context_json = context.to_string();
+        let context_digest = format!("{:x}", Sha256::digest(context_json.as_bytes()));
+        let mut response: Value = serde_json::from_str(&fixture.expected.response_json)
+            .expect("candidate source response");
+        response["context_digest"] = Value::String(context_digest.clone());
+        let response_json = response.to_string();
+        fixture.expected.owner.managed_task_signature = candidate_managed_signature.clone();
+        fixture.expected.context_json = context_json.clone();
+        fixture.expected.context_digest = context_digest.clone();
+        fixture.expected.response_json = response_json.clone();
+        fixture.expected.answer = parse_research_answer(response_json.as_bytes())
+            .expect("candidate source answer");
+        let connection = fixture
+            .db
+            .connect()
+            .expect("candidate source connection");
+        connection
+            .execute(
+                "UPDATE experiments SET code_revision_sha = ?1, task_signature = ?2
+                 WHERE experiment_id = ?3",
+                rusqlite::params![revision, candidate_managed_signature, fixture.experiment_id],
+            )
+            .expect("candidate source revision");
+        connection
+            .execute(
+                "UPDATE submissions SET task_signature = ?1 WHERE submission_id = ?2",
+                rusqlite::params![candidate_managed_signature, fixture.submission_id],
+            )
+            .expect("candidate source submission signature");
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET task_signature = ?1, context_json = ?2, context_digest = ?3,
+                     response_json = ?4
+                 WHERE review_id = ?5",
+                rusqlite::params![
+                    candidate_managed_signature,
+                    context_json,
+                    context_digest,
+                    response_json,
+                    fixture.review_id
+                ],
+            )
+            .expect("candidate source review identity");
+        connection
+            .execute(
+                "UPDATE task_observations SET command_json = ?1
+                 WHERE project_id = ?2 AND task_signature = ?3",
+                rusqlite::params![
+                    serde_json::to_string(&vec![candidate_task.command]).unwrap(),
+                    fixture.project_id,
+                    fixture.expected.raw_task_signature
+                ],
+            )
+            .expect("candidate source observation command");
+        let result = checkpoint_source_authority_for_ready_in_connection(
+            &connection,
+            &fixture.expected,
+            &fixture.request,
+        )
+        .expect("candidate source classification");
+        assert!(matches!(
+            result,
+            CheckpointSourceAuthorityRead::Unsupported { .. }
+        ));
+    }
+
+    fn store_historical_checkpoint(fixture: &SourceAuthorityFixture, serialized: &str) {
+        let connection = fixture.db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', checkpoint_json = ?1,
+                     finished_at = 4_000, updated_at = 4_000
+                 WHERE review_id = ?2",
+                rusqlite::params![serialized, fixture.review_id],
+            )
+            .unwrap();
+    }
+
+    fn store_historical_checkpoint_blob(fixture: &SourceAuthorityFixture, bytes: &[u8]) {
+        let connection = fixture.db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE research_reviews
+                 SET state = 'completed', checkpoint_json = ?1,
+                     finished_at = 4_000, updated_at = 4_000
+                 WHERE review_id = ?2",
+                rusqlite::params![bytes, fixture.review_id],
+            )
+            .unwrap();
+    }
+
+    fn stored_checkpoint_json(fixture: &SourceAuthorityFixture) -> String {
+        fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT checkpoint_json FROM research_reviews WHERE review_id = ?1",
+                [&fixture.review_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn read_historical_checkpoint(
+        fixture: &SourceAuthorityFixture,
+        checkpoint: &crate::research_checkpoint::PreparedCheckpoint,
+    ) -> Result<CheckpointSourceAuthority, AppError> {
+        let connection = fixture.db.connect()?;
+        prepared_checkpoint_source_authority_in_connection(&connection, checkpoint)
+    }
+
+    #[test]
+    fn source_authority_historical_reader_uses_stored_strict_checkpoint_and_ordinal_one() {
+        let fixture = source_authority_fixture();
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
+            &fixture.checkpoint,
+        )
+        .unwrap();
+        store_historical_checkpoint(&fixture, &encoded);
+
+        assert_eq!(stored_checkpoint_json(&fixture), encoded);
+        assert_eq!(
+            crate::research_checkpoint::parse_prepared_checkpoint(&stored_checkpoint_json(
+                &fixture,
+            ))
+            .unwrap(),
+            fixture.checkpoint
+        );
+        let authority = read_historical_checkpoint(&fixture, &fixture.checkpoint).unwrap();
+        let selected = select_checkpoint_support(&authority.support, &fixture.checkpoint.request)
+            .unwrap();
+        assert_eq!(selected.candidate.reference, fixture.candidate_reference);
+        assert!(selected
+            .candidate
+            .reference
+            .starts_with("checkpoint:source-authority-experiment:1:"));
+    }
+
+    #[test]
+    fn source_authority_historical_reader_keeps_captured_running_source_after_closed_gates() {
+        let fixture = source_authority_fixture();
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
+            &fixture.checkpoint,
+        )
+        .unwrap();
+        store_historical_checkpoint(&fixture, &encoded);
+
+        let terminal_task = PueueTask {
+            state: "Succeeded".to_owned(),
+            ended_at: Some("3_500".to_owned()),
+            ..fixture.live_task.clone()
+        };
+        let terminal_signature = task_signature(&terminal_task);
+        let connection = fixture.db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE experiments SET status = 'succeeded', finished_at = 3_500
+                 WHERE experiment_id = ?1",
+                [&fixture.experiment_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE campaigns SET state = 'paused', state_reason = 'historical_fixture',
+                         updated_at = 3_501
+                 WHERE campaign_id = ?1",
+                [&fixture.campaign_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE projects SET enabled = 0, paused = 1, halted_reason = 'historical_fixture',
+                         updated_at = 3_502
+                 WHERE project_id = ?1",
+                [&fixture.project_id],
+            )
+            .unwrap();
+        drop(connection);
+        TaskObservationRepository::new(&fixture.db)
+            .upsert(&NewTaskObservation::new(
+                &fixture.project_id,
+                &terminal_signature,
+                terminal_task.id,
+                &terminal_task.group,
+                vec![fixture.wrapped_command.clone()],
+                "Succeeded",
+                terminal_task
+                    .enqueued_at
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
+                terminal_task
+                    .started_at
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
+                terminal_task
+                    .ended_at
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
+                Some("0".to_owned()),
+                4_001,
+            ))
+            .unwrap();
+
+        let authority = read_historical_checkpoint(&fixture, &fixture.checkpoint).unwrap();
+        assert_eq!(
+            authority.observation.task_signature,
+            fixture.checkpoint.source_raw_task_signature
+        );
+        assert_eq!(authority.observation.state, "Running");
+        assert_eq!(authority.source.experiment.status, ExperimentStatus::Succeeded);
+        assert_eq!(authority.source.campaign.state, CampaignState::Paused);
+        assert!(!authority.project.enabled);
+        assert!(authority.project.paused);
+        assert_eq!(
+            authority.project.halted_reason.as_deref(),
+            Some("historical_fixture")
+        );
+    }
+
+    #[test]
+    fn source_authority_historical_reader_rejects_immutable_mutations_and_invalid_stored_checkpoint() {
+        let fixture = source_authority_fixture();
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
+            &fixture.checkpoint,
+        )
+        .unwrap();
+        store_historical_checkpoint(&fixture, &encoded);
+        let connection = fixture.db.connect().unwrap();
+        let changed_argv = serde_json::to_string(&vec!["python", "changed.py"]).unwrap();
+        connection
+            .execute(
+                "UPDATE proposals SET argv_json = ?1 WHERE proposal_id = ?2",
+                rusqlite::params![changed_argv, fixture.proposal_id],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(read_historical_checkpoint(&fixture, &fixture.checkpoint).is_err());
+
+        let fixture = source_authority_fixture();
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
+            &fixture.checkpoint,
+        )
+        .unwrap();
+        store_historical_checkpoint(&fixture, &encoded);
+        let connection = fixture.db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE task_observations SET state = 'Succeeded'
+                 WHERE project_id = ?1 AND task_signature = ?2",
+                rusqlite::params![
+                    fixture.project_id,
+                    fixture.checkpoint.source_raw_task_signature
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(read_historical_checkpoint(&fixture, &fixture.checkpoint).is_err());
+
+        let fixture = source_authority_fixture();
+        store_historical_checkpoint(&fixture, "{");
+        assert!(read_historical_checkpoint(&fixture, &fixture.checkpoint).is_err());
+
+        let fixture = source_authority_fixture();
+        let blob = b"not-a-text-checkpoint".to_vec();
+        store_historical_checkpoint_blob(&fixture, &blob);
+        let stored: (String, Vec<u8>) = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT typeof(checkpoint_json), CAST(checkpoint_json AS BLOB)
+                 FROM research_reviews WHERE review_id = ?1",
+                [&fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("blob".to_owned(), blob.clone()));
+        assert!(read_historical_checkpoint(&fixture, &fixture.checkpoint).is_err());
+        let after: (String, Vec<u8>) = fixture
+            .db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT typeof(checkpoint_json), CAST(checkpoint_json AS BLOB)
+                 FROM research_reviews WHERE review_id = ?1",
+                [&fixture.review_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, stored);
+
+        let fixture = source_authority_fixture();
+        let oversized = "x".repeat(crate::research_checkpoint::MAX_PREPARED_CHECKPOINT_BYTES + 1);
+        store_historical_checkpoint(&fixture, &oversized);
+        assert!(read_historical_checkpoint(&fixture, &fixture.checkpoint).is_err());
+
+        let fixture = source_authority_fixture();
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
+            &fixture.checkpoint,
+        )
+        .unwrap();
+        store_historical_checkpoint(&fixture, &encoded);
+        let mut supplied = fixture.checkpoint.clone();
+        supplied.response_digest = "b".repeat(64);
+        let supplied_encoded = crate::research_checkpoint::serialize_prepared_checkpoint(&supplied)
+            .unwrap();
+        assert_eq!(
+            crate::research_checkpoint::parse_prepared_checkpoint(&supplied_encoded).unwrap(),
+            supplied
+        );
+        assert_ne!(supplied_encoded, encoded);
+        assert!(read_historical_checkpoint(&fixture, &supplied).is_err());
+    }
+
+    #[test]
+    fn source_authority_historical_reader_accepts_whitespace_checkpoint_without_rewriting_bytes() {
+        let fixture = source_authority_fixture();
+        let encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
+            &fixture.checkpoint,
+        )
+        .unwrap();
+        let whitespace_encoded = format!(" \n\t{encoded}\n");
+        store_historical_checkpoint(&fixture, &whitespace_encoded);
+        assert_eq!(stored_checkpoint_json(&fixture), whitespace_encoded);
+
+        let authority = read_historical_checkpoint(&fixture, &fixture.checkpoint).unwrap();
+        assert_eq!(authority.source.experiment.experiment_id, fixture.experiment_id);
+        assert_eq!(stored_checkpoint_json(&fixture), whitespace_encoded);
+    }
+
+    #[test]
+    fn source_authority_historical_reader_rejects_nested_cwd_record_mutation_after_codec_roundtrip() {
+        let fixture = source_authority_nested_fixture();
+        let baseline_encoded = crate::research_checkpoint::serialize_prepared_checkpoint(
+            &fixture.checkpoint,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::research_checkpoint::parse_prepared_checkpoint(&baseline_encoded).unwrap(),
+            fixture.checkpoint
+        );
+        store_historical_checkpoint(&fixture, &baseline_encoded);
+        assert_eq!(
+            crate::research_checkpoint::parse_prepared_checkpoint(&stored_checkpoint_json(
+                &fixture,
+            ))
+            .unwrap(),
+            fixture.checkpoint
+        );
+        let baseline = read_historical_checkpoint(&fixture, &fixture.checkpoint).unwrap();
+        assert_eq!(
+            baseline.source.proposal.working_directory,
+            ".pueue-agent"
+        );
+
+        let mut mutated = fixture.checkpoint.clone();
+        let mut mutated_cwd = mutated.source_working_directory_record.clone();
+        mutated_cwd.inode += 1;
+        mutated.source_working_directory_record = mutated_cwd.clone();
+        let mutated_encoded = crate::research_checkpoint::serialize_prepared_checkpoint(&mutated)
+            .unwrap();
+        assert_eq!(
+            crate::research_checkpoint::parse_prepared_checkpoint(&mutated_encoded).unwrap(),
+            mutated
+        );
+        store_historical_checkpoint(&fixture, &mutated_encoded);
+        assert_eq!(
+            crate::research_checkpoint::parse_prepared_checkpoint(&stored_checkpoint_json(
+                &fixture,
+            ))
+            .unwrap(),
+            mutated
+        );
+        assert!(read_historical_checkpoint(&fixture, &mutated).is_err());
     }
 }

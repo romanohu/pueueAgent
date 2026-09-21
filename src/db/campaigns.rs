@@ -4903,7 +4903,7 @@ fn read_intent_by_proposal(
     read_intent_by_experiment(connection, &experiment_id)
 }
 
-fn read_intent_by_experiment(
+pub(super) fn read_intent_by_experiment(
     connection: &Connection,
     experiment_id: &str,
 ) -> Result<ManagedSubmissionIntent, AppError> {
