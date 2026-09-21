@@ -4665,9 +4665,18 @@ async fn research_fake_protocol_parses_all_actions_from_real_available_support()
         "train.py",
         b"# durable trainer source\nprint('ok')\n",
         &[
-            ("first.json", b"first checkpoint"),
-            ("second.json", b"second checkpoint"),
+            ("step-0.json", b"zero checkpoint"),
+            ("step-1.json", b"positive checkpoint"),
         ],
+    );
+    harness.rewrite_target_command(
+        &[
+            "python",
+            "train.py",
+            "--checkpoint-dir",
+            ".pueue-agent/artifacts",
+        ],
+        ".",
     );
 
     let (started, review) = harness.run_policy_evidence_attempt().await;
@@ -4679,15 +4688,30 @@ async fn research_fake_protocol_parses_all_actions_from_real_available_support()
         .as_str()
         .unwrap()
         .to_owned();
-    let candidate = &support["checkpoint_candidates"][0];
+    let candidate = support["checkpoint_candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| {
+            candidate["argv_path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("step-1.json"))
+        })
+        .expect("positive checkpoint candidate must be present");
     let candidate_reference = candidate["reference"].as_str().unwrap().to_owned();
     let candidate_path = candidate["argv_path"].as_str().unwrap().to_owned();
-    let target_argv = context["facts"]["target"]["argv"].as_array().unwrap();
-    let expected_resume_argv = target_argv
-        .iter()
-        .map(|value| value.as_str().unwrap().to_owned())
-        .chain(["--resume".to_owned(), candidate_path.clone()])
-        .collect::<Vec<_>>();
+    assert_eq!(
+        context["facts"]["target"]["argv"],
+        serde_json::json!(["python", "train.py", "--checkpoint-dir", "[path]"])
+    );
+    let expected_resume_argv = vec![
+        "python".to_owned(),
+        "train.py".to_owned(),
+        "--checkpoint-dir".to_owned(),
+        ".pueue-agent/artifacts".to_owned(),
+        "--resume".to_owned(),
+        candidate_path.clone(),
+    ];
     let context_json = review.context_json.clone().unwrap();
     let context_digest = review.context_digest.clone().unwrap();
 

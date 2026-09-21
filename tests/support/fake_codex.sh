@@ -260,6 +260,7 @@ run_research_fixture() {
   local next_direction_json='null'
   local candidate_path
   local candidate_ref
+  local candidate_json
   local loader_ref
   local target_argv_json
   local checkpoint_argv_json
@@ -359,9 +360,19 @@ run_research_fixture() {
     next_direction_json="$(jq -cn --arg value "$next_direction" '$value')"
   elif [ "$action" = "resume_from_checkpoint" ]; then
     loader_ref="$(printf '%s' "$context" | jq -er '.operations.checkpoint_support.loader_support[0].reference')"
-    candidate_ref="$(printf '%s' "$context" | jq -er '.operations.checkpoint_support.checkpoint_candidates[0].reference')"
-    candidate_path="$(printf '%s' "$context" | jq -er '.operations.checkpoint_support.checkpoint_candidates[0].argv_path')"
+    candidate_json="$(printf '%s' "$context" | jq -ec '.operations.checkpoint_support.checkpoint_candidates | map(select(.argv_path | test("(^|/)step-[1-9][0-9]*[.]json$"))) | .[0]')"
+    candidate_ref="$(printf '%s' "$candidate_json" | jq -er '.reference')"
+    candidate_path="$(printf '%s' "$candidate_json" | jq -er '.argv_path')"
     target_argv_json="$(printf '%s' "$context" | jq -ec '.facts.target.argv')"
+    target_argv_json="$(printf '%s' "$target_argv_json" | jq -ec '
+      . as $argv
+      | reduce range(0; ($argv | length)) as $index
+          ([]; . + [if $index > 0
+                     and $argv[$index - 1] == "--checkpoint-dir"
+                     and $argv[$index] == "[path]"
+                   then ".pueue-agent/artifacts"
+                   else $argv[$index]
+                   end])')"
     checkpoint_argv_json="$(printf '%s' "$target_argv_json" | jq -ec --arg path "$candidate_path" '. + ["--resume", $path]')"
     working_directory="$(printf '%s' "$context" | jq -er '.facts.target.working_directory // "."')"
     support_refs_json="$(jq -cn --arg loader "$loader_ref" --arg candidate "$candidate_ref" '[$loader, $candidate]')"

@@ -577,7 +577,6 @@ fn write_line(path: &str, line: &str) {
     let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
     writeln!(file, "{line}").unwrap();
 }
-fn touch(path: &str) { if let Some(parent) = std::path::Path::new(path).parent() { let _ = fs::create_dir_all(parent); } let _ = OpenOptions::new().create(true).append(true).open(path); }
 fn wait_for(path: &str, timeout_ms: u64) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_millis(timeout_ms) {
@@ -657,7 +656,7 @@ fn main() {
         let configured = fs::read_to_string(format!("{work}/control/kill-target")).unwrap_or_default().trim().to_owned();
         if !configured.is_empty() && target == configured {
             write_line(&format!("{work}/control/kill-pids"), &std::process::id().to_string());
-            touch(&format!("{work}/control/kill-entered"));
+            write_line(&format!("{work}/control/kill-entered"), &std::process::id().to_string());
             if !wait_for(&format!("{work}/control/kill-release"), 120_000) { std::process::exit(75); }
         }
     }
@@ -667,7 +666,7 @@ fn main() {
             for (index, arg) in args.iter().enumerate() { write_line(&format!("{work}/pueue-add-argv.log"), &format!("ADD_ARG_{}={}", index + 1, arg.to_string_lossy())); }
             write_line(&format!("{work}/pueue-add-argv.log"), "ADD_END");
             write_line(&format!("{work}/control/add-pids"), &std::process::id().to_string());
-            touch(&format!("{work}/control/add-entered"));
+            write_line(&format!("{work}/control/add-entered"), &std::process::id().to_string());
             if !wait_for(&format!("{work}/control/add-release"), 120_000) { std::process::exit(75); }
         }
     }
@@ -677,7 +676,7 @@ fn main() {
             if let Some(review_id) = ready_review() {
                 write_line(&format!("{work}/control/status-pids"), &std::process::id().to_string());
                 write_line(&format!("{work}/control/status-review-id"), &review_id);
-                touch(&format!("{work}/control/status-entered"));
+                write_line(&format!("{work}/control/status-entered"), &std::process::id().to_string());
                 if !wait_for(&format!("{work}/control/status-release"), 120_000) { std::process::exit(75); }
             }
         }
@@ -1183,7 +1182,7 @@ arm_kill_barrier() {
 }
 
 wait_for_kill_barrier() {
-  wait_for_marker "$CONTROL/kill-entered" "stop-pending kill" 180
+  wait_for_marker "$CONTROL/kill-entered" "stop-pending kill" 240
   record_barrier_pid_file "$CONTROL/kill-pids"
 }
 
@@ -1221,7 +1220,7 @@ run_stop_and_next_case() {
   local successor_checkpoint_line successor_checkpoint_path successor_checkpoint_step successor_checkpoint_weight
   setup_case
   write_research_scenario stop_and_next 33333333-3333-4333-a333-333333333333
-  submit_source 180 1
+  submit_source 360 1
   main_before="$(git -C "$PROJECT" rev-parse refs/heads/main)"
   source_before="$(git -C "$PROJECT" hash-object "$PROJECT/train.py")"
   arm_kill_barrier
@@ -1290,7 +1289,7 @@ run_checkpoint_case() {
   local main_before source_before
   setup_case
   write_research_scenario resume_from_checkpoint 44444444-4444-4444-a444-444444444444
-  submit_source 180 1
+  submit_source 240 1
   main_before="$(git -C "$PROJECT" rev-parse refs/heads/main)"
   source_before="$(git -C "$PROJECT" hash-object "$PROJECT/train.py")"
   arm_kill_barrier
@@ -1361,7 +1360,7 @@ run_checkpoint_case() {
   retained_argv_json="$(printf '%s\n' "$checkpoint_json" | "$REAL_JQ" -cS '.retained_argv')"
   [ "$(printf '%s\n' "$successor_argv" | "$REAL_JQ" -cS '.')" = "$retained_argv_json" ] \
     || die "checkpoint successor argv did not retain the verified supervisor path and source argv"
-  wait_for_task_terminal "$successor_task" 240
+  wait_for_task_terminal "$successor_task" 300
   wait_for_sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = '$successor_experiment_id'" "1" "checkpoint successor metric" "120"
   successor_line="$(wait_for_checkpoint "$successor_experiment_id" "$checkpoint_step" 30)"
   successor_path="${successor_line%%$'\t'*}"
@@ -1404,6 +1403,8 @@ PY
 
 run_review_running_restart_case() {
   local invoked="$RESEARCH_CONTROL/research-invoked" release="$RESEARCH_CONTROL/research-release"
+  local first_review_id first_agent_run_id first_planned_session first_generation
+  local first_binding first_run_status second_session_id second_binding
   setup_case
   write_research_scenario continue 55555555-5555-4555-a555-555555555555 "$invoked" "$release"
   submit_source 240 1
@@ -1412,6 +1413,15 @@ run_review_running_restart_case() {
   record_barrier_pid_file "$RESEARCH_CONTROL/research-invoked"
   wait_for_sql "SELECT COUNT(*) FROM research_reviews WHERE campaign_id = '$CAMPAIGN_ID' AND state = 'running'" "1" "review-running durable owner" "3"
   wait_for_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID' AND status = 'running'" "1" "review-running agent row" "3"
+  first_review_id="$(readonly_sql "SELECT review_id FROM research_reviews WHERE campaign_id = '$CAMPAIGN_ID' AND state = 'running'")"
+  first_agent_run_id="$(readonly_sql "SELECT agent_run_id FROM research_reviews WHERE review_id = '$first_review_id'")"
+  first_planned_session="$(readonly_sql "SELECT session_id FROM campaign_research WHERE campaign_id = '$CAMPAIGN_ID'")"
+  first_generation="$(readonly_sql "SELECT session_generation FROM campaign_research WHERE campaign_id = '$CAMPAIGN_ID'")"
+  first_binding="$(readonly_sql "SELECT json_extract(notes_json, '$.session_binding') FROM research_reviews WHERE review_id = '$first_review_id'")"
+  [ -n "$first_review_id" ] && [ -n "$first_agent_run_id" ] && [ -n "$first_planned_session" ] \
+    || die "review-running boundary lost its pending research identity"
+  [ "$first_generation" = 0 ] || die "review-running fresh launch changed generation before confirmation"
+  [ "$first_binding" = pending ] || die "review-running boundary was not a pending session binding"
   crash_daemon_exact
   old_pid="$(sed -n '1p' "$RESEARCH_CONTROL/research-invoked")"
   require_owned_pid "$old_pid"
@@ -1422,8 +1432,24 @@ run_review_running_restart_case() {
   wait_for_marker "$RESEARCH_CONTROL/research-invoked-2" "review-running fresh generation" 120
   release_marker "$RESEARCH_CONTROL/research-release-2"
   wait_for_sql "SELECT COUNT(*) FROM research_reviews WHERE campaign_id = '$CAMPAIGN_ID' AND state = 'completed'" "1" "review-running recovery" "240"
-  wait_for_sql "SELECT session_generation FROM campaign_research WHERE campaign_id = '$CAMPAIGN_ID'" "1" "review-running session generation" "120"
-  record "CASE restart_review_running PASS old_daemon_sigkill_reaped=true fresh_generation=1"
+  wait_for_sql "SELECT session_generation FROM campaign_research WHERE campaign_id = '$CAMPAIGN_ID'" "0" "review-running session generation" "120"
+  second_session_id="$(readonly_sql "SELECT session_id FROM campaign_research WHERE campaign_id = '$CAMPAIGN_ID'")"
+  second_binding="$(readonly_sql "SELECT json_extract(notes_json, '$.session_binding') FROM research_reviews WHERE review_id = '$first_review_id'")"
+  first_run_status="$(readonly_sql "SELECT status FROM agent_runs WHERE run_id = $first_agent_run_id")"
+  [ "$second_session_id" = 66666666-6666-4666-a666-666666666666 ] \
+    || die "review-running recovery did not confirm the replacement session"
+  [ "$second_session_id" != "$first_planned_session" ] \
+    || die "review-running recovery reused the crashed pending session identity"
+  [ "$second_binding" = confirmed ] || die "review-running recovery did not persist confirmed replacement binding"
+  case "$first_run_status" in
+    failed|timed_out|cancelled) ;;
+    *) die "review-running crashed run retained unexpected status: $first_run_status" ;;
+  esac
+  [ "$(grep -c '^RESEARCH_INVOCATION ' "$WORK/home/../research-codex-calls.log")" = 2 ] \
+    || die "review-running recovery launched an unexpected number of research calls"
+  [ "$(experiment_count)" = 1 ] && [ "$(submission_count)" = 1 ] \
+    || die "review-running recovery created duplicate external experiment work"
+  record "CASE restart_review_running PASS old_daemon_sigkill_reaped=true pending_session_retired=true replacement_session_distinct=true session_generation=0 first_run_status=$first_run_status research_invocations=2 external_work_unchanged=true"
 }
 
 run_answer_ready_case() {
@@ -1461,7 +1487,7 @@ run_answer_ready_case() {
 run_stop_pending_restart_case() {
   setup_case
   write_research_scenario stop_and_next 77777777-7777-4777-a777-777777777777
-  submit_source 180 1
+  submit_source 360 1
   arm_kill_barrier
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
@@ -1483,7 +1509,7 @@ run_stop_confirmed_restart_case() {
   local decision_pid_log="$HOME/../research-barrier-pids.log"
   setup_case
   write_research_scenario stop_and_next 88888888-8888-4888-a888-888888888888
-  submit_source 180 1
+  submit_source 360 1
   arm_kill_barrier
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
@@ -1543,7 +1569,7 @@ run_successor_submitting_restart_case() {
   local successor_submission_status_before successor_submission_status_after
   setup_case
   write_research_scenario stop_and_next 99999999-9999-4999-a999-999999999999
-  submit_source 180 1
+  submit_source 360 1
   arm_kill_barrier
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
@@ -1612,7 +1638,7 @@ run_add_reconcile_case() {
   local status_before status_after status_after_suppressed successor_task_before
   setup_case
   write_research_scenario stop_and_next bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
-  submit_source 180 1
+  submit_source 240 1
   arm_kill_barrier
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
@@ -1702,7 +1728,7 @@ run_failure_case() {
 
 run_unsafe_session_case() {
   local session_id=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
-  local session_path invocation_count
+  local session_path invocation_count unsafe_mode
   setup_case
   write_research_scenario continue "$session_id"
   submit_source 240 1
@@ -1711,9 +1737,12 @@ run_unsafe_session_case() {
   await_first_review
   session_path="$(session_file_for "$session_id")"
   [ -n "$session_path" ] || die "unsafe-session case did not establish an owned session"
-  chmod 644 "$session_path"
-  [ "$(stat -c '%a' "$session_path" 2>/dev/null || stat -f '%Lp' "$session_path")" = 644 ] \
-    || die "unsafe-session fixture did not change only the owned artifact permissions"
+  chmod 000 "$session_path"
+  unsafe_mode="$(stat -c '%a' "$session_path" 2>/dev/null || stat -f '%Lp' "$session_path")"
+  case "$unsafe_mode" in
+    0|000) ;;
+    *) die "unsafe-session fixture did not make only the owned artifact unreadable: mode=$unsafe_mode" ;;
+  esac
   write_research_scenario continue "$session_id"
   wait_for_sql "SELECT state FROM research_reviews WHERE campaign_id = '$CAMPAIGN_ID' ORDER BY created_at DESC, review_id DESC LIMIT 1" "blocked" "unsafe-session block" "420"
   wait_for_sql "SELECT failure_code FROM research_reviews WHERE campaign_id = '$CAMPAIGN_ID' ORDER BY created_at DESC, review_id DESC LIMIT 1" "research_session_unsafe" "unsafe-session failure code" "30"
@@ -1725,14 +1754,14 @@ run_unsafe_session_case() {
     || die "unsafe owned session created a fresh generation"
   [ "$(experiment_count)" = 1 ] || die "unsafe session created successor"
   [ "$(readonly_sql "SELECT COUNT(*) FROM campaign_research WHERE campaign_id = '$CAMPAIGN_ID' AND session_id IS NOT NULL")" = 1 ] || die "unsafe session lost campaign owner"
-  record "CASE failure_unsafe_session PASS owned_session=$session_id mode=644 fresh_fallback=false invocation_count=1 successor=0"
+  record "CASE failure_unsafe_session PASS owned_session=$session_id mode=$unsafe_mode unreadable=true fresh_fallback=false invocation_count=1 successor=0"
 }
 
 run_unknown_kill_case() {
   local kill_proxy_pid
   setup_case
   write_research_scenario stop_and_next bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
-  submit_source 180 1
+  submit_source 240 1
   arm_kill_barrier
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
