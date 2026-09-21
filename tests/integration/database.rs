@@ -694,6 +694,30 @@ fn research_claim_is_due_once_and_persists_authoritative_lineage() {
 }
 
 #[test]
+fn research_review_projection_preserves_checkpoint_json_exactly() {
+    let h = CampaignDbHarness::new();
+    let review = h.running_research_review();
+    let repository = ResearchRepository::new(&h.db);
+
+    assert_eq!(repository.find(&review.review_id).unwrap().checkpoint_json, None);
+
+    let checkpoint_json = "{ \"checkpoint_path\": \"retained/model.ckpt\", \"sha256\": \"abc\" }\n";
+    h.db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE research_reviews SET checkpoint_json = ?1 WHERE review_id = ?2",
+            params![checkpoint_json, review.review_id],
+        )
+        .unwrap();
+
+    assert_eq!(
+        repository.find(&review.review_id).unwrap().checkpoint_json.as_deref(),
+        Some(checkpoint_json),
+    );
+}
+
+#[test]
 fn research_claim_only_selects_the_oldest_running_candidate() {
     let h = CampaignDbHarness::new();
     let mut limits = CampaignLimits::default();

@@ -125,6 +125,7 @@ pub struct ResearchReview {
     pub response_json: Option<String>,
     pub termination_request_id: Option<i64>,
     pub successor_experiment_id: Option<String>,
+    pub checkpoint_json: Option<String>,
     pub session_generation: i64,
 }
 
@@ -6440,6 +6441,7 @@ fn review_from_row(row: &Row<'_>) -> rusqlite::Result<ResearchReview> {
         response_json: row.get(10)?,
         termination_request_id: row.get(11)?,
         successor_experiment_id: row.get(12)?,
+        checkpoint_json: row.get(20)?,
         session_generation: row.get(14)?,
     })
 }
