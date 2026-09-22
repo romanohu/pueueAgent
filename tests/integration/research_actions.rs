@@ -440,7 +440,7 @@ max_agent_runs = 10
         })
         .to_string();
         ResearchRepository::new(&db)
-            .finish_agent_run(&binding, run.run_id, &session_id, &answer, false, 309)
+            .finish_agent_run(&binding, run.run_id, &session_id, &answer, 309)
             .unwrap();
         AgentRunRepository::new(&db)
             .finish_and_resolve_events(
@@ -2397,6 +2397,9 @@ async fn ordinary_research_proposal_applies_one_successor_and_replays_without_du
     assert_eq!(successor.2, Some(42));
     assert!(successor.3.is_some());
     assert_eq!(successor.4, "accepted");
+    assert!(ResearchRepository::new(&harness.db)
+        .owns_successor(&harness.experiment_id)
+        .unwrap());
 
     let after = harness.db.connect().unwrap().query_row(
         "SELECT

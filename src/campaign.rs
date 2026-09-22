@@ -3596,7 +3596,8 @@ mod tests {
     #[test]
     fn candidate_submission_cwd_is_descriptor_bound_to_the_candidate_root() {
         let temporary = tempfile::tempdir().unwrap();
-        let candidate_path = temporary.path().join("candidate");
+        let root = std::fs::canonicalize(temporary.path()).unwrap();
+        let candidate_path = root.join("candidate");
         std::fs::create_dir_all(candidate_path.join("nested")).unwrap();
         let anchor = ProjectRootAnchor::resolve(&candidate_path).unwrap();
         let candidate = anchor.verify_identity().unwrap();

@@ -472,7 +472,7 @@ fn test_native_child(
         open_agent_log_gate(&reader, &log_path, &marker_path).expect("native-child gate");
     let log_identity = *agent_log.identity();
     let source_executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-    let executable_path = temporary.path().join("native-child-executable");
+    let executable_path = root.join("native-child-executable");
     std::fs::copy(&source_executable, &executable_path)
         .expect("copy native-child executable fixture");
     std::fs::set_permissions(

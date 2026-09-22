@@ -1730,7 +1730,7 @@ async fn prepare_attached_research(
     })
     .to_string();
     research
-        .finish_agent_run(&binding, run.run_id, &session_id, &answer, false, 309)
+        .finish_agent_run(&binding, run.run_id, &session_id, &answer, 309)
         .unwrap();
     AgentRunRepository::new(&harness.db)
         .finish_and_resolve_events(

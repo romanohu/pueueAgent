@@ -3371,7 +3371,6 @@ impl AgentHandle {
                                 self.run_id,
                                 &session_id,
                                 &response_json,
-                                false,
                                 now,
                             ) {
                                 Ok(()) => true,

@@ -815,10 +815,7 @@ impl PreparedRuntimeOutputs {
         if manifest.len() != 0 {
             return Err(recovery_required());
         }
-        let mut entries = fs::read_dir(descriptor_path(&self.artifact_directory))
-            .map_err(|_| recovery_required())?;
-        if let Some(entry) = entries.next() {
-            entry.map_err(|_| recovery_required())?;
+        if !check_output_directory_entries_with_limit(&self.artifact_directory, 1)?.is_empty() {
             return Err(recovery_required());
         }
         verify_runtime_output_scope(
@@ -4952,16 +4949,7 @@ impl WorktreeManager {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(_) => return Err(recovery_required()),
         };
-        let mut count = 0usize;
-        for entry in
-            fs::read_dir(descriptor_path(&worktrees)).map_err(|_| recovery_required())?
-        {
-            count = count.saturating_add(1);
-            if count > MAX_STATUS_PATHS {
-                return Err(recovery_required());
-            }
-            let entry = entry.map_err(|_| recovery_required())?;
-            let name = entry.file_name();
+        for name in check_output_directory_entries_with_limit(&worktrees, MAX_STATUS_PATHS)? {
             let admin = match open_existing_directory_at(&worktrees, &name) {
                 Ok(admin) => admin,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -7325,6 +7313,14 @@ fn remove_check_output_directory(
 
 #[cfg(unix)]
 fn check_output_directory_entries(directory: &File) -> Result<Vec<OsString>, AppError> {
+    check_output_directory_entries_with_limit(directory, MAX_CHECK_OUTPUT_ENTRIES)
+}
+
+#[cfg(unix)]
+fn check_output_directory_entries_with_limit(
+    directory: &File,
+    max_entries: usize,
+) -> Result<Vec<OsString>, AppError> {
     let dot = std::ffi::CString::new(".").expect("static directory component");
     let duplicate = unsafe {
         libc::openat(
@@ -7365,7 +7361,7 @@ fn check_output_directory_entries(directory: &File) -> Result<Vec<OsString>, App
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
         }
-        if names.len() >= MAX_CHECK_OUTPUT_ENTRIES {
+        if names.len() >= max_entries {
             unsafe { libc::closedir(stream) };
             return Err(recovery_required());
         }
@@ -9506,9 +9502,7 @@ fn bind_terminal_result_service(
 > {
     let mut results = BoundTerminalResults::Missing;
     let mut artifacts = None;
-    for entry in fs::read_dir(descriptor_path(service)).map_err(|_| recovery_required())? {
-        let entry = entry.map_err(|_| recovery_required())?;
-        let name = entry.file_name();
+    for name in check_output_directory_entries_with_limit(service, MAX_CHECK_OUTPUT_ENTRIES)? {
         if name == OsStr::new(RUNTIME_RESULTS_DIRECTORY) {
             results = bind_terminal_result_node(service, &name, experiment_id)?;
         } else if name == OsStr::new(RUNTIME_ARTIFACTS_DIRECTORY) {
@@ -9569,9 +9563,7 @@ fn bind_terminal_result_manifest(
 ) -> Result<BoundTerminalManifest, AppError> {
     let expected_name = OsString::from(format!("{experiment_id}.json"));
     let mut manifest = None;
-    for entry in fs::read_dir(descriptor_path(directory)).map_err(|_| recovery_required())? {
-        let entry = entry.map_err(|_| recovery_required())?;
-        let name = entry.file_name();
+    for name in check_output_directory_entries_with_limit(directory, 2)? {
         if name != expected_name {
             return Err(recovery_required());
         }
@@ -9866,9 +9858,7 @@ fn validate_terminal_result_artifact_directory(
 ) -> Result<(File, ExecutableIdentity), AppError> {
     let expected_name = OsStr::new(experiment_id);
     let mut artifact = None;
-    for entry in fs::read_dir(descriptor_path(directory)).map_err(|_| recovery_required())? {
-        let entry = entry.map_err(|_| recovery_required())?;
-        let name = entry.file_name();
+    for name in check_output_directory_entries_with_limit(directory, 2)? {
         if name != expected_name {
             return Err(recovery_required());
         }
@@ -9905,9 +9895,8 @@ fn scan_terminal_result_artifacts(
         return Err(recovery_required());
     }
     account_ignored_entry(&metadata, budget)?;
-    for entry in fs::read_dir(descriptor_path(directory)).map_err(|_| recovery_required())? {
-        let entry = entry.map_err(|_| recovery_required())?;
-        let name = entry.file_name();
+    let remaining = MAX_IGNORED_SCAN_ENTRIES.saturating_sub(budget.entries);
+    for name in check_output_directory_entries_with_limit(directory, remaining)? {
         if is_protected_path(Path::new(&name)) {
             return Err(recovery_required());
         }
@@ -10069,9 +10058,8 @@ fn scan_ignored_directory(
         return Err(recovery_required());
     }
     account_ignored_entry(&metadata, budget)?;
-    for entry in fs::read_dir(descriptor_path(directory)).map_err(|_| recovery_required())? {
-        let entry = entry.map_err(|_| recovery_required())?;
-        let name = entry.file_name();
+    let remaining = MAX_IGNORED_SCAN_ENTRIES.saturating_sub(budget.entries);
+    for name in check_output_directory_entries_with_limit(directory, remaining)? {
         let child_relative = relative.join(&name);
         if is_protected_path(&child_relative) {
             return Err(validation(
@@ -11256,44 +11244,45 @@ mod tests {
     #[test]
     fn git_pointer_target_types_are_enforced() {
         let root = tempdir().unwrap();
-        let directory = root.path().join("admin");
+        let root_path = fs::canonicalize(root.path()).unwrap();
+        let directory = root_path.join("admin");
         fs::create_dir(&directory).unwrap();
-        let file = root.path().join("candidate.git");
+        let file = root_path.join("candidate.git");
         fs::write(&file, b"gitdir\n").unwrap();
 
         assert!(parse_git_pointer(
             b"admin\n",
-            root.path(),
+            &root_path,
             GitPointerKind::Path(GitPointerTarget::Directory),
         )
         .is_ok());
         assert!(parse_git_pointer(
             b"candidate.git\n",
-            root.path(),
+            &root_path,
             GitPointerKind::Path(GitPointerTarget::Directory),
         )
         .is_err());
         assert!(parse_git_pointer(
             b"admin\n",
-            root.path(),
+            &root_path,
             GitPointerKind::Path(GitPointerTarget::File),
         )
         .is_err());
         assert!(parse_git_pointer(
             b"candidate.git\n",
-            root.path(),
+            &root_path,
             GitPointerKind::Path(GitPointerTarget::File),
         )
         .is_ok());
         assert!(parse_git_pointer(
             b"gitdir: admin\n",
-            root.path(),
+            &root_path,
             GitPointerKind::GitDir,
         )
         .is_ok());
         assert!(parse_git_pointer(
             b"gitdir: candidate.git\n",
-            root.path(),
+            &root_path,
             GitPointerKind::GitDir,
         )
         .is_err());
@@ -12094,47 +12083,48 @@ mod tests {
     #[test]
     fn git_config_proof_rejects_execution_channels_and_wrong_worktree() {
         let root = tempdir().unwrap();
-        let worktree = root.path().join("candidate");
+        let root_path = fs::canonicalize(root.path()).unwrap();
+        let worktree = root_path.join("candidate");
         fs::create_dir(&worktree).unwrap();
         assert!(validate_git_config_bytes(
             b"[include]\npath = /tmp/config\n",
-            root.path(),
+            &root_path,
             None,
         )
         .is_err());
         assert!(validate_git_config_bytes(
             b"[filter \"smudge\"]\ncommand = /bin/sh\n",
-            root.path(),
+            &root_path,
             None,
         )
         .is_err());
         assert!(validate_git_config_bytes(
             b"[diff \"external\"]\nexternal = /bin/sh\n",
-            root.path(),
+            &root_path,
             None,
         )
         .is_err());
         assert!(validate_git_config_bytes(
             b"[core]\nworktree = /tmp/other\n",
-            root.path(),
+            &root_path,
             Some(&worktree),
         )
         .is_err());
         assert!(validate_git_config_bytes(
             b"[core]\nworktree = /tmp/other\n",
-            root.path(),
+            &root_path,
             None,
         )
         .is_err());
         assert!(validate_git_config_bytes(
             format!("[core]\nworktree = {}\n", worktree.display()).as_bytes(),
-            root.path(),
+            &root_path,
             Some(&worktree),
         )
         .is_ok());
         assert!(validate_git_config_bytes(
             b"[remote \"origin\"]\nurl = https://example.invalid/repo.git\n",
-            root.path(),
+            &root_path,
             None,
         )
         .is_ok());
@@ -12167,7 +12157,8 @@ mod tests {
     #[test]
     fn git_metadata_reads_are_offset_independent_and_nonempty() {
         let root = tempdir().unwrap();
-        let path = root.path().join("config");
+        let root_path = fs::canonicalize(root.path()).unwrap();
+        let path = root_path.join("config");
         fs::write(&path, b"[remote \"origin\"]\nurl = https://example.invalid/repo\n")
             .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -12235,13 +12226,15 @@ mod tests {
     #[test]
     fn ignored_status_walk_does_not_follow_symlinked_directories() {
         let root = tempdir().unwrap();
-        secure_test_directory(root.path());
+        let root_path = fs::canonicalize(root.path()).unwrap();
+        secure_test_directory(&root_path);
         let outside = tempdir().unwrap();
-        fs::write(outside.path().join("credentials.json"), b"secret").unwrap();
-        fs::create_dir(root.path().join("build")).unwrap();
-        secure_test_directory(&root.path().join("build"));
-        std::os::unix::fs::symlink(outside.path(), root.path().join("build/outside")).unwrap();
-        assert!(validate_ignored_tree(root.path(), &[PathBuf::from("build/")]).is_ok());
+        let outside_path = fs::canonicalize(outside.path()).unwrap();
+        fs::write(outside_path.join("credentials.json"), b"secret").unwrap();
+        fs::create_dir(root_path.join("build")).unwrap();
+        secure_test_directory(&root_path.join("build"));
+        std::os::unix::fs::symlink(&outside_path, root_path.join("build/outside")).unwrap();
+        assert!(validate_ignored_tree(&root_path, &[PathBuf::from("build/")]).is_ok());
     }
 
     #[cfg(unix)]

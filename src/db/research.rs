@@ -1190,7 +1190,6 @@ impl<'db> ResearchRepository<'db> {
         interval_minutes: u32,
         now: i64,
     ) -> Result<(), AppError> {
-        let candidate_due = next_research_due(started_at, interval_minutes)?;
         let mut connection = self.db.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1225,9 +1224,10 @@ impl<'db> ResearchRepository<'db> {
                 )
                 .optional()
                 .map_err(database_error("read latest completed research review"))?;
-            completed_anchor
-                .map(|anchor| next_research_due(anchor, interval_minutes))
-                .unwrap_or(Ok(candidate_due))?
+            match completed_anchor {
+                Some(anchor) => next_research_due(anchor, interval_minutes)?,
+                None => next_research_due(started_at, interval_minutes)?,
+            }
         };
         if next_due != current_due {
             transaction
@@ -4118,7 +4118,6 @@ impl<'db> ResearchRepository<'db> {
         agent_run_id: i64,
         session_id: &str,
         response_json: &str,
-        _rebind_session: bool,
         now: i64,
     ) -> Result<(), AppError> {
         validate_research_binding(binding)?;

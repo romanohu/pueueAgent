@@ -694,6 +694,41 @@ fn research_claim_is_due_once_and_persists_authoritative_lineage() {
 }
 
 #[test]
+fn research_schedule_ignores_overflow_when_due_state_is_already_owned() {
+    let h = CampaignDbHarness::new();
+    h.start(&CampaignLimits::default(), 1_000);
+    let task_signature = h.make_running_research_baseline(41, "research", 1_000);
+    let repository = ResearchRepository::new(&h.db);
+
+    repository
+        .schedule_running(&h.campaign_id, 1_000, 1, 1_060)
+        .unwrap();
+    assert_eq!(
+        repository.state(&h.campaign_id).unwrap().next_due_at,
+        Some(1_060)
+    );
+
+    repository
+        .schedule_running(&h.campaign_id, i64::MAX, 1, 1_061)
+        .expect("an established due date should ignore an overflowing candidate");
+    assert_eq!(
+        repository.state(&h.campaign_id).unwrap().next_due_at,
+        Some(1_060)
+    );
+
+    repository
+        .claim_due(&h.campaign_id, &h.experiment_id, &task_signature, 1_060)
+        .unwrap()
+        .expect("the established due review should be claimed");
+    assert_eq!(repository.state(&h.campaign_id).unwrap().next_due_at, None);
+
+    repository
+        .schedule_running(&h.campaign_id, i64::MAX, 1, 1_062)
+        .expect("an open review should ignore an overflowing candidate");
+    assert_eq!(repository.state(&h.campaign_id).unwrap().next_due_at, None);
+}
+
+#[test]
 fn research_review_projection_preserves_checkpoint_json_exactly() {
     let h = CampaignDbHarness::new();
     let review = h.running_research_review();
@@ -1171,7 +1206,6 @@ fn research_finish_agent_run_rejects_context_replacement_after_confirmation() {
             run.run_id,
             &binding.session_id,
             &response_json,
-            false,
             1_082,
         )
         .unwrap_err();

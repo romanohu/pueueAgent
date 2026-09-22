@@ -55,4 +55,3 @@ Self-review: SQLite remains authoritative; no generic intervention token is pass
 
 - Native research integration is Linux-only and therefore produced zero tests on this macOS host. The controller must run the committed RED checkpoint and the GREEN `research_agent`/scheduler launch and restart coverage on isolated Linux state before accepting native behavior.
 - The repository’s broad lib/integration suites have pre-existing environment-sensitive failures (native executable anchors, fixture permissions, and migration fixtures); focused Task4/database checks above pass. `cargo fmt --check` also reports pre-existing whole-repository formatting drift.
-
