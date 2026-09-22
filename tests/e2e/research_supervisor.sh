@@ -129,6 +129,8 @@ REPORT="$WORK/evidence.log"
 DAEMON_LOG="$WORK/daemon.log"
 PUEUED_LOG="$WORK/pueued.log"
 DAEMON_PID=""
+RUN_ID_LOCK_PID=""
+RUN_ID_LOCK_PARENT_IDENTITY=""
 PUEUED_PID=""
 PROJECT_ID=""
 GROUP=""
@@ -200,6 +202,7 @@ cleanup() {
   local status=$?
   local cleanup_incomplete=0
   local daemon_pid=""
+  local run_id_lock_pid=""
   local barrier_pid=""
   local task_id=""
   local state=""
@@ -233,6 +236,32 @@ cleanup() {
       wait "$daemon_pid" 2>/dev/null || true
     fi
     DAEMON_PID=""
+  fi
+
+  if [ -n "$RUN_ID_LOCK_PID" ]; then
+    run_id_lock_pid="$RUN_ID_LOCK_PID"
+    case "$run_id_lock_pid" in
+      ''|*[!0-9]*) cleanup_incomplete=1; run_id_lock_pid="" ;;
+      *)
+        if [ "$run_id_lock_pid" -le 1 ]; then
+          cleanup_incomplete=1
+          run_id_lock_pid=""
+        fi
+        ;;
+    esac
+    if [ -n "$run_id_lock_pid" ]; then
+      if pid_is_alive "$run_id_lock_pid"; then
+        kill -TERM "$run_id_lock_pid" 2>/dev/null || true
+        if ! wait_pid_gone "$run_id_lock_pid"; then
+          kill -KILL "$run_id_lock_pid" 2>/dev/null || true
+          wait_pid_gone "$run_id_lock_pid" || true
+        fi
+      fi
+      wait "$run_id_lock_pid" 2>/dev/null || true
+      pid_is_alive "$run_id_lock_pid" && cleanup_incomplete=1
+    fi
+    RUN_ID_LOCK_PID=""
+    RUN_ID_LOCK_PARENT_IDENTITY=""
   fi
 
   # Never release a mutating proxy during cleanup.  Terminate only PIDs that a
@@ -1187,6 +1216,89 @@ wait_for_kill_barrier() {
   record_barrier_pid_file "$CONTROL/kill-pids"
 }
 
+start_run_id_admission_lock() {
+  local entered="$CONTROL/run-id-admission-entered"
+  local marker_pid marker_device marker_inode state_parent_identity
+  [ -z "$RUN_ID_LOCK_PID" ] || die "run-ID admission lock helper is already active"
+  rm -f -- "$entered" "$CONTROL/run-id-admission-release" \
+    "$CONTROL/run-id-admission-released"
+  state_parent_identity="$("$REAL_PYTHON" -c '
+import os, sys
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+fd = os.open(os.path.dirname(os.path.abspath(sys.argv[1])), flags)
+st = os.fstat(fd)
+print(f"{st.st_dev}|{st.st_ino}")
+os.close(fd)
+' "$STATE_DB")" || die "could not identify the exact state database parent"
+  "$REAL_PYTHON" - "$STATE_DB" "$entered" \
+    "$CONTROL/run-id-admission-release" "$CONTROL/run-id-admission-released" 480 \
+    > "$WORK/run-id-admission-lock.log" 2>&1 <<'RUN_ID_LOCK_HELPER' &
+import fcntl
+import os
+import sys
+import time
+
+db_path, entered_path, release_path, released_path, timeout_text = sys.argv[1:]
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+state_parent_fd = os.open(os.path.dirname(os.path.abspath(db_path)), flags)
+state_parent = os.fstat(state_parent_fd)
+fcntl.flock(state_parent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+def write_marker(path, payload):
+    marker_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        encoded = (payload + "\n").encode("ascii")
+        if os.write(marker_fd, encoded) != len(encoded):
+            raise OSError("short marker write")
+        os.fsync(marker_fd)
+    finally:
+        os.close(marker_fd)
+
+write_marker(entered_path, f"{os.getpid()}|{state_parent.st_dev}|{state_parent.st_ino}")
+deadline = time.monotonic() + float(timeout_text)
+while not os.path.exists(release_path):
+    if time.monotonic() >= deadline:
+        raise SystemExit(75)
+    time.sleep(0.05)
+fcntl.flock(state_parent_fd, fcntl.LOCK_UN)
+os.close(state_parent_fd)
+write_marker(released_path, str(os.getpid()))
+RUN_ID_LOCK_HELPER
+  RUN_ID_LOCK_PID="$!"
+  require_owned_pid "$RUN_ID_LOCK_PID"
+  wait_for_marker "$entered" "run-ID admission lock acquisition" 10
+  IFS='|' read -r marker_pid marker_device marker_inode < "$entered"
+  [ "$marker_pid" = "$RUN_ID_LOCK_PID" ] \
+    || die "run-ID admission lock marker did not identify its direct child"
+  [ "$marker_device|$marker_inode" = "$state_parent_identity" ] \
+    || die "run-ID admission lock did not hold the exact state database parent"
+  pid_is_alive "$RUN_ID_LOCK_PID" \
+    || die "run-ID admission lock helper exited before the crash boundary"
+  RUN_ID_LOCK_PARENT_IDENTITY="$state_parent_identity"
+  record "RUN_ID_ADMISSION_LOCK phase=confirmed-handoff-gate pid=$RUN_ID_LOCK_PID parent_device_inode=$RUN_ID_LOCK_PARENT_IDENTITY"
+}
+
+release_run_id_admission_lock() {
+  local lock_pid="$RUN_ID_LOCK_PID"
+  local marker_pid marker_device marker_inode wait_status=0
+  require_owned_pid "$lock_pid"
+  IFS='|' read -r marker_pid marker_device marker_inode < "$CONTROL/run-id-admission-entered"
+  [ "$marker_pid" = "$lock_pid" ] \
+    || die "run-ID admission lock owner changed before release"
+  [ "$marker_device|$marker_inode" = "$RUN_ID_LOCK_PARENT_IDENTITY" ] \
+    || die "run-ID admission lock parent identity changed before release"
+  : > "$CONTROL/run-id-admission-release"
+  wait_for_marker "$CONTROL/run-id-admission-released" "run-ID admission lock release" 10
+  [ "$(sed -n '1p' "$CONTROL/run-id-admission-released")" = "$lock_pid" ] \
+    || die "run-ID admission lock release marker did not identify its direct child"
+  wait "$lock_pid" || wait_status=$?
+  RUN_ID_LOCK_PID=""
+  RUN_ID_LOCK_PARENT_IDENTITY=""
+  [ "$wait_status" -eq 0 ] \
+    || die "run-ID admission lock helper exited with status $wait_status"
+  record "RUN_ID_ADMISSION_LOCK_RELEASED pid=$lock_pid reaped=true"
+}
+
 release_kill_and_restart() {
   local old_proxy_pid
   old_proxy_pid="$(sed -n '1p' "$CONTROL/kill-pids")"
@@ -1551,8 +1663,9 @@ run_stop_pending_restart_case() {
 }
 
 run_stop_confirmed_restart_case() {
-  local first_decision_pid fresh_decision_pid successor_task successor_experiment_id
-  local decision_pid_log="$HOME/../research-barrier-pids.log"
+  local fresh_decision_pid successor_task successor_experiment_id decision_cycle_id decision_event_id
+  local decision_event_key decision_pid_log="$HOME/../research-barrier-pids.log"
+  local nonempty_temp_entry temp_root="$PROJECT/.pueue-agent/tmp"
   setup_case
   write_research_scenario stop_and_next 88888888-8888-4888-a888-888888888888
   submit_source 360 1
@@ -1560,27 +1673,43 @@ run_stop_confirmed_restart_case() {
   start_daemon
   wait_for_task_state "$SOURCE_TASK_ID" Running 120
   wait_for_kill_barrier
-  "$REAL_JQ" -cn --arg invoked "$CONTROL/decision-entered" --arg release "$CONTROL/decision-release" \
-    '{invoked_path:$invoked,release_path:$release}' > "$HOME/.pueue-agent/decision-control.json"
-  chmod 600 "$HOME/.pueue-agent/decision-control.json"
+  start_run_id_admission_lock
   release_kill_and_restart
   await_stop_confirmed
-  wait_for_marker "$CONTROL/decision-entered" "stop-confirmed restart" 120
-  record_barrier_pid_file "$decision_pid_log"
-  first_decision_pid="$(sed -n '1p' "$decision_pid_log")"
-  require_owned_pid "$first_decision_pid"
-  [ "$(readonly_sql "SELECT COUNT(*) FROM termination_requests WHERE project_id = '$PROJECT_ID' AND status = 'confirmed'")" = 1 ] || die "restart stop-confirmed duplicated kill"
+  decision_cycle_id="$(readonly_sql "SELECT decision_cycle_id FROM research_reviews WHERE campaign_id = '$CAMPAIGN_ID' AND experiment_id = '$SOURCE_EXPERIMENT_ID'")"
+  [ -n "$decision_cycle_id" ] || die "stop-confirmed handoff did not bind its decision cycle"
+  decision_event_key="campaign-decision:v1:$decision_cycle_id"
+  decision_event_id="$(readonly_sql "SELECT event_id FROM events WHERE project_id = '$PROJECT_ID' AND kind = 'campaign_decision' AND dedup_key = '$decision_event_key'")"
+  [ -n "$decision_event_id" ] || die "stop-confirmed handoff did not create its exact decision event"
+  wait_for_sql "SELECT COUNT(*) FROM events AS event JOIN decision_cycles AS cycle ON cycle.cycle_id = '$decision_cycle_id' AND cycle.campaign_id = '$CAMPAIGN_ID' AND cycle.source_experiment_id = '$SOURCE_EXPERIMENT_ID' AND cycle.state = 'pending' WHERE event.project_id = '$PROJECT_ID' AND event.event_id = $decision_event_id AND event.kind = 'campaign_decision' AND event.dedup_key = '$decision_event_key' AND event.status = 'retry_wait' AND event.attempts = 0 AND event.not_before > CAST(strftime('%s','now') AS INTEGER)" "1" "future decision retry deferred by held run-ID admission lock" "240"
+  [ "$(readonly_sql "SELECT COUNT(*) FROM decision_attempts WHERE cycle_id = '$decision_cycle_id'")" = 0 ] \
+    || die "stop-confirmed boundary reserved a decision attempt before the crash"
+  [ "$(readonly_sql "SELECT COUNT(*) FROM budget_reservations WHERE campaign_id = '$CAMPAIGN_ID' AND dimension = 'agent_run' AND subject_key LIKE 'campaign-decision-attempt:v1:$decision_cycle_id:%'")" = 0 ] \
+    || die "stop-confirmed boundary reserved generic decision agent-run budget before the crash"
+  [ "$(readonly_sql "SELECT COUNT(*) FROM agent_runs WHERE project_id = '$PROJECT_ID' AND primary_event_id = $decision_event_id")" = 0 ] \
+    || die "stop-confirmed boundary started a generic decision agent before the crash"
+  if [ -d "$temp_root" ]; then
+    nonempty_temp_entry="$(find "$temp_root" -mindepth 2 -maxdepth 2 -print -quit)" \
+      || die "could not inspect the private run-temp generations while admission was held"
+  else
+    nonempty_temp_entry=""
+  fi
+  [ -z "$nonempty_temp_entry" ] \
+    || die "stop-confirmed boundary populated a private run-temp generation: $nonempty_temp_entry"
+  [ "$(readonly_sql "SELECT COUNT(*) FROM termination_requests WHERE project_id = '$PROJECT_ID' AND status = 'confirmed'")" = 1 ] \
+    || die "restart stop-confirmed duplicated kill"
   [ "$(experiment_count)" = 1 ] || die "restart stop-confirmed admitted successor too early"
   [ "$(pueue_task_status "$SOURCE_TASK_ID")" != __missing__ ] || die "stop-confirmed source task disappeared"
-  [ "$(readonly_sql "SELECT COUNT(*) FROM decision_cycles WHERE campaign_id = '$CAMPAIGN_ID' AND state = 'completed'")" = 0 ] \
+  [ "$(readonly_sql "SELECT COUNT(*) FROM decision_cycles WHERE cycle_id = '$decision_cycle_id' AND state = 'completed'")" = 0 ] \
     || die "stop-confirmed decision completed before its crash boundary"
+  pid_is_alive "$RUN_ID_LOCK_PID" \
+    || die "run-ID admission lock owner exited before the confirmed handoff crash"
 
-  # Crash at the confirmed terminal-decision boundary itself, then start a
-  # fresh barrier generation.  The earlier release_kill_and_restart covers
-  # stop-pending recovery; this hard crash covers the later confirmed state.
+  # Crash after the durable confirmed research handoff but before generic
+  # decision admission.  The run-ID guard blocks temp preflight and spawn;
+  # startup must then see the empty temp root and admit one fresh decision.
   crash_daemon_exact
-  terminate_exact_pid "$first_decision_pid"
-  rm -f -- "$HOME/.pueue-agent/decision-control.json"
+  release_run_id_admission_lock
   : > "$decision_pid_log"
   "$REAL_JQ" -cn --arg invoked "$CONTROL/decision-entered-2" --arg release "$CONTROL/decision-release-2" \
     '{invoked_path:$invoked,release_path:$release}' > "$HOME/.pueue-agent/decision-control.json"
@@ -1606,7 +1735,7 @@ run_stop_confirmed_restart_case() {
   wait_for_sql "SELECT COUNT(*) FROM experiment_metrics WHERE experiment_id = '$successor_experiment_id'" "1" "stop-confirmed restart successor metric" "120"
   [ "$(readonly_sql "SELECT COUNT(*) FROM termination_requests WHERE project_id = '$PROJECT_ID' AND status = 'confirmed'")" = 1 ] \
     || die "stop-confirmed restart ended with duplicate confirmed termination"
-  record "CASE restart_stop_confirmed PASS first_crash_at_confirmed=true fresh_barrier_generation=true one_cycle=true one_confirmed_kill=true successor=1 successor_metric=true"
+  record "CASE restart_stop_confirmed PASS crash_after_confirmed_handoff_before_decision=true run_id_lock_deferred_event=true fresh_barrier_generation=true one_cycle=true one_confirmed_kill=true successor=1 successor_metric=true"
 }
 
 run_successor_submitting_restart_case() {
