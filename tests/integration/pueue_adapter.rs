@@ -718,7 +718,7 @@ async fn cancelling_the_caller_still_terminates_and_reaps_the_process_group() {
 
 #[cfg(all(unix, debug_assertions))]
 #[tokio::test]
-async fn controlled_deadline_during_exec_proof_reports_cleanup_uncertainty() {
+async fn controlled_exec_proof_deadline_preserves_the_native_cleanup_boundary() {
     let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = NativeFakePueue::delays(0, 12_000, 0);
     let adapter = configured_pueue(fixture.policy()).unwrap();
@@ -726,29 +726,103 @@ async fn controlled_deadline_during_exec_proof_reports_cleanup_uncertainty() {
     // broad pre-release margin while holding exec proof beyond the deadline.
     let deadline = Instant::now() + Duration::from_secs(8);
 
-    let failure = tokio::time::timeout(
-        Duration::from_secs(20),
-        adapter.kill_controlled_before(41, deadline, CancellationToken::new()),
-    )
-    .await
-    .expect("controlled launch deadline exceeded the outer test bound")
-    .expect_err("controlled deadline unexpectedly succeeded");
-    let lifecycle_trace = std::env::var_os("PUEUE_AGENT_TEST_LIFECYCLE_TRACE")
-        .and_then(|path| fs::read_to_string(path).ok())
-        .unwrap_or_else(|| "unavailable".to_owned());
-
-    assert_eq!(
-        failure.boundary(),
-        pueue_agent::pueue::PueueControlBoundary::CleanupUncertain,
-        "unexpected exec-proof deadline failure: {failure:?}; lifecycle trace={lifecycle_trace:?}"
+    let trace_path = PathBuf::from(
+        std::env::var_os("PUEUE_AGENT_TEST_LIFECYCLE_TRACE")
+            .expect("fixture lifecycle trace path is installed"),
     );
-    assert!(matches!(
-        failure.into_error(),
-        AppError::Pueue(PueueError::Cleanup {
-            operation: "kill",
-            ..
-        })
-    ));
+    let operation = tokio::spawn(async move {
+        adapter
+            .kill_controlled_before(41, deadline, CancellationToken::new())
+            .await
+    });
+    // Capture the helper's process-group ID before the deadline result arrives.
+    let helper_pid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let trace = fs::read_to_string(&trace_path).unwrap_or_default();
+            if let Some(helper_pid) = trace.lines().find_map(|line| {
+                line.strip_prefix("readiness:")
+                    .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            }) {
+                break helper_pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native helper did not publish readiness before the deadline");
+
+    let failure = tokio::time::timeout(Duration::from_secs(20), operation)
+        .await
+        .expect("controlled launch deadline exceeded the outer test bound")
+        .expect("controlled operation task panicked")
+        .expect_err("controlled deadline unexpectedly succeeded");
+    // Probe synchronously at return, before the fixture's later polling check.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let (helper_group_probe, helper_group_probe_errno) = {
+        let result = unsafe { libc::kill(-helper_pid, 0) };
+        let errno = (result == -1)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten();
+        (result, errno)
+    };
+    let lifecycle_trace =
+        fs::read_to_string(&trace_path).unwrap_or_else(|_| "unavailable".to_owned());
+    let readiness_pid = lifecycle_trace.lines().find_map(|line| {
+        line.strip_prefix("readiness:")
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+    });
+    let exec_proof_pid = lifecycle_trace.lines().find_map(|line| {
+        line.strip_prefix("exec-proof:")
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+    });
+    assert_eq!(
+        readiness_pid,
+        Some(helper_pid),
+        "unexpected lifecycle trace: {lifecycle_trace:?}"
+    );
+    assert_eq!(
+        exec_proof_pid,
+        Some(helper_pid),
+        "exec proof did not use the ready helper: {lifecycle_trace:?}"
+    );
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        assert_eq!(
+            failure.boundary(),
+            pueue_agent::pueue::PueueControlBoundary::TargetReleasedClientQuiescent,
+            "unexpected exec-proof deadline failure: {failure:?}; lifecycle trace={lifecycle_trace:?}"
+        );
+        assert_eq!(
+            helper_group_probe,
+            -1,
+            "native cleanup reported quiescence while helper group {helper_pid} remained: errno={helper_group_probe_errno:?}, trace={lifecycle_trace:?}"
+        );
+        assert_eq!(
+            helper_group_probe_errno,
+            Some(libc::ESRCH),
+            "native cleanup did not prove helper group {helper_pid} absent: trace={lifecycle_trace:?}"
+        );
+        assert!(matches!(
+            failure.into_error(),
+            AppError::Pueue(PueueError::Timeout { operation: "kill" })
+        ));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        assert_eq!(
+            failure.boundary(),
+            pueue_agent::pueue::PueueControlBoundary::CleanupUncertain,
+            "unexpected exec-proof deadline failure: {failure:?}; lifecycle trace={lifecycle_trace:?}"
+        );
+        assert!(matches!(
+            failure.into_error(),
+            AppError::Pueue(PueueError::Cleanup {
+                operation: "kill",
+                ..
+            })
+        ));
+    }
     fixture.assert_no_execution_artifacts();
     fixture.assert_helper_lifecycle_deadline_started().await;
 }
