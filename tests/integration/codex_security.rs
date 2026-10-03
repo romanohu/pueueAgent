@@ -263,9 +263,9 @@ fn forbidden_codex_security_args_fail_but_structured_model_reasoning_survive() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn installed_codex_capability_probe_requires_exact_research_surface() {
-    let root_help = "--strict-config --sandbox read-only workspace-write --ask-for-approval never";
+    let root_help = "--strict-config --sandbox read-only --ask-for-approval never";
     let exec_help = "--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message --json";
-    let supported = DoctorCodexFixture::new("codex-cli 0.138.0", root_help, exec_help, "");
+    let supported = DoctorCodexFixture::new("codex-cli 0.138.0", root_help, exec_help);
     assert_eq!(
         probe_doctor_agent_runtime(&Ok(supported.policy.clone())).await,
         DoctorAgentRuntime::Supported
@@ -275,7 +275,6 @@ async fn installed_codex_capability_probe_requires_exact_research_surface() {
         "codex-cli 0.148.0",
         root_help,
         exec_help,
-        "",
     );
     assert_eq!(custom.policy.custom_allowlist.len(), 1);
     assert_eq!(
@@ -288,7 +287,6 @@ async fn installed_codex_capability_probe_requires_exact_research_surface() {
         "codex-cli 0.148.0",
         root_help,
         &exec_help.replace("--json", "--json-schema"),
-        "",
     );
     assert_eq!(
         probe_doctor_agent_runtime(&Ok(lookalike.policy.clone())).await,
@@ -298,11 +296,6 @@ async fn installed_codex_capability_probe_requires_exact_research_surface() {
     );
 
     let missing = [
-        (
-            "workspace-write",
-            root_help.replace(" workspace-write", ""),
-            exec_help.to_owned(),
-        ),
         (
             "read-only",
             root_help.replace("read-only ", ""),
@@ -355,7 +348,7 @@ async fn installed_codex_capability_probe_requires_exact_research_surface() {
         ),
     ];
     for (missing_flag, root_help, exec_help) in missing {
-        let fixture = DoctorCodexFixture::new("codex-cli 0.148.0", &root_help, &exec_help, "");
+        let fixture = DoctorCodexFixture::new("codex-cli 0.148.0", &root_help, &exec_help);
         let runtime = probe_doctor_agent_runtime(&Ok(fixture.policy.clone())).await;
         assert_eq!(
             runtime,
@@ -366,7 +359,7 @@ async fn installed_codex_capability_probe_requires_exact_research_surface() {
         );
     }
 
-    let old_version = DoctorCodexFixture::new("codex-cli 0.137.9", root_help, exec_help, "");
+    let old_version = DoctorCodexFixture::new("codex-cli 0.137.9", root_help, exec_help);
     assert_eq!(
         probe_doctor_agent_runtime(&Ok(old_version.policy.clone())).await,
         DoctorAgentRuntime::Blocked {
@@ -375,15 +368,15 @@ async fn installed_codex_capability_probe_requires_exact_research_surface() {
     );
 
     for (label, version_behavior) in [
-        ("nonzero", "exit 9".to_owned()),
-        ("timeout", "/bin/sleep 5".to_owned()),
-        ("oversize", "printf '%262145s' ''".to_owned()),
+        ("nonzero", DoctorVersionBehavior::Nonzero),
+        ("timeout", DoctorVersionBehavior::Timeout),
+        ("oversize", DoctorVersionBehavior::Oversize),
     ] {
-        let fixture = DoctorCodexFixture::new(
+        let fixture = DoctorCodexFixture::with_version_behavior(
             "codex-cli 0.148.0",
             root_help,
             exec_help,
-            &version_behavior,
+            version_behavior,
         );
         let runtime = probe_doctor_agent_runtime(&Ok(fixture.policy.clone())).await;
         assert_eq!(
@@ -395,7 +388,7 @@ async fn installed_codex_capability_probe_requires_exact_research_surface() {
         );
     }
 
-    let replaced = DoctorCodexFixture::new("codex-cli 0.148.0", root_help, exec_help, "");
+    let replaced = DoctorCodexFixture::new("codex-cli 0.148.0", root_help, exec_help);
     fs::rename(&replaced.codex, replaced.codex.with_extension("old")).unwrap();
     fs::write(&replaced.codex, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&replaced.codex, fs::Permissions::from_mode(0o700)).unwrap();
@@ -408,15 +401,11 @@ async fn installed_codex_capability_probe_requires_exact_research_surface() {
 
     let marker_dir = tempfile::tempdir().unwrap();
     let marker = marker_dir.path().join("descendant-survived");
-    let descendant = format!(
-        "( /bin/sleep 1; printf '%s\\n' survived > {} ) >/dev/null 2>&1 &",
-        shell_quote(&marker.to_string_lossy())
-    );
-    let no_survivor = DoctorCodexFixture::new(
+    let no_survivor = DoctorCodexFixture::with_version_behavior(
         "codex-cli 0.148.0",
         root_help,
         exec_help,
-        &descendant,
+        DoctorVersionBehavior::Descendant(marker.clone()),
     );
     let runtime = probe_doctor_agent_runtime(&Ok(no_survivor.policy.clone())).await;
     assert_eq!(
@@ -437,10 +426,18 @@ struct DoctorCodexFixture {
     codex: std::path::PathBuf,
 }
 
+#[cfg(target_os = "linux")]
+enum DoctorVersionBehavior {
+    Nonzero,
+    Timeout,
+    Oversize,
+    Descendant(PathBuf),
+}
+
 #[cfg(unix)]
 impl DoctorCodexFixture {
-    fn new(version: &str, root_help: &str, exec_help: &str, version_behavior: &str) -> Self {
-        Self::build(version, root_help, exec_help, version_behavior, false)
+    fn new(version: &str, root_help: &str, exec_help: &str) -> Self {
+        Self::build(version, root_help, exec_help, "normal", None, false)
     }
 
     #[cfg(target_os = "linux")]
@@ -448,16 +445,39 @@ impl DoctorCodexFixture {
         version: &str,
         root_help: &str,
         exec_help: &str,
-        version_behavior: &str,
     ) -> Self {
-        Self::build(version, root_help, exec_help, version_behavior, true)
+        Self::build(version, root_help, exec_help, "normal", None, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_version_behavior(
+        version: &str,
+        root_help: &str,
+        exec_help: &str,
+        behavior: DoctorVersionBehavior,
+    ) -> Self {
+        let (mode, marker) = match behavior {
+            DoctorVersionBehavior::Nonzero => ("nonzero", None),
+            DoctorVersionBehavior::Timeout => ("timeout", None),
+            DoctorVersionBehavior::Oversize => ("oversize", None),
+            DoctorVersionBehavior::Descendant(marker) => ("descendant", Some(marker)),
+        };
+        Self::build(
+            version,
+            root_help,
+            exec_help,
+            mode,
+            marker.as_deref(),
+            false,
+        )
     }
 
     fn build(
         version: &str,
         root_help: &str,
         exec_help: &str,
-        version_behavior: &str,
+        version_mode: &str,
+        descendant_marker: Option<&Path>,
         custom_agent: bool,
     ) -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -470,13 +490,78 @@ impl DoctorCodexFixture {
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
         }
         let codex = bin.join("codex");
+        let source = bin.join("codex-fixture.rs");
+        let descendant_command = descendant_marker
+            .map(|marker| {
+                format!(
+                    "/bin/sleep 1; printf '%s\\n' survived > {}",
+                    shell_quote(&marker.to_string_lossy())
+                )
+            })
+            .unwrap_or_default();
         fs::write(
-            &codex,
+            &source,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  {version_behavior}\n  printf '%s\\n' '{version}'\n  exit 0\nfi\nif [ \"$1\" = \"--help\" ]; then\n  printf '%s\\n' '{root_help}'\n  exit 0\nfi\nif [ \"$1\" = \"exec\" ] && [ \"$2\" = \"--help\" ]; then\n  printf '%s\\n' '{exec_help}'\n  exit 0\nfi\nexit 0\n"
+                r#"use std::{{env, io::Write, process::{{Command, Stdio}}, thread, time::Duration}};
+
+const VERSION: &str = {version:?};
+const ROOT_HELP: &str = {root_help:?};
+const EXEC_HELP: &str = {exec_help:?};
+const VERSION_MODE: &str = {version_mode:?};
+const DESCENDANT_COMMAND: &str = {descendant_command:?};
+
+fn main() {{
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--version"] {{
+        match VERSION_MODE {{
+            "nonzero" => std::process::exit(9),
+            "timeout" => thread::sleep(Duration::from_secs(5)),
+            "oversize" => {{
+                std::io::stdout().write_all(&vec![b'x'; 262_145]).unwrap();
+                return;
+            }}
+            "descendant" => {{
+                let _ = Command::new("/bin/sh")
+                    .args(["-c", DESCENDANT_COMMAND])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+            }}
+            _ => {{}}
+        }}
+        println!("{{VERSION}}");
+        return;
+    }}
+    if args == ["--help"] {{
+        println!("{{ROOT_HELP}}");
+        return;
+    }}
+    if args == ["exec", "--help"] {{
+        println!("{{EXEC_HELP}}");
+    }}
+}}
+            "#,
+                version = version,
+                root_help = root_help,
+                exec_help = exec_help,
+                version_mode = version_mode,
+                descendant_command = descendant_command,
             ),
         )
         .unwrap();
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "-o"])
+            .arg(&codex)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated doctor Codex failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
         let project_program = if custom_agent {
             let custom = bin.join("custom-standard-agent");
@@ -561,9 +646,8 @@ async fn unavailable_policy_skips_ambient_codex_probe() {
 async fn installed_codex_capability_probe_fails_closed_off_linux() {
     let fixture = DoctorCodexFixture::new(
         "codex-cli 0.148.0",
-        "--strict-config --sandbox read-only workspace-write --ask-for-approval never",
+        "--strict-config --sandbox read-only --ask-for-approval never",
         "--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message --json",
-        "",
     );
     assert_eq!(
         probe_doctor_agent_runtime(&Ok(fixture.policy.clone())).await,
