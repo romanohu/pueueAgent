@@ -69,6 +69,17 @@
 
 `--metric-min-delta` は改善幅であって目標値ではありません。成功条件は最初の投入前に `STATE.md` に記入します。学習コードは `PUEUE_AGENT_RESULT_PATH` に、その実行の ID と有限な metric を含む JSON を出力する必要があります。[出力形式とPython例](getting-started-ja.md#評価結果を出力する)を参照してください。ログへの表示だけでは自動 best 更新の根拠になりません。
 
+### `pueue-agent trial`
+
+- **構文:** `pueue-agent trial [--timeout-seconds 60] [--metric-name NAME --metric-direction minimize|maximize [--metric-min-delta DELTA]] [--json] -- COMMAND...`
+- **目的:** campaign を開始せず、現在の登録済み project で command を一度実行して、実 argv、runtime 環境変数、結果 manifest を確認します。対象 project はカレントディレクトリから解決します。
+- **状態変更:** 専用 nonce group に Pueue task を作り、`.pueue-agent/trials/<trial-id>/` に private output を作ります。task、group、output の cleanup が確認された場合に削除します。campaign、proposal、experiment、submission、budget reservation、agent run、research review、通常 Event、task observation は作成しません。trial 成功後の自動 submit もありません。
+- **主なオプション:** `--timeout-seconds` は1〜300秒、既定60秒です。Pueue control と cleanup の確認には実行 timeout 後も最大30秒かかる場合があります。`--metric-name` と `--metric-direction` はセットで指定し、`--metric-min-delta` は finite かつ0以上の数値です。`--json` は固定 schema の report を返します。
+- **例:** `pueue-agent trial --timeout-seconds 60 --metric-name loss --metric-direction minimize -- python train.py`
+- **group と manifest:** trial は `pueue-agent-trial-<trial_id.simple()>` という未登録 group を毎回作ります。suffix は32桁のhexで、reportのcanonical UUID `trial_id` は36文字です。command は `PUEUE_AGENT_EXPERIMENT_ID`、`PUEUE_AGENT_CAMPAIGN_ID`、`PUEUE_AGENT_RESULT_PATH`、`PUEUE_AGENT_ARTIFACT_DIR` を受け取ります。結果ファイルは16 KiB以下の `{"schema_version":1,"experiment_id":"<PUEUE_AGENT_EXPERIMENT_ID>","metrics":{"loss":0.18}}` 形式で、`metrics` は有限な数値を1つ以上含めます。metric を指定した場合は指定名が必要です。
+- **report と終了コード:** report は `schema_version`、`trial_id`、`task_id`、`group`、`outcome`、`terminal`、`manifest`、`metric_count`、`selected_metric_name`、`selected_metric_value`、`task_cleanup`、`group_cleanup`、`output_cleanup` を含みます。成功は task 成功、manifest 検証、3つの cleanup 確認をすべて満たした場合だけです。成功は0、command failure、timeout、manifest failure、cleanup 不確実は1で終了します。admission後のfailure reportには確認できた trial/task/group ID と cleanup 状態が残ります。preflight failureはreport作成前に固定errorを返すためJSON reportはなく、Clap parse errorは通常のexit behaviorに従います。argv、環境値、manifest bytes は出力しません。
+- **失敗時の確認:** `task_cleanup`、`group_cleanup`、`output_cleanup` のいずれかが `confirmed` でなければ、report の `trial_id`、`task_id`、`group` を保存します。同じ command をすぐ再実行したり、表示されていない ID を削除したりせず、対象 profile の task と group を ID で調査してください。
+
 ### `pueue-agent submit-batch`
 
 - **構文:** `pueue-agent submit-batch --request-id UUID --manifest PATH [--group GROUP] [--json] [PROJECT_ROOT]`
@@ -274,6 +285,7 @@ pueue-agent experiment inspect <experiment-id>
 - **状態変更:** ありません（読み取り専用）。エラー診断がある場合は非ゼロ終了します。
 - **主なオプション:** `--json`、`--pueue-config`、任意の `PROJECT_ROOT`。
 - **例:** `pueue-agent doctor --json .`
+- **確認点:** active campaign がない場合の `state.objective` は `STATE.md` が初回 submit に使えるかを、`execution.agent_runtime` は pinned Codex が research runtime を実行できるかを示します。どちらも読み取り専用 check です。
 - **失敗時の確認:** 出力の各チェックの remediation を実行し、実行ポリシーとサービス状態を再確認します。
 
 decision 診断は live campaign に限定した policy 上限 + 1 の read-only probe です。`decision.rows` は cycle / attempt の件数上限、SQLite storage class、payload byte 上限を、`decision.lineage` は terminal source experiment との同一 campaign lineage を確認します。`decision.active_attempts` は active attempt と agent binding の単一 owner、`decision.running_attempts` は run ownership と timeout、`decision.wait_wake` は有限 wake、`decision.digests` は current cycle の bounded payload digest、`decision.degraded_diagnostics` は degraded cycle の bounded failure facts を確認します。doctor は row を移行、削除、修復せず、raw prompt、objective、decision body を出力しません。

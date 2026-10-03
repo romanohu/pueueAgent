@@ -252,6 +252,630 @@ fn cancel_command_requires_one_explicit_task_id() {
         .is_err());
 }
 
+#[test]
+fn trial_cli_contract_accepts_timeout_bounds_and_complete_metric_flags() {
+    for timeout in ["1", "60", "300"] {
+        let parsed = pueue_agent::cli::Cli::try_parse_from([
+            "pueue-agent",
+            "trial",
+            "--timeout-seconds",
+            timeout,
+            "--metric-name",
+            "loss",
+            "--metric-direction",
+            "minimize",
+            "--metric-min-delta",
+            "0.1",
+            "--json",
+            "--",
+            "python",
+            "train.py",
+        ]);
+        assert!(parsed.is_ok(), "timeout {timeout} should parse: {parsed:?}");
+    }
+
+    let default =
+        pueue_agent::cli::Cli::try_parse_from(["pueue-agent", "trial", "--", "python", "train.py"])
+            .unwrap();
+    assert!(format!("{default:?}").contains("timeout_seconds: 60"));
+
+    for arguments in [
+        vec!["trial", "--timeout-seconds", "0", "--", "true"],
+        vec!["trial", "--timeout-seconds", "301", "--", "true"],
+        vec!["trial", "--metric-name", "loss", "--", "true"],
+        vec!["trial", "--metric-direction", "minimize", "--", "true"],
+        vec!["trial", "--metric-min-delta", "0.1", "--", "true"],
+        vec![
+            "trial",
+            "--metric-name",
+            "loss",
+            "--metric-direction",
+            "minimize",
+            "--metric-min-delta",
+            "-0.1",
+            "--",
+            "true",
+        ],
+        vec!["trial", "--"],
+    ] {
+        let mut full = vec!["pueue-agent"];
+        full.extend(arguments);
+        assert!(
+            pueue_agent::cli::Cli::try_parse_from(full).is_err(),
+            "invalid trial arguments must be rejected"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn trial_rejects_non_utf8_command_argument_before_database_setup() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let temporary = TempDir::new().unwrap();
+    let state_dir = temporary.path().join("state");
+    fs::create_dir(&state_dir).unwrap();
+    let invalid_argument = OsString::from_vec(vec![b'c', 0xff]);
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .env("PUEUE_AGENT_STATE_DIR", &state_dir)
+        .current_dir(temporary.path())
+        .args(["trial", "--"])
+        .arg(invalid_argument)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("must be valid UTF-8"), "{stderr}");
+    assert!(!state_dir.join("state.sqlite3").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn trial_cli_runs_one_isolated_task_and_keeps_the_database_read_only() {
+    let harness = TrialCliHarness::new();
+    let before = trial_cli_database_snapshot(&harness.database_path);
+    let output = harness
+        .command()
+        .args([
+            "trial",
+            "--metric-name",
+            &harness.metric_name,
+            "--metric-direction",
+            "minimize",
+            "--",
+        ])
+        .arg(&harness.child)
+        .arg(&harness.secret)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let human = String::from_utf8_lossy(&output.stdout);
+    assert!(human.contains("outcome: succeeded"), "{human}");
+    assert!(human.contains("terminal: succeeded"), "{human}");
+    assert!(human.contains("manifest: valid"), "{human}");
+    assert!(human.contains("selected_metric_value: 1.25"), "{human}");
+    assert!(human.contains("task_cleanup: confirmed"), "{human}");
+    assert!(human.contains("group_cleanup: confirmed"), "{human}");
+    assert!(human.contains("output_cleanup: confirmed"), "{human}");
+    assert!(!human.contains(&harness.secret));
+    assert!(!human.contains(".pueue-agent/trials/"));
+
+    let observation = fs::read_to_string(&harness.child_observation).unwrap();
+    assert!(observation.contains(&format!("cwd={}\n", harness.root.display())));
+    assert!(observation.contains("result=.pueue-agent/trials/"));
+    assert!(observation.contains("artifact=.pueue-agent/trials/"));
+    assert!(observation.contains("experiment_id="));
+    assert!(observation.contains("campaign_id="));
+    assert!(observation.contains("result_path="));
+    assert!(observation.contains("artifact_dir="));
+    assert_eq!(
+        fs::read(harness.root.join("trial-input.txt")).unwrap(),
+        b"fixture input"
+    );
+    assert!(!harness.codex_marker.exists());
+    assert!(!harness.task_state.exists());
+    assert!(!harness.group_state.exists());
+
+    let calls = fs::read_to_string(&harness.pueue_calls).unwrap();
+    let add_group = calls
+        .lines()
+        .find_map(|line| line.strip_prefix("add:"))
+        .expect("one trial Pueue add");
+    assert!(add_group.starts_with("pueue-agent-trial-"));
+    assert_eq!(add_group.len(), 50);
+    assert_ne!(add_group, harness.project_group);
+    assert!(calls.contains("remove:41"));
+    assert!(calls.contains(&format!("group-remove:{add_group}")));
+
+    let after = trial_cli_database_snapshot(&harness.database_path);
+    assert_eq!(before, after);
+}
+
+#[cfg(unix)]
+#[test]
+fn trial_json_failure_is_bounded_and_exits_after_cleanup() {
+    let harness = TrialCliHarness::new();
+    let before = trial_cli_database_snapshot(&harness.database_path);
+    let output = harness
+        .command()
+        .args([
+            "trial",
+            "--metric-name",
+            &harness.metric_name,
+            "--metric-direction",
+            "minimize",
+            "--json",
+            "--",
+        ])
+        .arg(&harness.child)
+        .arg(&harness.secret)
+        .arg("--fail")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"], "command_failed");
+    assert_eq!(report["terminal"], "failed");
+    assert_eq!(report["manifest"], "not_read");
+    assert_eq!(report["task_cleanup"], "confirmed");
+    assert_eq!(report["group_cleanup"], "confirmed");
+    assert_eq!(report["output_cleanup"], "confirmed");
+    assert!(!stdout.contains(&harness.secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(&harness.secret));
+    assert!(!harness.task_state.exists());
+    assert!(!harness.group_state.exists());
+    assert_eq!(before, trial_cli_database_snapshot(&harness.database_path));
+}
+
+#[cfg(unix)]
+#[test]
+fn trial_json_preflight_error_does_not_fabricate_a_report_or_leak_inputs() {
+    let harness = TrialCliHarness::new();
+    fs::write(harness.root.join(".pueue-agent/STATE.md"), "").unwrap();
+    let before = trial_cli_database_snapshot(&harness.database_path);
+    let output = harness
+        .command()
+        .args(["trial", "--json", "--"])
+        .arg(&harness.child)
+        .arg(&harness.secret)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("trial stopped before a bounded report was available"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(&harness.secret));
+    assert!(!stderr.contains(&harness.root.display().to_string()));
+    assert!(!stderr.contains(&harness.child.display().to_string()));
+    assert!(!harness.pueue_calls.exists());
+    assert!(!harness.root.join(".pueue-agent/trials").exists());
+    assert_eq!(before, trial_cli_database_snapshot(&harness.database_path));
+}
+
+#[cfg(unix)]
+struct TrialCliHarness {
+    _temporary: TempDir,
+    root: std::path::PathBuf,
+    database_path: std::path::PathBuf,
+    project_group: String,
+    metric_name: String,
+    secret: String,
+    child: std::path::PathBuf,
+    child_observation: std::path::PathBuf,
+    codex_marker: std::path::PathBuf,
+    pueue_calls: std::path::PathBuf,
+    task_state: std::path::PathBuf,
+    group_state: std::path::PathBuf,
+    state_dir: std::path::PathBuf,
+    home: std::path::PathBuf,
+    codex_home: std::path::PathBuf,
+    trusted_dir: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl TrialCliHarness {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = TempDir::new().unwrap();
+        let temporary_root = fs::canonicalize(temporary.path()).unwrap();
+        let root = temporary_root.join("project");
+        fs::create_dir(&root).unwrap();
+        pueue_agent::init::run(&root).unwrap();
+        fs::write(
+            root.join(".pueue-agent/STATE.md"),
+            "Minimize validation loss below 0.10.\n",
+        )
+        .unwrap();
+        fs::write(root.join("trial-input.txt"), b"fixture input").unwrap();
+
+        let state_dir = temporary_root.join("state");
+        fs::create_dir(&state_dir).unwrap();
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let database_path = state_dir.join("state.sqlite3");
+        let db = Db::open(&database_path).unwrap();
+        let project_config =
+            pueue_agent::config::load(&root.join(".pueue-agent/config.toml")).unwrap();
+        ProjectRepository::new(&db)
+            .register(&NewProject::new(
+                &project_config.project_id,
+                &root,
+                &project_config.pueue_group,
+                root.join(".pueue-agent/config.toml"),
+                100,
+            ))
+            .unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE projects SET paused = 1 WHERE project_id = ?1",
+                [&project_config.project_id],
+            )
+            .unwrap();
+
+        let home = temporary_root.join("home");
+        let codex_home = temporary_root.join("codex-home");
+        let trusted_dir = temporary_root.join("trusted-bin");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&codex_home).unwrap();
+        fs::create_dir(&trusted_dir).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&trusted_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let pueue_config = home.join(".config/pueue/pueue.yml");
+        fs::create_dir_all(pueue_config.parent().unwrap()).unwrap();
+        fs::write(&pueue_config, "fixture: true\n").unwrap();
+        fs::set_permissions(&pueue_config, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let pueue = trusted_dir.join("pueue");
+        let pueue_calls = temporary_root.join("pueue-calls.log");
+        let task_state = temporary_root.join("pueue-task.state");
+        let group_state = temporary_root.join("pueue-group.state");
+        compile_trial_pueue(&pueue, &pueue_calls, &task_state, &group_state);
+        let codex = trusted_dir.join("codex");
+        fs::write(
+            &codex,
+            "#!/bin/sh\nprintf invoked > \"$0.marker\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+        let codex_marker = codex.with_extension("marker");
+
+        let policy_path = state_dir.join("execution-policy.toml");
+        fs::write(
+            &policy_path,
+            format!(
+                "version = 1\ntrusted_path = {:?}\n\n[executables]\ncodex = {:?}\npueue = {:?}\n",
+                trusted_dir.display().to_string(),
+                codex.display().to_string(),
+                pueue.display().to_string(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let secret = "trial-secret-sentinel-6e2ab1".to_owned();
+        let metric_name = format!("API_KEY={secret}");
+        let child = temporary_root.join("trial-child");
+        let child_observation = temporary_root.join("trial-child-observation.txt");
+        compile_trial_child(&child, &root, &child_observation, &secret, &metric_name);
+
+        Self {
+            _temporary: temporary,
+            root,
+            database_path,
+            project_group: project_config.pueue_group,
+            metric_name,
+            secret,
+            child,
+            child_observation,
+            codex_marker,
+            pueue_calls,
+            task_state,
+            group_state,
+            state_dir,
+            home,
+            codex_home,
+            trusted_dir,
+        }
+    }
+
+    fn command(&self) -> assert_cmd::Command {
+        let mut command = assert_cmd::Command::cargo_bin("pueue-agent").unwrap();
+        command
+            .env("PUEUE_AGENT_STATE_DIR", &self.state_dir)
+            .env("HOME", &self.home)
+            .env("CODEX_HOME", &self.codex_home)
+            .env("PATH", &self.trusted_dir)
+            .env_remove("PUEUE_CONFIG")
+            .current_dir(&self.root);
+        command
+    }
+}
+
+#[cfg(unix)]
+fn compile_trial_pueue(
+    target: &std::path::Path,
+    calls: &std::path::Path,
+    task_state: &std::path::Path,
+    group_state: &std::path::Path,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source_path = target.with_extension("rs");
+    let source = r#"
+use std::{env, fs, fs::OpenOptions, io::Write, path::Path, process::Command};
+
+const CALLS: &str = __CALLS__;
+const TASK_STATE: &str = __TASK_STATE__;
+const GROUP_STATE: &str = __GROUP_STATE__;
+const SECRET: &str = __SECRET__;
+
+fn quote(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '\"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character if character.is_control() => {
+                quoted.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('\"');
+    quoted
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|byte| matches!(
+            byte,
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'@' | b'%' | b'_' | b'+' |
+                b'=' | b',' | b'.' | b'/' | b'-'
+        ))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn log_call(value: &str) {
+    writeln!(OpenOptions::new().create(true).append(true).open(CALLS).unwrap(), "{value}").unwrap();
+}
+
+fn main() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    let operation = ["status", "group", "add", "kill", "remove"]
+        .iter()
+        .find(|operation| args.iter().any(|argument| argument == **operation))
+        .copied()
+        .unwrap_or("");
+    let operation_index = args.iter().position(|argument| argument == operation).unwrap();
+    let operation_args = &args[operation_index + 1..];
+
+    match operation {
+        "status" => {
+            log_call("status");
+            let Ok(task) = fs::read_to_string(TASK_STATE) else {
+                println!("{{\"tasks\":{{}}}}");
+                return;
+            };
+            let fields = task.splitn(4, '\n').collect::<Vec<_>>();
+            let mut output = String::from("{\"tasks\":{\"41\":{\"id\":41,\"group\":");
+            output.push_str(&quote(fields[0]));
+            output.push_str(",\"command\":");
+            output.push_str(&quote(fields[1]));
+            output.push_str(",\"status\":{");
+            output.push_str(&quote(fields[2]));
+            output.push_str(":{\"enqueued_at\":\"100\",\"start\":\"100\",\"end\":\"101\",\"result\":");
+            output.push_str(&quote(fields[3]));
+            output.push_str("}}}}}");
+            println!("{output}");
+        }
+        "group" if operation_args.first().is_some_and(|argument| argument == "-j") => {
+            let Ok(group) = fs::read_to_string(GROUP_STATE) else {
+                log_call("group-json");
+                println!("{{}}");
+                return;
+            };
+            log_call("group-json");
+            println!("{{{}:{{\"status\":\"Running\"}}}}", quote(group.trim()));
+        }
+        "group" if operation_args.first().is_some_and(|argument| argument == "add") => {
+            let group = operation_args.get(1).expect("group name");
+            fs::write(GROUP_STATE, group).unwrap();
+            log_call(&format!("group-add:{group}"));
+        }
+        "group" if operation_args.first().is_some_and(|argument| argument == "remove") => {
+            let group = operation_args.get(1).expect("group name");
+            let _ = fs::remove_file(GROUP_STATE);
+            log_call(&format!("group-remove:{group}"));
+        }
+        "add" => {
+            let group_index = operation_args.iter().position(|argument| argument == "-g").unwrap();
+            let group = operation_args[group_index + 1].clone();
+            let directory_index = operation_args.iter().position(|argument| argument == "--working-directory").unwrap();
+            let working_directory = &operation_args[directory_index + 1];
+            let separator_index = operation_args.iter().position(|argument| argument == "--").unwrap();
+            let argv = &operation_args[separator_index + 1..];
+            let command = argv.iter().map(|argument| shell_quote(argument)).collect::<Vec<_>>().join(" ");
+            let mut child = Command::new(argv.first().expect("runtime executable"));
+            child.args(&argv[1..]).current_dir(working_directory).env("TASK_SECRET_SENTINEL", SECRET);
+            let status = child.status().expect("launch one trial command");
+            let succeeded = status.success();
+            let state = if succeeded { "Done" } else { "Failed" };
+            let result = if succeeded { "Success" } else { "Failed" };
+            fs::write(TASK_STATE, format!("{group}\n{command}\n{state}\n{result}" )).unwrap();
+            log_call(&format!("add:{group}"));
+            println!("41");
+        }
+        "remove" => {
+            let task_id = operation_args.first().unwrap();
+            let _ = fs::remove_file(TASK_STATE);
+            log_call(&format!("remove:{task_id}"));
+        }
+        "kill" => log_call(&format!("kill:{}", operation_args.first().unwrap_or(&String::new()))),
+        _ => panic!("unexpected Pueue operation"),
+    }
+}
+"#
+    .replace("__CALLS__", &format!("{:?}", calls.to_string_lossy()))
+    .replace("__TASK_STATE__", &format!("{:?}", task_state.to_string_lossy()))
+    .replace("__GROUP_STATE__", &format!("{:?}", group_state.to_string_lossy()))
+    .replace("__SECRET__", &format!("{:?}", "trial-secret-sentinel-6e2ab1"));
+    fs::write(&source_path, source).unwrap();
+    let output = std::process::Command::new("rustc")
+        .args(["--edition=2021", "-O", "-o"])
+        .arg(target)
+        .arg(&source_path)
+        .output()
+        .expect("compile disposable Pueue fixture");
+    assert!(
+        output.status.success(),
+        "disposable Pueue fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::set_permissions(target, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(unix)]
+fn compile_trial_child(
+    target: &std::path::Path,
+    root: &std::path::Path,
+    observation: &std::path::Path,
+    secret: &str,
+    metric_name: &str,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source_path = target.with_extension("rs");
+    let source = r#"
+use std::{env, fs, path::{Path, PathBuf}, process};
+
+const ROOT: &str = __ROOT__;
+const OBSERVATION: &str = __OBSERVATION__;
+const SECRET: &str = __SECRET__;
+const METRIC_NAME: &str = __METRIC_NAME__;
+
+fn main() {
+    let root = PathBuf::from(ROOT);
+    let cwd = env::current_dir().unwrap();
+    assert_eq!(cwd, root);
+    assert_eq!(fs::read(root.join("trial-input.txt")).unwrap(), b"fixture input");
+    let experiment_id = env::var("PUEUE_AGENT_EXPERIMENT_ID").unwrap();
+    let campaign_id = env::var("PUEUE_AGENT_CAMPAIGN_ID").unwrap();
+    let result = PathBuf::from(env::var_os("PUEUE_AGENT_RESULT_PATH").unwrap());
+    let artifact = PathBuf::from(env::var_os("PUEUE_AGENT_ARTIFACT_DIR").unwrap());
+    let expected_trials = root.join(".pueue-agent/trials");
+    let generation = result.parent().unwrap();
+    assert!(generation.starts_with(&expected_trials));
+    assert_eq!(result.file_name().unwrap(), "result.json");
+    assert_eq!(artifact, generation.join("artifacts"));
+    let generation_id = generation.file_name().unwrap().to_string_lossy();
+    assert_eq!(generation_id.len(), 36);
+    assert_eq!(env::var("TASK_SECRET_SENTINEL").unwrap(), SECRET);
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    assert!(args.contains(&SECRET.to_owned()));
+
+    fs::create_dir_all(&artifact).unwrap();
+    fs::write(artifact.join("fixture.bin"), b"fixture artifact").unwrap();
+    let observation = format!(
+        "cwd={}\nresult={}\nartifact={}\nexperiment_id={}\ncampaign_id={}\nresult_path={}\nartifact_dir={}\n",
+        cwd.display(),
+        result.strip_prefix(&root).unwrap().display(),
+        artifact.strip_prefix(&root).unwrap().display(),
+        experiment_id,
+        campaign_id,
+        result.display(),
+        artifact.display(),
+    );
+    fs::write(OBSERVATION, observation).unwrap();
+    let manifest = format!(
+        "{{\"schema_version\":1,\"experiment_id\":\"{experiment_id}\",\"metrics\":{{\"{METRIC_NAME}\":1.25}},\"private_note\":\"{SECRET}\"}}"
+    );
+    fs::write(&result, manifest).unwrap();
+    if args.iter().any(|argument| argument == "--fail") {
+        process::exit(7);
+    }
+    assert!(Path::new(&result).exists());
+}
+"#
+    .replace("__ROOT__", &format!("{:?}", root.to_string_lossy()))
+    .replace("__OBSERVATION__", &format!("{:?}", observation.to_string_lossy()))
+    .replace("__SECRET__", &format!("{:?}", secret))
+    .replace("__METRIC_NAME__", &format!("{:?}", metric_name));
+    fs::write(&source_path, source).unwrap();
+    let output = std::process::Command::new("rustc")
+        .args(["--edition=2021", "-O", "-o"])
+        .arg(target)
+        .arg(&source_path)
+        .output()
+        .expect("compile disposable trial command");
+    assert!(
+        output.status.success(),
+        "disposable trial command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::set_permissions(target, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(unix)]
+fn trial_cli_database_snapshot(
+    path: &std::path::Path,
+) -> std::collections::BTreeMap<String, Vec<Vec<String>>> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let mut snapshot = std::collections::BTreeMap::new();
+    for table in [
+        "campaigns",
+        "proposals",
+        "experiments",
+        "submissions",
+        "budget_reservations",
+        "agent_runs",
+        "research_reviews",
+        "events",
+        "integration_events",
+        "task_observations",
+    ] {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let column_count = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..column_count)
+                    .map(|index| row.get::<_, Value>(index).map(|value| format!("{value:?}")))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        snapshot.insert(table.to_owned(), rows);
+    }
+    snapshot
+}
+
 #[cfg(unix)]
 #[test]
 fn service_lifecycle_commands_report_only_verified_service_state() {

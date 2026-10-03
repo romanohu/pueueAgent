@@ -215,13 +215,11 @@ impl PrivateTrialOutput {
                 private_trial_output_paths(&verified_root.anchor.canonical_path, trial_id);
             let root_mount = directory_mount_identity_at(&verified_root.directory, stage)?;
             let root_record = research_directory_record_at(&verified_root.directory, root_mount, stage)?;
-            let service = open_or_create_retention_directory(
+            let service = open_or_create_private_temp_container(
                 &verified_root.directory,
                 OsStr::new(PRIVATE_TEMP_ROOT),
-                root_mount,
-                true,
-                stage,
-            )?;
+            )
+            .map_err(|violation| stage_violation(violation, stage))?;
             let service_record = research_directory_record_at(&service, root_mount, stage)?;
             let trials = open_or_create_retention_directory(
                 &service,
@@ -8109,6 +8107,73 @@ mod tests {
         assert!(service.exists());
         assert!(trials.exists());
         assert_eq!(fs::read(&sibling_sentinel).unwrap(), b"neighbor");
+    }
+
+    #[test]
+    fn private_trial_output_rejects_unsafe_service_parents_without_mutation() {
+        for mode in [0o720, 0o702] {
+            let holder = tempfile::tempdir().unwrap();
+            let root_path = holder.path().join("project");
+            fs::create_dir(&root_path).unwrap();
+            fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+            let service = root_path.join(PRIVATE_TEMP_ROOT);
+            fs::create_dir(&service).unwrap();
+            fs::set_permissions(&service, fs::Permissions::from_mode(mode)).unwrap();
+            let sentinel = service.join("sentinel");
+            fs::write(&sentinel, b"preserve writable service").unwrap();
+            let root_path = fs::canonicalize(root_path).unwrap();
+            let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+            let root = anchor.verify_identity().unwrap();
+
+            let error = match PrivateTrialOutput::create(&root, Uuid::new_v4()) {
+                Ok(_) => panic!("writable service parent was accepted"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+            assert_eq!(error.stage, PolicyViolationStage::PreBinding);
+            assert_eq!(
+                error.detail,
+                PolicyViolationDetail::TempUnsafe(TempUnsafeReason::InvalidEntry)
+            );
+            assert_eq!(fs::metadata(&service).unwrap().permissions().mode() & 0o777, mode);
+            assert_eq!(fs::read(&sentinel).unwrap(), b"preserve writable service");
+            assert!(!service.join("trials").exists());
+        }
+
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        let outside_service = holder.path().join("outside-service");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&outside_service).unwrap();
+        fs::set_permissions(&outside_service, fs::Permissions::from_mode(0o700)).unwrap();
+        let sentinel = outside_service.join("sentinel");
+        fs::write(&sentinel, b"preserve symlink target").unwrap();
+        let service = root_path.join(PRIVATE_TEMP_ROOT);
+        symlink(&outside_service, &service).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+
+        let error = match PrivateTrialOutput::create(&root, Uuid::new_v4()) {
+            Ok(_) => panic!("symlink service parent was accepted"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, PolicyViolationCode::TempUnsafe);
+        assert_eq!(error.stage, PolicyViolationStage::PreBinding);
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::IoFailure)
+        );
+        assert!(fs::symlink_metadata(&service)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(&service).unwrap(), outside_service);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve symlink target");
+        assert!(!outside_service.join("trials").exists());
     }
 
     #[test]

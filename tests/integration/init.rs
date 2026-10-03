@@ -7,7 +7,7 @@ use assert_cmd::{cargo::CommandCargoExt, Command};
 use pueue_agent::{
     config,
     db::{AgentRunRepository, Db, EventRepository, ProjectRepository},
-    environment::PrivateRunTemp,
+    environment::{PrivateRunTemp, PrivateTrialOutput},
     execution_policy::ProjectRootAnchor,
     models::{
         AgentContextMode, AgentRunStatus, EventKind, NewAgentRun, NewEvent, NewProject,
@@ -15,6 +15,7 @@ use pueue_agent::{
     state, AppError,
 };
 use tempfile::TempDir;
+use uuid::Uuid;
 
 fn init(root: &std::path::Path) -> std::process::Output {
     Command::cargo_bin("pueue-agent")
@@ -272,6 +273,42 @@ fn ordinary_init_container_allows_private_temp_inventory_create_and_removal() {
         0o700
     );
     drop(generation);
+
+    let mut trial_output = PrivateTrialOutput::create(&verified_root, Uuid::new_v4()).unwrap();
+    let trial_generation = trial_output.result_path().parent().unwrap().to_owned();
+    let trials = trial_generation.parent().unwrap().to_owned();
+    assert_eq!(
+        fs::metadata(&trials).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&trial_generation)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    fs::write(trial_output.result_path(), b"init trial result").unwrap();
+    fs::set_permissions(
+        trial_output.result_path(),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    assert_eq!(
+        trial_output.read_result_bounded().unwrap(),
+        b"init trial result"
+    );
+    trial_output.cleanup().unwrap();
+    assert!(!trial_generation.exists());
+    assert_eq!(
+        fs::metadata(root.join(".pueue-agent"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
 
     ProjectRepository::new(&db)
         .remove("project-a", 110, &[])

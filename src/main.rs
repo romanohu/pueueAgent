@@ -63,6 +63,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Disable(args) => commands::disable(args).await,
         Command::Cancel(args) => commands::cancel(args).await,
         Command::Submit(args) => commands::submit(args).await,
+        Command::Trial(args) => commands::trial(args).await,
         Command::SubmitBatch(args) => commands::submit_batch(args).await,
         Command::Event(args) => commands::event(args).await,
         Command::Status(args) => commands::status(args).await,
@@ -99,7 +100,7 @@ mod commands {
             InspectArgs, InstructionsAction, InstructionsArgs, ProjectArgs, ProposalAction,
             ProposalArgs, RunsArgs,
             ServiceLifecycleArgs, StatusArgs, SteerAction, SteerArgs, SubmitArgs, SubmitBatchArgs,
-            UpgradeArgs, VersionArgs, WakeArgs,
+            TrialArgs, UpgradeArgs, VersionArgs, WakeArgs,
         },
         daemon::{production_shutdown_token, Daemon, DaemonConfig},
         db::{CampaignRepository, Db, InterventionRepository, ProjectRepository},
@@ -126,7 +127,7 @@ mod commands {
             ServiceStatus,
         },
         status::{self as status_command, DisableMode, PueueSnapshot, StatusInput},
-        submit as submit_command,
+        submit as submit_command, trial as trial_command,
         upgrade::{
             self, resolve_source_root, ProcessUpgradeCommandRunner, ReloadingPueueHealth,
             UpgradeRunner,
@@ -370,8 +371,12 @@ mod commands {
             metric_direction,
             metric_min_delta,
         } = args;
-        let objective_metric =
-            crate::objective_metric_from_flags(metric_name, metric_direction, metric_min_delta)?;
+        let objective_metric = crate::objective_metric_from_flags(
+            metric_name,
+            metric_direction,
+            metric_min_delta,
+            "submit.metric",
+        )?;
         let current_dir = env::current_dir().map_err(|source| AppError::Io {
             operation: "read current directory",
             source,
@@ -415,6 +420,69 @@ mod commands {
             submit_command::render_submission(&submission, &registered.pueue_group, json)?
         );
         Ok(())
+    }
+
+    pub async fn trial(args: TrialArgs) -> Result<(), AppError> {
+        let TrialArgs {
+            timeout_seconds,
+            metric_name,
+            metric_direction,
+            metric_min_delta,
+            json,
+            command,
+        } = args;
+        let objective_metric = crate::objective_metric_from_flags(
+            metric_name,
+            metric_direction,
+            metric_min_delta,
+            "trial.metric",
+        )?;
+        let argv = command
+            .into_iter()
+            .map(|argument| {
+                argument.into_string().map_err(|_| AppError::Validation {
+                    field: "trial.command",
+                    message: "must be valid UTF-8",
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (db, project, _service_paths, policy) =
+            resolve_project_read_only(None, None).map_err(|_| super::trial_preflight_error())?;
+        let pueue = configured_pueue(Arc::clone(&policy))
+            .map_err(|_| super::trial_preflight_error())?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let signal_cancellation = cancellation.clone();
+        let interrupt_monitor = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                signal_cancellation.cancel();
+            }
+        });
+        let result = trial_command::run_with(
+            &db,
+            &project,
+            policy,
+            &pueue,
+            &trial_command::TrialOptions {
+                argv,
+                objective_metric,
+                timeout: std::time::Duration::from_secs(timeout_seconds),
+            },
+            cancellation,
+        )
+        .await;
+        interrupt_monitor.abort();
+        let _ = interrupt_monitor.await;
+        let report = result.map_err(|_| AppError::Message {
+            message: "trial stopped before a bounded report was available".to_owned(),
+        })?;
+        println!("{}", super::render_trial_report(&report, json)?);
+        if report.is_success() {
+            Ok(())
+        } else {
+            Err(AppError::Message {
+                message: "trial failed; inspect the bounded report".to_owned(),
+            })
+        }
     }
 
     pub async fn submit_batch(args: SubmitBatchArgs) -> Result<(), AppError> {
@@ -1068,10 +1136,114 @@ mod commands {
     }
 }
 
+fn trial_preflight_error() -> AppError {
+    AppError::Message {
+        message: "trial could not start; check project readiness and configuration".to_owned(),
+    }
+}
+
+fn render_trial_report(
+    report: &pueue_agent::trial::TrialReport,
+    json: bool,
+) -> Result<String, AppError> {
+    if json {
+        return serde_json::to_string_pretty(report).map_err(|_| AppError::Message {
+            message: "trial report could not be rendered".to_owned(),
+        });
+    }
+
+    let terminal = match report.terminal {
+        Some(pueue_agent::trial::TrialTerminalClass::Succeeded) => "succeeded",
+        Some(pueue_agent::trial::TrialTerminalClass::Failed) => "failed",
+        None => "none",
+    };
+    Ok(format!(
+        concat!(
+            "schema_version: {}\n",
+            "trial_id: {}\n",
+            "task_id: {}\n",
+            "group: {}\n",
+            "outcome: {}\n",
+            "terminal: {}\n",
+            "manifest: {}\n",
+            "metric_count: {}\n",
+            "selected_metric_name: {}\n",
+            "selected_metric_value: {}\n",
+            "task_cleanup: {}\n",
+            "group_cleanup: {}\n",
+            "output_cleanup: {}"
+        ),
+        report.schema_version,
+        report.trial_id,
+        report
+            .task_id
+            .map(|task_id| task_id.to_string())
+            .unwrap_or_else(|| "none".to_owned()),
+        report.group,
+        trial_outcome_code(report.outcome),
+        terminal,
+        trial_manifest_code(report.manifest),
+        report
+            .metric_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "none".to_owned()),
+        report.selected_metric_name.as_deref().unwrap_or("none"),
+        report
+            .selected_metric_value
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_owned()),
+        trial_cleanup_code(report.task_cleanup),
+        trial_cleanup_code(report.group_cleanup),
+        trial_cleanup_code(report.output_cleanup),
+    ))
+}
+
+fn trial_outcome_code(outcome: pueue_agent::trial::TrialOutcome) -> &'static str {
+    use pueue_agent::trial::TrialOutcome;
+
+    match outcome {
+        TrialOutcome::Succeeded => "succeeded",
+        TrialOutcome::CommandFailed => "command_failed",
+        TrialOutcome::TimedOut => "timed_out",
+        TrialOutcome::Cancelled => "cancelled",
+        TrialOutcome::AddUncertain => "add_uncertain",
+        TrialOutcome::GroupCreationFailed => "group_creation_failed",
+        TrialOutcome::ControlFailed => "control_failed",
+        TrialOutcome::IdentityUncertain => "identity_uncertain",
+        TrialOutcome::ManifestInvalid => "manifest_invalid",
+        TrialOutcome::SelectedMetricMissing => "selected_metric_missing",
+        TrialOutcome::CleanupUncertain => "cleanup_uncertain",
+    }
+}
+
+fn trial_manifest_code(manifest: pueue_agent::trial::TrialManifestClass) -> &'static str {
+    use pueue_agent::trial::TrialManifestClass;
+
+    match manifest {
+        TrialManifestClass::NotRead => "not_read",
+        TrialManifestClass::Valid => "valid",
+        TrialManifestClass::Invalid => "invalid",
+    }
+}
+
+fn trial_cleanup_code(cleanup: pueue_agent::trial::TrialCleanupStatus) -> &'static str {
+    use pueue_agent::trial::TrialCleanupStatus;
+
+    match cleanup {
+        TrialCleanupStatus::NotStarted => "not_started",
+        TrialCleanupStatus::NotRequired => "not_required",
+        TrialCleanupStatus::Confirmed => "confirmed",
+        TrialCleanupStatus::NotOwned => "not_owned",
+        TrialCleanupStatus::Retained => "retained",
+        TrialCleanupStatus::Uncertain => "uncertain",
+    }
+}
+
 fn objective_metric_from_flags(
     name: Option<String>,
     direction: Option<pueue_agent::cli::MetricDirectionArg>,
     min_delta: Option<f64>,
+    error_field: &'static str,
 ) -> Result<Option<pueue_agent::models::ObjectiveMetric>, AppError> {
     match (name, direction, min_delta) {
         (None, None, None) => Ok(None),
@@ -1092,7 +1264,7 @@ fn objective_metric_from_flags(
             Ok(Some(metric))
         }
         _ => Err(AppError::Validation {
-            field: "submit.metric",
+            field: error_field,
             message:
                 "--metric-name and --metric-direction must be provided together; --metric-min-delta is optional and requires both",
         }),
@@ -1110,6 +1282,7 @@ mod objective_metric_flag_tests {
             Some("loss".to_owned()),
             Some(MetricDirectionArg::Minimize),
             None,
+            "submit.metric",
         )
         .unwrap();
         let metric = metric.expect("must be Some");
@@ -1119,13 +1292,34 @@ mod objective_metric_flag_tests {
 
     #[test]
     fn rejects_incomplete_metric_flags() {
-        assert!(objective_metric_from_flags(Some("loss".to_owned()), None, None).is_err());
-        assert!(objective_metric_from_flags(None, Some(MetricDirectionArg::Maximize), None).is_err());
-        assert!(objective_metric_from_flags(None, None, Some(0.1)).is_err());
-        assert!(objective_metric_from_flags(Some("loss".to_owned()), None, Some(0.1)).is_err());
-        let err = objective_metric_from_flags(Some("loss".to_owned()), None, None)
+        assert!(
+            objective_metric_from_flags(Some("loss".to_owned()), None, None, "submit.metric")
+                .is_err()
+        );
+        assert!(objective_metric_from_flags(
+            None,
+            Some(MetricDirectionArg::Maximize),
+            None,
+            "submit.metric"
+        )
+        .is_err());
+        assert!(objective_metric_from_flags(None, None, Some(0.1), "submit.metric").is_err());
+        assert!(objective_metric_from_flags(
+            Some("loss".to_owned()),
+            None,
+            Some(0.1),
+            "submit.metric"
+        )
+        .is_err());
+        let err = objective_metric_from_flags(Some("loss".to_owned()), None, None, "submit.metric")
             .unwrap_err()
             .to_string();
+        assert!(err.contains("submit.metric"));
         assert!(err.contains("must be provided together") || err.contains("together"));
+        let trial_err =
+            objective_metric_from_flags(Some("loss".to_owned()), None, None, "trial.metric")
+                .unwrap_err()
+                .to_string();
+        assert!(trial_err.contains("trial.metric"));
     }
 }

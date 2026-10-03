@@ -23,6 +23,7 @@ pub enum Command {
     Disable(DisableArgs),
     Cancel(CancelArgs),
     Submit(SubmitArgs),
+    Trial(TrialArgs),
     SubmitBatch(SubmitBatchArgs),
     Event(EventArgs),
     Status(StatusArgs),
@@ -342,6 +343,39 @@ pub struct SubmitArgs {
     pub command: Vec<OsString>,
 }
 
+#[derive(Debug, Args)]
+pub struct TrialArgs {
+    #[arg(
+        long,
+        default_value_t = 60,
+        value_parser = parse_trial_timeout_seconds,
+        value_name = "SECONDS"
+    )]
+    pub timeout_seconds: u64,
+    #[arg(long, value_name = "NAME", requires = "metric_direction")]
+    pub metric_name: Option<String>,
+    #[arg(long, value_enum, value_name = "DIRECTION", requires = "metric_name")]
+    pub metric_direction: Option<MetricDirectionArg>,
+    #[arg(
+        long,
+        value_name = "DELTA",
+        allow_negative_numbers = true,
+        requires = "metric_name",
+        requires = "metric_direction",
+        value_parser = parse_metric_min_delta
+    )]
+    pub metric_min_delta: Option<f64>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(
+        last = true,
+        required = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
+    pub command: Vec<OsString>,
+}
+
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum MetricDirectionArg {
     Minimize,
@@ -360,6 +394,17 @@ fn parse_metric_min_delta(value: &str) -> Result<f64, String> {
         }
     } else {
         Err("min delta must be a finite number".to_owned())
+    }
+}
+
+fn parse_trial_timeout_seconds(value: &str) -> Result<u64, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "timeout must be between 1 and 300 seconds".to_owned())?;
+    if (1..=300).contains(&seconds) {
+        Ok(seconds)
+    } else {
+        Err("timeout must be between 1 and 300 seconds".to_owned())
     }
 }
 

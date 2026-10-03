@@ -92,6 +92,7 @@ fn help_lists_diagnostics_commands_and_status_options() {
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("submit"));
+    assert!(text.contains("trial"));
     assert!(text.contains("daemon"));
     assert!(text.contains("events"));
     assert!(text.contains("inspect"));
@@ -137,6 +138,30 @@ fn help_lists_diagnostics_commands_and_status_options() {
     assert!(text.contains("--metadata"));
     assert!(text.contains("--metadata-json"));
     assert!(text.contains("--json"));
+}
+
+#[test]
+fn trial_help_lists_only_bounded_metric_and_command_options() {
+    let output = assert_cmd::Command::cargo_bin("pueue-agent")
+        .unwrap()
+        .args(["trial", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    for option in [
+        "--timeout-seconds",
+        "--metric-name",
+        "--metric-direction",
+        "--metric-min-delta",
+        "--json",
+    ] {
+        assert!(text.contains(option), "missing {option} from trial help");
+    }
+    assert!(!text.contains("--project-root"));
+    assert!(!text.contains("--pueue-config"));
+    assert!(!text.contains("--retain"));
 }
 
 #[test]
