@@ -24,6 +24,7 @@ WORK="$(mktemp -d /tmp/pa-rust-e2e.XXXXXX)"
 XDG_RUNTIME_DIR="$WORK/runtime"
 DAEMON_PID=""
 PUEUED_PID=""
+PUEUED_START_ATTEMPTED=0
 
 fail() {
   echo "Rust E2E FAIL: $*" >&2
@@ -41,7 +42,10 @@ cleanup() {
     kill -TERM "$DAEMON_PID" 2>/dev/null || true
     wait "$DAEMON_PID" 2>/dev/null || true
   fi
-  "$REAL_PUEUE" --config "$WORK/pueue.yml" shutdown >/dev/null 2>&1 || true
+  if [ "$PUEUED_START_ATTEMPTED" -eq 1 ] &&
+    [ -f "$WORK/pueue.yml" ] && [ ! -L "$WORK/pueue.yml" ]; then
+    "$REAL_PUEUE" --config "$WORK/pueue.yml" shutdown >/dev/null 2>&1 || true
+  fi
   if [ -z "$PUEUED_PID" ] && [ -f "$XDG_RUNTIME_DIR/pueue.pid" ]; then
     PUEUED_PID="$(cat "$XDG_RUNTIME_DIR/pueue.pid" 2>/dev/null || true)"
   fi
@@ -557,6 +561,7 @@ cargo build --quiet --offline --manifest-path "$REPO_ROOT/Cargo.toml"
 "$PA_BIN" --help | grep -q "SQLite-backed Pueue agent supervisor" \
   || fail "bin/pueue-agent is not the Rust development launcher"
 
+PUEUED_START_ATTEMPTED=1
 "$REAL_PUEUED" --config "$WORK/pueue.yml" -d >"$WORK/pueued.log" 2>&1
 for _ in $(seq 100); do
   "$REAL_PUEUE" --config "$WORK/pueue.yml" status --json >/dev/null 2>&1 && break

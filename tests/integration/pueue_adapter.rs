@@ -751,15 +751,6 @@ async fn controlled_exec_proof_deadline_preserves_the_native_cleanup_boundary() 
     .await
     .expect("native helper did not publish readiness before the deadline");
 
-    #[cfg(target_os = "linux")]
-    let readiness_proc_snapshot = linux_native_cleanup_snapshot(helper_pid, &[]);
-    #[cfg(target_os = "linux")]
-    let readiness_child_pids = readiness_proc_snapshot
-        .children
-        .iter()
-        .map(|(pid, _)| *pid)
-        .collect::<Vec<_>>();
-
     let failure = tokio::time::timeout(Duration::from_secs(20), operation)
         .await
         .expect("controlled launch deadline exceeded the outer test bound")
@@ -774,25 +765,6 @@ async fn controlled_exec_proof_deadline_preserves_the_native_cleanup_boundary() 
             .flatten();
         (result, errno)
     };
-    #[cfg(target_os = "linux")]
-    let cleanup_proc_diagnostics = if helper_group_probe != -1
-        || helper_group_probe_errno != Some(libc::ESRCH)
-    {
-        let immediate = linux_native_cleanup_snapshot(helper_pid, &readiness_child_pids);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let later_group_result = unsafe { libc::kill(-helper_pid, 0) };
-        let later_group_errno = (later_group_result == -1)
-            .then(|| std::io::Error::last_os_error().raw_os_error())
-            .flatten();
-        let later = linux_native_cleanup_snapshot(helper_pid, &readiness_child_pids);
-        format!(
-            "; proc at readiness={readiness_proc_snapshot:?}, immediately after failed probe={immediate:?}, 50ms follow-up group probe={later_group_result} errno={later_group_errno:?} proc={later:?}"
-        )
-    } else {
-        String::new()
-    };
-    #[cfg(not(target_os = "linux"))]
-    let cleanup_proc_diagnostics = String::new();
     let lifecycle_trace =
         fs::read_to_string(&trace_path).unwrap_or_else(|_| "unavailable".to_owned());
     let readiness_pid = lifecycle_trace.lines().find_map(|line| {
@@ -824,12 +796,12 @@ async fn controlled_exec_proof_deadline_preserves_the_native_cleanup_boundary() 
         assert_eq!(
             helper_group_probe,
             -1,
-            "native cleanup reported quiescence while helper group {helper_pid} remained: errno={helper_group_probe_errno:?}, trace={lifecycle_trace:?}{cleanup_proc_diagnostics}"
+            "native cleanup reported quiescence while helper group {helper_pid} remained: errno={helper_group_probe_errno:?}, trace={lifecycle_trace:?}"
         );
         assert_eq!(
             helper_group_probe_errno,
             Some(libc::ESRCH),
-            "native cleanup did not prove helper group {helper_pid} absent: trace={lifecycle_trace:?}{cleanup_proc_diagnostics}"
+            "native cleanup did not prove helper group {helper_pid} absent: trace={lifecycle_trace:?}"
         );
         assert!(matches!(
             failure.into_error(),
@@ -853,125 +825,6 @@ async fn controlled_exec_proof_deadline_preserves_the_native_cleanup_boundary() 
     }
     fixture.assert_no_execution_artifacts();
     fixture.assert_helper_lifecycle_deadline_started().await;
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-struct LinuxNativeCleanupProcessStat {
-    pid: libc::pid_t,
-    ppid: libc::pid_t,
-    state: char,
-    pgrp: libc::pid_t,
-    start_time: u64,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-struct LinuxNativeCleanupSnapshot {
-    helper: Result<LinuxNativeCleanupProcessStat, String>,
-    child_list: Result<Vec<libc::pid_t>, String>,
-    child_list_truncated: bool,
-    children: Vec<(libc::pid_t, Result<LinuxNativeCleanupProcessStat, String>)>,
-    children_truncated: bool,
-}
-
-#[cfg(target_os = "linux")]
-fn linux_native_cleanup_snapshot(
-    helper_pid: libc::pid_t,
-    known_child_pids: &[libc::pid_t],
-) -> LinuxNativeCleanupSnapshot {
-    const MAX_CHILD_STATS: usize = 16;
-
-    let helper = linux_native_cleanup_process_stat(helper_pid);
-    let raw_child_list = fs::read_to_string(format!(
-        "/proc/{helper_pid}/task/{helper_pid}/children"
-    ))
-    .map_err(|error| error.to_string())
-    .and_then(|children| {
-        children
-            .split_whitespace()
-            .map(|pid| {
-                pid.parse::<libc::pid_t>()
-                    .map_err(|error| format!("invalid child PID {pid:?}: {error}"))
-            })
-            .collect::<Result<Vec<_>, _>>()
-    });
-    let child_list_truncated = raw_child_list
-        .as_ref()
-        .map_or(false, |children| children.len() > MAX_CHILD_STATS);
-    let child_list = raw_child_list.map(|mut children| {
-        children.truncate(MAX_CHILD_STATS);
-        children
-    });
-    let mut child_pids = known_child_pids.to_vec();
-    if let Ok(current_child_pids) = &child_list {
-        child_pids.extend(current_child_pids);
-    }
-    child_pids.sort_unstable();
-    child_pids.dedup();
-    let children_truncated = child_pids.len() > MAX_CHILD_STATS;
-    child_pids.truncate(MAX_CHILD_STATS);
-    let children = child_pids
-        .into_iter()
-        .map(|pid| (pid, linux_native_cleanup_process_stat(pid)))
-        .collect();
-
-    LinuxNativeCleanupSnapshot {
-        helper,
-        child_list,
-        child_list_truncated,
-        children,
-        children_truncated,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn linux_native_cleanup_process_stat(
-    expected_pid: libc::pid_t,
-) -> Result<LinuxNativeCleanupProcessStat, String> {
-    let stat = fs::read_to_string(format!("/proc/{expected_pid}/stat"))
-        .map_err(|error| error.to_string())?;
-    let comm_end = stat
-        .rfind(')')
-        .ok_or_else(|| "stat is missing its command terminator".to_owned())?;
-    let comm_start = stat
-        .find('(')
-        .ok_or_else(|| "stat is missing command".to_owned())?;
-    let stat_pid = stat[..comm_start]
-        .trim()
-        .parse::<libc::pid_t>()
-        .map_err(|error| format!("invalid stat PID: {error}"))?;
-    let fields = stat[comm_end + 1..].split_whitespace().collect::<Vec<_>>();
-    let field = |index: usize, name: &str| {
-        fields
-            .get(index)
-            .copied()
-            .ok_or_else(|| format!("stat is missing {name}"))
-    };
-    let parse_pid = |index, name| {
-        field(index, name)?
-            .parse::<libc::pid_t>()
-            .map_err(|error| format!("invalid {name}: {error}"))
-    };
-    let state = field(0, "state")?
-        .chars()
-        .next()
-        .ok_or_else(|| "stat state is empty".to_owned())?;
-    let start_time = field(19, "starttime")?
-        .parse::<u64>()
-        .map_err(|error| format!("invalid starttime: {error}"))?;
-    if stat_pid != expected_pid {
-        return Err(format!(
-            "stat PID changed from {expected_pid} to {stat_pid} while reading"
-        ));
-    }
-    Ok(LinuxNativeCleanupProcessStat {
-        pid: stat_pid,
-        ppid: parse_pid(1, "PPID")?,
-        state,
-        pgrp: parse_pid(2, "process group")?,
-        start_time,
-    })
 }
 
 #[cfg(all(unix, debug_assertions))]

@@ -232,6 +232,39 @@ run_signal_retention_probe() {
   rm -rf "$retained_work"
 }
 
+@test "missing dependency preflight never invokes Pueue before daemon start" {
+  fake_bin="$BATS_TEST_TMPDIR/preflight-bin"
+  mkdir -p "$fake_bin"
+  real_dirname="$(command -v dirname)"
+  real_mktemp="$(command -v mktemp)"
+  ln -s "$real_dirname" "$fake_bin/dirname"
+  ln -s "$real_mktemp" "$fake_bin/mktemp"
+
+  printf '%s\n' '#!/bin/sh' 'printf "Linux\\n"' > "$fake_bin/uname"
+  printf '%s\n' '#!/bin/sh' 'printf "called\\n" >> "$PUEUE_MARKER"' > "$fake_bin/pueue"
+  printf '%s\n' '#!/bin/sh' 'printf "called\\n" >> "$PUEUED_MARKER"' > "$fake_bin/pueued"
+  printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin/git"
+  printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin/python3"
+  printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin/jq"
+  chmod +x "$fake_bin/uname" "$fake_bin/pueue" "$fake_bin/pueued" \
+    "$fake_bin/git" "$fake_bin/python3" "$fake_bin/jq"
+
+  pueue_marker="$BATS_TEST_TMPDIR/pueue-called"
+  pueued_marker="$BATS_TEST_TMPDIR/pueued-called"
+  run env PATH="$fake_bin" HOME="$BATS_TEST_TMPDIR/home" \
+    PUEUE_MARKER="$pueue_marker" PUEUED_MARKER="$pueued_marker" \
+    /bin/bash "$REPO_ROOT/tests/e2e/rust_supervisor.sh"
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"sqlite3 is required"* ]]
+  [ ! -e "$pueue_marker" ]
+  [ ! -e "$pueued_marker" ]
+  retained_work="$(printf '%s\n' "$output" | sed -n 's/^Rust E2E retained WORK after failure: //p')"
+  [ -n "$retained_work" ]
+  [ -d "$retained_work" ]
+  rm -rf "$retained_work"
+}
+
 @test "TERM-terminated real Pueue harness retains diagnostics and status" {
   run_signal_retention_probe TERM 143
 }

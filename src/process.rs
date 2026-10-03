@@ -748,6 +748,7 @@ pub struct VerifiedChild {
     child: tokio::process::Child,
     pid: i64,
     process_group: ProcessGroupOwnership,
+    group_quiescence_pending: Option<libc::pid_t>,
     pub start_gate: StartGate,
     pub exec_status: ExecStatusReceiver,
     pub ack: AckReceiver,
@@ -781,6 +782,7 @@ impl VerifiedChild {
         source: io::Error,
     ) -> Result<TerminalObservation, AppError> {
         if source.raw_os_error() == Some(libc::ECHILD) {
+            self.remember_group_for_quiescence(self.process_group.id());
             self.process_group.release();
             return Ok(TerminalObservation::OwnershipLost);
         }
@@ -827,16 +829,22 @@ impl VerifiedChild {
     }
 
     async fn reap_after_terminal_group_cleanup(&mut self) -> Result<ExitStatus, AppError> {
-        if let Some(group) = self.process_group.id() {
+        let group = self.process_group.id();
+        if let Some(group) = group {
             drain_owned_process_group(self, group).await?;
         }
         match self.child.wait().await {
             Ok(status) => {
-                self.process_group.release();
+                if let Some(group) = group {
+                    self.verify_reaped_group_quiescence(group).await?;
+                } else {
+                    self.verify_pending_group_quiescence().await?;
+                }
                 Ok(status)
             }
             Err(source) => {
                 if source.raw_os_error() == Some(libc::ECHILD) {
+                    self.remember_group_for_quiescence(group);
                     self.process_group.release();
                 }
                 Err(AppError::Io {
@@ -850,6 +858,7 @@ impl VerifiedChild {
     pub(crate) async fn reap_observed_terminal(&mut self) -> Result<ExitStatus, AppError> {
         #[cfg(test)]
         if std::mem::take(&mut self.force_ownership_loss_before_reap) {
+            self.remember_group_for_quiescence(self.process_group.id());
             self.process_group.release();
         }
         if self.terminal_observed()? != TerminalObservation::Terminal {
@@ -860,6 +869,37 @@ impl VerifiedChild {
         self.reap_after_terminal_group_cleanup().await
     }
 
+    fn remember_group_for_quiescence(&mut self, group: Option<libc::pid_t>) {
+        if group.is_some() {
+            self.group_quiescence_pending = group;
+        }
+    }
+
+    async fn verify_pending_group_quiescence(&mut self) -> Result<(), AppError> {
+        if let Some(group) = self.group_quiescence_pending {
+            verify_process_group_quiescence_after_reap(group).await?;
+            self.group_quiescence_pending = None;
+        }
+        Ok(())
+    }
+
+    async fn verify_reaped_group_quiescence(
+        &mut self,
+        group: libc::pid_t,
+    ) -> Result<(), AppError> {
+        self.remember_group_for_quiescence(Some(group));
+        self.process_group.release();
+        self.verify_pending_group_quiescence().await
+    }
+
+    fn verify_pending_group_quiescence_blocking(&mut self) -> Result<(), AppError> {
+        if let Some(group) = self.group_quiescence_pending {
+            verify_process_group_quiescence_after_reap_blocking(group)?;
+            self.group_quiescence_pending = None;
+        }
+        Ok(())
+    }
+
     /// Synchronously terminate and reap the owned child group.  This is used
     /// by cancellation/drop paths where spawning an asynchronous cleanup task
     /// would let a temporary capability disappear while a descendant still
@@ -868,7 +908,7 @@ impl VerifiedChild {
     /// process quiescence.
     pub(crate) fn terminate_and_reap_blocking(&mut self) -> Result<(), AppError> {
         let Some(group) = self.process_group.id() else {
-            return Ok(());
+            return self.verify_pending_group_quiescence_blocking();
         };
         let signal = unsafe { libc::kill(-group, libc::SIGTERM) };
         if signal < 0 {
@@ -1115,6 +1155,68 @@ async fn drain_owned_process_group_before(
     }
 }
 
+#[cfg(unix)]
+async fn verify_process_group_quiescence_after_reap(
+    group: libc::pid_t,
+) -> Result<(), AppError> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    loop {
+        let result = unsafe { libc::kill(-group, 0) };
+        if result == -1 {
+            let source = io::Error::last_os_error();
+            match source.raw_os_error() {
+                Some(libc::ESRCH) => return Ok(()),
+                Some(libc::EINTR) => {}
+                _ => {
+                    return Err(AppError::Io {
+                        operation: "verify verified child process-group quiescence",
+                        source,
+                    });
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(AppError::Runtime {
+                operation: "verify verified child process-group quiescence",
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[cfg(unix)]
+fn verify_process_group_quiescence_after_reap_blocking(
+    group: libc::pid_t,
+) -> Result<(), AppError> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    loop {
+        let result = unsafe { libc::kill(-group, 0) };
+        if result == -1 {
+            let source = io::Error::last_os_error();
+            match source.raw_os_error() {
+                Some(libc::ESRCH) => return Ok(()),
+                Some(libc::EINTR) => {}
+                _ => {
+                    return Err(AppError::Io {
+                        operation: "verify verified child process-group quiescence",
+                        source,
+                    });
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(AppError::Runtime {
+                operation: "verify verified child process-group quiescence",
+            });
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[cfg(all(test, unix))]
 pub(crate) fn test_running_verified_child(test_name: &str) -> Result<VerifiedChild, AppError> {
     use std::os::unix::process::CommandExt;
@@ -1137,6 +1239,7 @@ pub(crate) fn test_running_verified_child(test_name: &str) -> Result<VerifiedChi
         child,
         pid,
         process_group: ProcessGroupOwnership::Owned(OwnedProcessGroup(pid)),
+        group_quiescence_pending: None,
         start_gate: StartGate { writer: None },
         exec_status: ExecStatusReceiver { reader: None },
         ack: AckReceiver { reader: None },
@@ -2632,6 +2735,7 @@ fn spawn_verified_command_with_deadlines(
         child,
         pid,
         process_group: ProcessGroupOwnership::Owned(OwnedProcessGroup(pid)),
+        group_quiescence_pending: None,
         start_gate: StartGate { writer: Some(std::fs::File::from(release_write)) },
         exec_status: ExecStatusReceiver {
             reader: Some(std::fs::File::from(exec_read)),
@@ -2714,20 +2818,16 @@ pub(crate) async fn terminate_process_group_before(
 ) -> Result<(), AppError> {
     child.start_gate.writer.take();
     let Some(group) = child.process_group.id() else {
-        return Ok(());
+        return child.verify_pending_group_quiescence().await;
     };
     // The unreaped helper reserves its process-group identifier. Signal the
     // typed owned group directly; probing/reaping first could release that
     // reservation while a descendant remains alive.
     drain_owned_process_group_before(child, group, term_deadline).await?;
     match tokio::time::timeout(Duration::from_secs(1), child.child.wait()).await {
-        Ok(Ok(_)) => {
-            child.process_group.release();
-            Ok(())
-        }
+        Ok(Ok(_)) => child.verify_reaped_group_quiescence(group).await,
         Ok(Err(source)) if source.raw_os_error() == Some(libc::ECHILD) => {
-            child.process_group.release();
-            Ok(())
+            child.verify_reaped_group_quiescence(group).await
         }
         Ok(Err(source)) => {
             Err(AppError::Io {
@@ -4506,6 +4606,7 @@ mod tests {
             child,
             pid,
             process_group: ProcessGroupOwnership::Owned(OwnedProcessGroup(pid)),
+            group_quiescence_pending: None,
             start_gate: StartGate { writer: None },
             exec_status: ExecStatusReceiver { reader: None },
             ack: AckReceiver { reader: None },
@@ -4723,6 +4824,65 @@ mod tests {
         let pid = child.pid as libc::pid_t;
         child.terminate_and_reap_blocking().unwrap();
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_quiescence_keeps_a_read_only_group_retry_pending() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = observation_child("hold");
+        let group = child.pid as libc::pid_t;
+        let mut sibling_command = Command::new(std::env::current_exe().unwrap());
+        sibling_command
+            .args([
+                "--ignored",
+                "--exact",
+                "process::tests::terminal_observation_subprocess",
+                "--nocapture",
+            ])
+            .env("PUEUE_AGENT_OBSERVATION_MODE", "hold")
+            .process_group(group);
+        let mut sibling_command = tokio::process::Command::from(sibling_command);
+        sibling_command.kill_on_drop(true);
+        let mut sibling = sibling_command.spawn().unwrap();
+        let sibling_pid = sibling.id().unwrap() as libc::pid_t;
+        assert_eq!(unsafe { libc::getpgid(sibling_pid) }, group);
+
+        child.child.start_kill().unwrap();
+        child.child.wait().await.unwrap();
+        assert_eq!(unsafe { libc::kill(-group, 0) }, 0);
+
+        // Cancellation can happen after the helper is reaped. The released
+        // PGID must then remain pending without retaining signal authority.
+        assert!(tokio::time::timeout(
+            Duration::from_millis(25),
+            child.verify_reaped_group_quiescence(group),
+        )
+        .await
+        .is_err());
+        assert!(matches!(child.process_group, ProcessGroupOwnership::Released));
+        assert_eq!(child.group_quiescence_pending, Some(group));
+
+        // Both cleanup entry points retry observation only and fail closed
+        // while a sibling still occupies the group.
+        assert!(matches!(
+            terminate_process_group_before(&mut child, Instant::now()).await,
+            Err(AppError::Runtime { .. })
+        ));
+        assert_eq!(unsafe { libc::kill(sibling_pid, 0) }, 0);
+        assert!(matches!(
+            child.terminate_and_reap_blocking(),
+            Err(AppError::Runtime { .. })
+        ));
+        assert_eq!(unsafe { libc::kill(sibling_pid, 0) }, 0);
+
+        assert_eq!(unsafe { libc::kill(sibling_pid, libc::SIGKILL) }, 0);
+        sibling.wait().await.unwrap();
+        child.verify_pending_group_quiescence().await.unwrap();
+        assert_eq!(child.group_quiescence_pending, None);
+        assert_eq!(unsafe { libc::kill(-group, 0) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 
