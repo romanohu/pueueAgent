@@ -287,6 +287,7 @@ fn phase_2_campaign_documentation_covers_autonomous_terminal_loop_and_phase_3_bo
         "pueue-agent init\n",
         "# edit .pueue-agent/STATE.md\n",
         "pueue-agent enable\n",
+        "pueue-agent doctor\n",
         "pueue-agent submit -- python train.py"
     );
     assert!(getting_started.contains(getting_started_quick_start));
