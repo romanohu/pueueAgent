@@ -422,7 +422,6 @@ async fn installed_codex_capability_probe_requires_exact_research_surface() {
 struct DoctorCodexFixture {
     _temp: TempDir,
     policy: ResolvedExecutionPolicy,
-    #[cfg(target_os = "linux")]
     codex: std::path::PathBuf,
 }
 
@@ -575,12 +574,61 @@ fn main() {{
             temp.path(),
             &[("doctor-project", &project, &project_program)],
         );
+        let mut policy = policy.as_ref().clone();
+        policy.codex_anchor = ExecutableAnchor::resolve(
+            OsStr::new("codex"),
+            &policy.trusted_path,
+            &policy.project_roots,
+        )
+        .expect("resolve generated Codex fixture anchor");
         Self {
             _temp: temp,
-            policy: policy.as_ref().clone(),
-            #[cfg(target_os = "linux")]
+            policy,
             codex,
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_codex_fixture_pins_the_generated_global_codex_anchor() {
+    let fixture = DoctorCodexFixture::new(
+        "codex-cli 0.148.0",
+        "--strict-config --sandbox read-only --ask-for-approval never",
+        "--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message --json",
+    );
+    let expected = ExecutableAnchor::resolve(
+        OsStr::new("codex"),
+        &fixture.policy.trusted_path,
+        &fixture.policy.project_roots,
+    )
+    .expect("resolve generated Codex fixture anchor");
+    assert_eq!(
+        expected.canonical_path,
+        fs::canonicalize(&fixture.codex).expect("canonical generated Codex fixture path")
+    );
+    assert_eq!(
+        fixture.policy.codex_anchor, expected,
+        "the global Codex anchor must point to the generated fixture executable"
+    );
+
+    for (args, expected_output) in [
+        (&["--version"][..], "codex-cli 0.148.0\n"),
+        (
+            &["--help"][..],
+            "--strict-config --sandbox read-only --ask-for-approval never\n",
+        ),
+        (
+            &["exec", "--help"][..],
+            "--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message --json\n",
+        ),
+    ] {
+        let output = Command::new(&fixture.policy.codex_anchor.canonical_path)
+            .args(args)
+            .output()
+            .expect("run generated Codex fixture directly");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, expected_output.as_bytes());
     }
 }
 
