@@ -45,6 +45,16 @@ preview は SQLite、Pueue、service、lock、backup を作成しません。app
 
 CLI ごとに別の profile を混在させないでください。profile の優先順位は[導入ガイド](getting-started-ja.md)にあります。
 
+## trial が失敗する、または cleanup が未確認になる
+
+`pueue-agent trial` は campaign を作らずに command を一度実行します。report の `outcome`、`terminal`、`manifest`、3つの cleanup field を確認してください。`command_failed`、`timed_out`、`manifest_invalid` で task/group/output がすべて `confirmed` の場合は、command と入力を修正してから再実行できます。trial 自体は campaign や budget を変更しません。
+
+cleanup field に `retained` または `uncertain` がある report は、Pueue task や group の有無が判定できない可能性があります。report の `trial_id`、`task_id`、`group` を保存し、同じ Pueue profile の status と照合してください。ID が分からないまま task/group を削除したり、同じ command を重ねて投入したりしないでください。nonce group は意図的に未登録であり、canonical callback はその group を拒否するため、trial による通常 Event、task observation、integration event は作られません。
+
+JSON report が出ず fixed error だけの場合は、`TrialReport` を作る前に失敗しています。private output の作成途中で error になった場合は trial ID が表示されないまま `.pueue-agent/trials/` に generation directory が残ることがあります。report がないことを cleanup 済みの証明にせず、同じ command をすぐ再実行したり directory を手動削除したりせず、project path と error を管理者へ渡してください。
+
+初回実行の前には `doctor` を確認します。campaign がない project の `state.objective` error は `.pueue-agent/STATE.md` の目的が不足・未設定であることを、`execution.agent_runtime` error は pinned Codex が必要な research runtime を提供しないことを示します。原因を直した後、`doctor` が通ることを再確認してください。
+
 ## Campaign experiment が `unreconciled` になった
 
 | 症状 | まず確認 | 想定原因 | 安全な復旧 |

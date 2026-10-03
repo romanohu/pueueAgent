@@ -111,7 +111,7 @@ trialはcurrent directoryから既存のregistered/enabled projectを解決し�
 
 preflight失敗ではfilesystemとPueueを変更しない。trial経路はwriteable `Db`、campaign coordinator、repositories、callback writerを呼ばない。
 
-trialはcampaign/proposal/experiment/submission/reservation/agent-run/research-review/Event/task-observationを作らない。後述する未登録Pueue groupへのglobal callbackは既存どおり`integration_events(kind=unknown_callback_group)`を1件だけ冪等記録し得る。これは通常Eventではなくscheduler/agent起動へ接続されない。
+trialはcampaign/proposal/experiment/submission/reservation/agent-run/research-review/Event/task-observationを作らない。installed canonical callbackには`--group`がなく、implicit-group pathはPueue statusからtask groupを解決した後、未登録nonce groupを`record_callback`前に拒否する。このtrial経路では通常Eventだけでなく`integration_events`にも差分は生じない。`--group`を追加して別のcallback branchへ強制しない。
 
 ## 8. 専用Pueue groupによる隔離
 
@@ -122,9 +122,9 @@ registered project groupは使わない。そこへtrialを入れると既存cal
 - ownership proofは同じadapterによる`create前に不存在`、direct `group add`の成功応答、`create後に存在`の3点すべてとする。既存groupを成功扱いで採用しない。add失敗後にgroupが現れてもownership不明として削除しない。実Pueueの既存group応答はisolated Linux gateで固定する。
 - taskをexact identityでterminal/removed/absentまで確認した後に限り、group内taskが0件であることを再確認して`group remove`する。
 - remove後はgroup不存在を確認する。削除失敗や残存はtrial失敗として、group名とtask IDだけをbounded reportに残す。
-- `group remove`は残存taskをdefaultへ移すPueue操作なので、空確認前には絶対に呼ばない。
+- Pueue 4.0.4の`group remove`はnonempty groupを拒否し、残存taskをdefaultへ移す処理ではない。それでも、exact trial taskのglobalな不存在を確認し、groupが空であるfresh snapshotを得る前にremoveを呼んではならない。daemon側の拒否だけではcoordinatorがremoveを呼ばなかった証明にならない。
 
-reconcilerは未登録groupを`unknown_groups`として無視し、task observation、Event、agentを作らない。callbackが未知groupをintegration eventとして記録する既存挙動は維持する。
+reconcilerは未登録groupを`unknown_groups`として無視し、task observation、Event、agentを作らない。canonical implicit callbackはgroupを受け取らず、Pueue statusでtask groupを解決した後、未登録nonce groupをrecord前に拒否するため、ordinary DBとintegration DBのどちらにも差分を作らない。このStage 3では`--group`を加えて別callback pathを強制しない。
 
 ## 9. Private trial output
 
@@ -143,7 +143,7 @@ impl PrivateTrialOutput {
 ```
 
 - pathは`.pueue-agent/trials/<uuid>/result.json`と同階層の`artifacts/`。
-- service/trials/generationはowner-only directory。productionと同じくresult fileとartifact directoryはchildが作るため、trial側で事前作成しない。
+- service containerは既存private-temp verifierと同じowner/non-group-other-writable条件を満たせばよく、通常の`init`が`umask 022`で作る`0755`も受理する。`trials`とgenerationはowner-only directory（`0700`）を保つ。productionと同じくresult fileとartifact directoryはchildが作るため、trial側で事前作成しない。
 - 作成前後とread/cleanup前後にproject root、mount、service、parent、generationのidentityを再検証する。
 - terminal後にretained generation descriptorから`result.json`をno-followで開き、regular file、owner、mode、link count、mountを検証して16 KiB + 1 byteまで読む。childによる同一generation内のatomic renameは受理するが、symlink、hardlink、special file、parent/generation substitutionは受理しない。
 - cleanupはtask absence確認後だけ、既存のdepth/entry/allocated-byte上限内でdescriptor-relativeに実行する。pathnameでreplacement generationを削除しない。
@@ -175,7 +175,7 @@ add後の各snapshotは次を満たす必要がある。
 - 存在時はgroupとcanonical commandがexact一致する。
 - 同じunique canonical commandが別IDに存在しない。
 
-addがerrorになっても「何も投入されなかった」と仮定しない。bounded status scanでunique group/commandを探し、exact 1件ならそのIDをcleanup対象として回収する。0件を安定して確認できればoutput/group cleanupへ進み、複数・status error・identity mismatchならPueue mutationを止めて残存を報告する。
+addがerrorになっても「何も投入されなかった」と仮定しない。task-add clientの終了とreap後、exact group/commandが1件だけ見つかり、ID/group/commandが一貫するときだけ、そのtaskを回収する。複数候補・status error・identity mismatchはPueue mutationを止めて識別子と残存資源を報告する。add requestが一度もreleaseされなかったと制御境界で確認でき、fresh statusがemptyの場合はcleanupできる。一方、requestをreleaseしたclientが終了・reap済みでもmatching taskが0件の場合、client quiescenceはdaemonへのrequest fenceではないため、enqueue不存在を証明できずgroup/outputを保持してuncertaintyを報告する。sleepや繰返しsnapshotだけでこの不確実性を解消しない。
 
 通常終了とcleanupの順序は次である。
 
@@ -229,7 +229,7 @@ Stage 3Aと3Bは同じStage 3内の独立checkpointにする。
 7. real taskがproject rootで実argvを実行し、4つのenvironment変数とinput data accessを確認してvalid manifestを生成する。
 8. success/failure/queued timeout/running timeout/add ambiguityで、exact task identityを使いkill/removeを判断する。
 9. 成功時はtask、group、private outputがすべて消え、置換されたoutputや別group/taskを削除しない。
-10. campaign/proposal/experiment/submission/reservation/agent-run/research-review/Event/task-observation行とbudgetは増えない。global callback由来のbounded unknown-group integration eventだけは許容する。
+10. campaign/proposal/experiment/submission/reservation/agent-run/research-review/Event/task-observation/integration-event行とbudgetは増えない。
 11. trialを2回実行してID/path/groupが衝突せず、timeout後にrunning trial taskを残さない。
 12. Linux isolated gateは専用state、Pueue profile、disposable projectで行い、既存service/experimentや利用者projectを操作しない。
 
@@ -237,4 +237,4 @@ Stage 3Aと3Bは同じStage 3内の独立checkpointにする。
 
 CLI processがSIGKILLやhost crashで消えると、non-durable trialは自動再開・自動cleanupされない。今回DB rowを作らない契約と両立してdurable crash recoveryを加えることは別機能である。通常完了、validation failure、Pueue error、task timeout、捕捉したinterruptではbounded cleanupを行う。identityが不明な場合は安全のため残し、trial ID/group/task IDを表示する。
 
-専用groupへのglobal callbackがunknown-group integration eventを残す場合がある。これはagent起動authorityではなく、既存の外部integration監査記録である。これも完全にzero-writeにするにはcallbackへspoof不能なtransient identityを追加する必要があり、本Stage 3の最小scopeには含めない。
+callback identityが不明な、または別profileの状態は自動で修復しない。canonical callbackがnonce groupを拒否する場合は通常Eventとintegration eventの両方が記録されない。これはtrialの通常条件であり、DBを書き換えずに扱う。

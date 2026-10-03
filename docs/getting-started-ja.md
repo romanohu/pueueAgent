@@ -50,12 +50,13 @@ $EDITOR .pueue-agent/config.toml
 $EDITOR .pueue-agent/STATE.md
 ```
 
-インストール済みの環境で campaign を開始する最短手順は次の4段階です。自動評価まで使う場合は、投入前に後述の[結果出力](#評価結果を出力する)を準備し、`submit` に `--metric-name` / `--metric-direction` を付けてください。
+インストール済みの環境で campaign を開始する最短手順は次の5段階です。自動評価まで使う場合は、投入前に後述の[結果出力](#評価結果を出力する)を準備し、`submit` に `--metric-name` / `--metric-direction` を付けてください。
 
 ```bash
 pueue-agent init
 # edit .pueue-agent/STATE.md
 pueue-agent enable
+pueue-agent doctor
 pueue-agent submit -- python train.py
 ```
 
@@ -178,6 +179,26 @@ SQLite database は次の優先順位で解決した directory の `state.sqlite
 3. Linux などでは `$HOME/.local/state/pueue-agent/`、macOS では `$HOME/Library/Application Support/pueue-agent/`
 
 相対パスや空の override は採用されません。`enable` は解決済みの state directory を user service 定義へ固定するため、対話 CLI と service で別の state database を参照しないよう、同じ環境と profile で `pueue-agent status` と `pueue-agent doctor` を確認してください。
+
+## 最初の submit 前に readiness を確認する
+
+最初の campaign を始める前に、project のルートで `doctor` を実行します。live campaign がない場合、`state.objective` は `.pueue-agent/STATE.md` の目的が submit に使える内容かを読み取り専用で確認します。`execution.agent_runtime` は service policy に固定された Codex が必要な research 実行形式に対応しているかを確認します。doctor は campaign、budget、file、Pueue task を作成・変更しません。
+
+```bash
+pueue-agent doctor
+```
+
+学習 command と結果 manifest を campaign の前に一度確認したい場合は、明示的に `trial` を実行できます。
+
+```bash
+pueue-agent trial --timeout-seconds 60 \
+  --metric-name validation_loss --metric-direction minimize \
+  -- python train.py --lr 0.001
+```
+
+`trial` はカレントディレクトリから登録済み・有効な project を解決し、その command を一回実行します。実行 timeout は既定60秒、1〜300秒で指定できます。cleanup の確認は実行 deadline 後も最大30秒です。trial は毎回異なる未登録 Pueue group と一時 output directory を使い、task、group、output の cleanup を確認します。trial は campaign、proposal、experiment、submission、reservation を作成せず、research budget も使いません。成功しても `submit` は自動実行されません。`--` より後ろには shell command 文字列ではなく実行する argv を指定してください。
+
+trial の command も managed experiment と同じ結果 manifest を書く必要があります。`schema_version` は `1`、`experiment_id` は実行時の `PUEUE_AGENT_EXPERIMENT_ID` と一致させ、`metrics` には有限の数値を1つ以上入れます。詳細な JSON 例は[評価結果を出力する](#評価結果を出力する)を参照してください。
 
 ## 最初の実験を投入する
 
