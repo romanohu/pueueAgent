@@ -10406,6 +10406,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn checkpoint_discovery_rejects_non_utf8_subtree_but_omits_non_utf8_leaf() {
+        use std::os::unix::ffi::OsStringExt;
+
         let (_temporary, policy, anchor) = research_policy_fixture();
         let directory_root = research_artifact_fixture(&policy, "source-non-utf8-directory");
         let non_utf8_directory = directory_root.join(std::ffi::OsString::from_vec(vec![
