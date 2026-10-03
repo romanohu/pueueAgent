@@ -23,7 +23,7 @@ use crate::{
     AppError,
 };
 
-const MAX_RESULT_MANIFEST_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_RESULT_MANIFEST_BYTES: usize = 16 * 1024;
 const RESULT_DIRECTORY: &str = "results";
 
 /// Declared result locations for one campaign experiment task, in discovery
@@ -54,6 +54,11 @@ enum ManifestOutcome {
 enum ManifestRead {
     Invalid,
     Bytes(Vec<u8>),
+}
+
+pub(crate) enum ClassifiedManifest {
+    Invalid,
+    Valid { metrics: BTreeMap<String, f64> },
 }
 
 /// A bounded terminal-result classification that has not yet changed the
@@ -140,6 +145,16 @@ fn classify_manifest(bytes: &[u8], experiment_id: &str) -> Result<ManifestOutcom
         metrics,
         metrics_json,
     })
+}
+
+pub(crate) fn classify_manifest_bytes(
+    bytes: &[u8],
+    expected_experiment_id: &str,
+) -> Result<ClassifiedManifest, AppError> {
+    match classify_manifest(bytes, expected_experiment_id)? {
+        ManifestOutcome::Invalid => Ok(ClassifiedManifest::Invalid),
+        ManifestOutcome::Valid { metrics, .. } => Ok(ClassifiedManifest::Valid { metrics }),
+    }
 }
 
 fn defect_row(experiment_id: &str, defect: &'static str, now: i64) -> ExperimentMetricsRow {
@@ -391,6 +406,76 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+    fn assert_campaign_trial_manifest_parity(
+        bytes: &[u8],
+        expected_experiment_id: &str,
+    ) -> ExperimentMetricsRow {
+        let campaign = classify_manifest(bytes, expected_experiment_id).unwrap();
+        let trial = classify_manifest_bytes(bytes, expected_experiment_id).unwrap();
+        match (&campaign, &trial) {
+            (ManifestOutcome::Invalid, ClassifiedManifest::Invalid) => {}
+            (
+                ManifestOutcome::Valid { metrics, .. },
+                ClassifiedManifest::Valid {
+                    metrics: trial_metrics,
+                },
+            ) => assert_eq!(metrics, trial_metrics),
+            _ => panic!("campaign and trial manifest classifications differed"),
+        }
+        row_from_manifest_outcome(campaign, expected_experiment_id, None, 100)
+    }
+
+    #[test]
+    fn classify_manifest_bytes_projects_bounded_numeric_metrics() {
+        let valid = br#"{"schema_version":1,"experiment_id":"experiment-a","metrics":{"z":2,"integer":1,"decimal":1.0,"large":9007199254740993}}"#;
+        match classify_manifest_bytes(valid, "experiment-a").unwrap() {
+            ClassifiedManifest::Valid { metrics } => {
+                assert_eq!(metrics.get("decimal"), Some(&1.0));
+                assert_eq!(metrics.get("integer"), Some(&1.0));
+                assert_eq!(metrics.get("z"), Some(&2.0));
+                assert_eq!(metrics.get("large"), Some(&9007199254740992.0));
+            }
+            ClassifiedManifest::Invalid => panic!("valid manifest was rejected"),
+        }
+
+        let empty = br#"{"schema_version":1,"experiment_id":"experiment-a","metrics":{}}"#;
+        match classify_manifest_bytes(empty, "experiment-a").unwrap() {
+            ClassifiedManifest::Valid { metrics } => assert!(metrics.is_empty()),
+            ClassifiedManifest::Invalid => panic!("empty metrics map was rejected"),
+        }
+        let empty_row = assert_campaign_trial_manifest_parity(empty, "experiment-a");
+        assert_eq!(empty_row.metrics_json, "{}");
+        assert_eq!(empty_row.artifact_defect, None);
+
+        let invalid = vec![
+            b"not-json".to_vec(),
+            br#"{"schema_version":2,"experiment_id":"experiment-a","metrics":{}}"#.to_vec(),
+            br#"{"schema_version":1,"experiment_id":"other","metrics":{}}"#.to_vec(),
+            br#"{"schema_version":1,"experiment_id":"experiment-a","metrics":{"loss":"nan"}}"#
+                .to_vec(),
+            vec![b'x'; MAX_RESULT_MANIFEST_BYTES],
+            vec![b'x'; MAX_RESULT_MANIFEST_BYTES + 1],
+        ];
+        for bytes in invalid {
+            let row = assert_campaign_trial_manifest_parity(&bytes, "experiment-a");
+            assert_eq!(row.artifact_defect.as_deref(), Some("result_invalid"));
+            assert_eq!(row.metrics_json, "{}");
+        }
+    }
+
+    #[test]
+    fn campaign_projection_keeps_manifest_number_types_separate_from_trial_metrics() {
+        let bytes = br#"{"schema_version":1,"experiment_id":"experiment-a","metrics":{"z":2,"integer":1,"decimal":1.0,"large":9007199254740993}}"#;
+        let row = assert_campaign_trial_manifest_parity(bytes, "experiment-a");
+        let metrics: Value = serde_json::from_str(&row.metrics_json).unwrap();
+        assert!(metrics["integer"].is_i64());
+        assert!(metrics["decimal"].is_f64());
+        assert!(metrics["large"].is_u64());
+        assert_eq!(
+            row.metrics_json,
+            r#"{"decimal":1.0,"integer":1,"large":9007199254740993,"z":2}"#
+        );
+    }
 
     #[cfg(unix)]
     #[test]

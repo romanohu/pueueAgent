@@ -8,6 +8,7 @@
 //! cleanup pathname could otherwise mutate a replacement generation.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fmt,
@@ -20,6 +21,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::execution_policy::{
     ExecutableIdentity, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
@@ -83,22 +85,586 @@ pub fn campaign_experiment_task_environment(
     ]
 }
 
+/// Derive the fixed-layout paths for one private trial without touching the
+/// filesystem.  Callers that need to validate the fully composed command can
+/// do so before creating the trial generation.
+pub(crate) fn private_trial_output_paths(
+    project_root: &Path,
+    trial_id: Uuid,
+) -> (PathBuf, PathBuf) {
+    let generation = project_root
+        .join(PRIVATE_TEMP_ROOT)
+        .join("trials")
+        .join(OsString::from(trial_id.to_string()));
+    (generation.join("result.json"), generation.join("artifacts"))
+}
+
 pub fn campaign_experiment_runtime_argv(
     project_root: &Path,
     campaign_id: &str,
     experiment_id: &str,
     user_argv: &[String],
 ) -> Vec<OsString> {
+    let service_root = project_root.join(PRIVATE_TEMP_ROOT);
+    experiment_runtime_argv_with_outputs(
+        campaign_id,
+        experiment_id,
+        &service_root
+            .join(RESULTS_DIRECTORY)
+            .join(format!("{experiment_id}.json")),
+        &service_root.join(ARTIFACTS_DIRECTORY).join(experiment_id),
+        user_argv,
+    )
+}
+
+pub(crate) fn experiment_runtime_argv_with_outputs(
+    campaign_id: &str,
+    experiment_id: &str,
+    result_path: &Path,
+    artifact_dir: &Path,
+    user_argv: &[String],
+) -> Vec<OsString> {
     let mut argv = Vec::with_capacity(1 + 4 + user_argv.len());
     argv.push(OsString::from("/usr/bin/env"));
-    for (name, value) in campaign_experiment_task_environment(project_root, campaign_id, experiment_id) {
+    let assignments = [
+        ("PUEUE_AGENT_EXPERIMENT_ID", OsString::from(experiment_id)),
+        ("PUEUE_AGENT_CAMPAIGN_ID", OsString::from(campaign_id)),
+        (
+            "PUEUE_AGENT_RESULT_PATH",
+            result_path.as_os_str().to_os_string(),
+        ),
+        (
+            "PUEUE_AGENT_ARTIFACT_DIR",
+            artifact_dir.as_os_str().to_os_string(),
+        ),
+    ];
+    for (name, value) in assignments {
         let mut assignment = OsString::from(name);
-        assignment.push(OsString::from("="));
+        assignment.push("=");
         assignment.push(value);
         argv.push(assignment);
     }
     argv.extend(user_argv.iter().map(OsString::from));
     argv
+}
+
+/// Descriptor-bound output capability for one non-campaign trial.
+///
+/// The generation is created before a child is launched; its result file and
+/// artifact directory are deliberately left for that child to create.  All
+/// later reads and cleanup use the retained descriptor chain and revalidate
+/// the named chain before returning.
+pub struct PrivateTrialOutput {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    root_anchor: ProjectRootAnchor,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    root: File,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    service: File,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    trials: File,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    generation: File,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    result_descriptor: RefCell<Option<RetainedTrialResult>>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mount: MountIdentity,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    root_record: ResearchDirectoryRecord,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    service_record: ResearchDirectoryRecord,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    trials_record: ResearchDirectoryRecord,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    generation_record: ResearchDirectoryRecord,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    generation_name: OsString,
+    result_path: PathBuf,
+    artifact_dir: PathBuf,
+    cleaned: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct TrialOutputChain {
+    trials: File,
+    generation: Option<File>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct RetainedTrialResult {
+    file: File,
+    snapshot: ResearchLeafSnapshot,
+    digest: Option<String>,
+}
+
+impl PrivateTrialOutput {
+    pub fn create(root: &VerifiedProjectRoot, trial_id: Uuid) -> Result<Self, PolicyViolation> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (root, trial_id);
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::PreBinding,
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let stage = PolicyViolationStage::PreBinding;
+            let verified_root = root.anchor.verify_identity()?;
+            let (result_path, artifact_dir) =
+                private_trial_output_paths(&verified_root.anchor.canonical_path, trial_id);
+            let root_mount = directory_mount_identity_at(&verified_root.directory, stage)?;
+            let root_record = research_directory_record_at(&verified_root.directory, root_mount, stage)?;
+            let service = open_or_create_retention_directory(
+                &verified_root.directory,
+                OsStr::new(PRIVATE_TEMP_ROOT),
+                root_mount,
+                true,
+                stage,
+            )?;
+            let service_record = research_directory_record_at(&service, root_mount, stage)?;
+            let trials = open_or_create_retention_directory(
+                &service,
+                OsStr::new("trials"),
+                root_mount,
+                true,
+                stage,
+            )?;
+            let trials_record = research_directory_record_at(&trials, root_mount, stage)?;
+            let generation_name = OsString::from(trial_id.to_string());
+            if open_optional_directory_on_mount(&trials, &generation_name, root_mount, stage)?.is_some() {
+                return Err(temp_violation_at(TempUnsafeReason::ExistingEntry, stage));
+            }
+            mkdirat_private(&trials, &generation_name)?;
+            let generation = open_directory_on_mount(&trials, &generation_name, root_mount, stage)?;
+            validate_private_directory_at(&generation, stage)?;
+            let generation_record = research_directory_record_at(&generation, root_mount, stage)?;
+            trials.sync_all().map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
+            let root_anchor = verified_root.anchor.clone();
+            let output = Self {
+                root_anchor,
+                root: verified_root.directory,
+                service,
+                trials,
+                generation,
+                result_descriptor: RefCell::new(None),
+                mount: root_mount,
+                root_record,
+                service_record,
+                trials_record,
+                generation_record,
+                generation_name,
+                result_path,
+                artifact_dir,
+                cleaned: false,
+            };
+            output.revalidate_chain(true)?;
+            Ok(output)
+        }
+    }
+
+    pub fn result_path(&self) -> &Path {
+        &self.result_path
+    }
+
+    pub fn artifact_dir(&self) -> &Path {
+        &self.artifact_dir
+    }
+
+    pub fn read_result_bounded(&self) -> Result<Vec<u8>, PolicyViolation> {
+        self.read_result_bounded_after_read(|| {})
+    }
+
+    fn read_result_bounded_after_read<F: FnOnce()>(
+        &self,
+        after_read: F,
+    ) -> Result<Vec<u8>, PolicyViolation> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = after_read;
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::Finalized,
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let chain = self.revalidate_chain(true)?;
+            let retained_result =
+                self.retained_result_for_generation(chain.generation.as_ref().unwrap())?;
+            let result = match retained_result.as_ref() {
+                Some((file, _, _)) => file.try_clone().map_err(|_| {
+                    temp_violation_at(TempUnsafeReason::IoFailure, PolicyViolationStage::Finalized)
+                })?,
+                None => open_research_file_on_mount(
+                    chain.generation.as_ref().unwrap(),
+                    OsStr::new("result.json"),
+                    self.mount,
+                    PolicyViolationStage::Finalized,
+                )?,
+            };
+            let max_bytes = crate::result_manifest::MAX_RESULT_MANIFEST_BYTES as u64;
+            let before = research_leaf_snapshot(
+                &result,
+                self.mount,
+                u64::MAX,
+                PolicyViolationStage::Finalized,
+            )?;
+            if retained_result
+                .as_ref()
+                .is_some_and(|(_, snapshot, _)| *snapshot != before)
+            {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            if retained_result.is_none() {
+                let retained_file = result.try_clone().map_err(|_| {
+                    temp_violation_at(TempUnsafeReason::IoFailure, PolicyViolationStage::Finalized)
+                })?;
+                *self.result_descriptor.borrow_mut() = Some(RetainedTrialResult {
+                    file: retained_file,
+                    snapshot: before,
+                    digest: None,
+                });
+            }
+            if before.links != 1 {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::InvalidEntry,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            if before.logical_bytes > crate::result_manifest::MAX_RESULT_MANIFEST_BYTES as u64 {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::ByteLimit,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            let before_digest =
+                hash_research_file(&result, max_bytes, PolicyViolationStage::Finalized)?.1;
+            if retained_result
+                .as_ref()
+                .is_some_and(|(_, snapshot, digest)| {
+                    *snapshot != before
+                        || digest
+                            .as_ref()
+                            .is_some_and(|expected| expected != &before_digest)
+                })
+            {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            if let Some(retained) = self.result_descriptor.borrow_mut().as_mut() {
+                if retained.digest.is_none() {
+                    retained.digest = Some(before_digest.clone());
+                }
+            }
+            let size = usize::try_from(before.logical_bytes).map_err(|_| {
+                temp_violation_at(TempUnsafeReason::ByteLimit, PolicyViolationStage::Finalized)
+            })?;
+            let mut bytes = vec![0_u8; size];
+            read_research_bytes(&result, &mut bytes, PolicyViolationStage::Finalized)?;
+            after_read();
+            let after = research_leaf_snapshot(
+                &result,
+                self.mount,
+                max_bytes + 1,
+                PolicyViolationStage::Finalized,
+            )?;
+            let after_digest =
+                hash_research_file(&result, max_bytes, PolicyViolationStage::Finalized)?.1;
+            if before != after
+                || before_digest != after_digest
+                || format!("{:x}", Sha256::digest(&bytes)) != before_digest
+            {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            let visible = open_research_file_on_mount(
+                chain.generation.as_ref().unwrap(),
+                OsStr::new("result.json"),
+                self.mount,
+                PolicyViolationStage::Finalized,
+            )?;
+            let visible_snapshot = research_leaf_snapshot(
+                &visible,
+                self.mount,
+                max_bytes + 1,
+                PolicyViolationStage::Finalized,
+            )?;
+            let visible_digest =
+                hash_research_file(&visible, max_bytes, PolicyViolationStage::Finalized)?.1;
+            if visible_snapshot != before || visible_digest != before_digest {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            self.revalidate_chain(true)?;
+            Ok(bytes)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn retained_result_for_generation(
+        &self,
+        generation: &File,
+    ) -> Result<Option<(File, ResearchLeafSnapshot, Option<String>)>, PolicyViolation> {
+        let Some(retained) = self.result_descriptor.borrow().as_ref().map(|retained| {
+            (
+                retained.file.try_clone(),
+                retained.snapshot,
+                retained.digest.clone(),
+            )
+        }) else {
+            return Ok(None);
+        };
+        let retained_file = retained.0.map_err(|_| {
+            temp_violation_at(TempUnsafeReason::IoFailure, PolicyViolationStage::Finalized)
+        })?;
+        let retained_snapshot = research_leaf_snapshot(
+            &retained_file,
+            self.mount,
+            u64::MAX,
+            PolicyViolationStage::Finalized,
+        )?;
+        let visible = open_research_file_on_mount(
+            generation,
+            OsStr::new("result.json"),
+            self.mount,
+            PolicyViolationStage::Finalized,
+        )?;
+        let visible_snapshot = research_leaf_snapshot(
+            &visible,
+            self.mount,
+            u64::MAX,
+            PolicyViolationStage::Finalized,
+        )?;
+        if retained_snapshot != retained.1
+            || visible_snapshot != retained.1
+        {
+            return Err(temp_violation_at(
+                TempUnsafeReason::IdentityChanged,
+                PolicyViolationStage::Finalized,
+            ));
+        }
+        if let Some(expected_digest) = retained.2.as_ref() {
+            let max_bytes = crate::result_manifest::MAX_RESULT_MANIFEST_BYTES as u64;
+            let retained_digest =
+                hash_research_file(&retained_file, max_bytes, PolicyViolationStage::Finalized)?.1;
+            let visible_digest =
+                hash_research_file(&visible, max_bytes, PolicyViolationStage::Finalized)?.1;
+            if &retained_digest != expected_digest || &visible_digest != expected_digest {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+        }
+        Ok(Some((retained_file, retained.1, retained.2)))
+    }
+
+    pub fn cleanup(&mut self) -> Result<TempCleanupReport, PolicyViolation> {
+        self.cleanup_before(Instant::now() + std::time::Duration::from_secs(30))
+    }
+
+    pub(crate) fn cleanup_before(
+        &mut self,
+        cleanup_before: Instant,
+    ) -> Result<TempCleanupReport, PolicyViolation> {
+        self.cleanup_before_with_hook(cleanup_before, || {})
+    }
+
+    fn cleanup_before_with_hook<F: FnOnce()>(
+        &mut self,
+        cleanup_before: Instant,
+        before_generation_recheck: F,
+    ) -> Result<TempCleanupReport, PolicyViolation> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (cleanup_before, before_generation_recheck);
+            return Err(PolicyViolation::new(
+                PolicyViolationCode::UnsupportedPlatform,
+                PolicyViolationStage::Finalized,
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if self.cleaned {
+                return Ok(TempCleanupReport {
+                    entries_removed: 0,
+                    allocated_bytes_reclaimed: 0,
+                });
+            }
+            let chain = self.revalidate_chain(true)?;
+            check_cleanup_deadline(Some(cleanup_before))?;
+            let _ = self.retained_result_for_generation(chain.generation.as_ref().unwrap())?;
+            let mut state = AuditState::default();
+            let entries = audit_trial_output_directory(
+                chain.generation.as_ref().unwrap(),
+                0,
+                &mut state,
+                Some(cleanup_before),
+                self.mount,
+            )?;
+            let mut report = TempCleanupReport {
+                entries_removed: 0,
+                allocated_bytes_reclaimed: 0,
+            };
+            remove_audited_trial_output_entries(
+                chain.generation.as_ref().unwrap(),
+                &entries,
+                &mut report,
+                Some(cleanup_before),
+                self.mount,
+            )?;
+            finish_cleanup_before_success(
+                chain.generation.as_ref().unwrap(),
+                Some(cleanup_before),
+                #[cfg(all(test, unix))]
+                None,
+            )?;
+            let chain = self.revalidate_chain(true)?;
+            before_generation_recheck();
+            check_cleanup_deadline(Some(cleanup_before))?;
+            if directory_identity_at(
+                &chain.generation.as_ref().unwrap(),
+                PolicyViolationStage::Finalized,
+            )? != (self.generation_record.device, self.generation_record.inode)
+            {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            let named_generation = entry_metadata_at(
+                &chain.trials,
+                &self.generation_name,
+                PolicyViolationStage::Finalized,
+            )?;
+            if named_generation.mount_identity != self.mount {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::MountBoundary,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            if named_generation.identity
+                != (self.generation_record.device, self.generation_record.inode)
+                || named_generation.kind != AuditedEntryKind::Directory
+            {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            let visible_generation = open_directory_on_mount(
+                &chain.trials,
+                &self.generation_name,
+                self.mount,
+                PolicyViolationStage::Finalized,
+            )?;
+            validate_private_directory_at(&visible_generation, PolicyViolationStage::Finalized)?;
+            if research_directory_record_at(
+                &visible_generation,
+                self.mount,
+                PolicyViolationStage::Finalized,
+            )? != self.generation_record
+            {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            check_cleanup_deadline(Some(cleanup_before))?;
+            unlinkat(&chain.trials, &self.generation_name, true)?;
+            let _ = check_cleanup_deadline(Some(cleanup_before));
+            sync_directory(
+                &chain.trials,
+                #[cfg(all(unix, test))]
+                None,
+            )?;
+            check_cleanup_deadline(Some(cleanup_before))?;
+            let parent = self.revalidate_chain(false)?;
+            check_cleanup_deadline(Some(cleanup_before))?;
+            if open_optional_directory_on_mount(
+                &parent.trials,
+                &self.generation_name,
+                self.mount,
+                PolicyViolationStage::Finalized,
+            )?
+            .is_some()
+            {
+                return Err(temp_violation_at(
+                    TempUnsafeReason::IdentityChanged,
+                    PolicyViolationStage::Finalized,
+                ));
+            }
+            self.cleaned = true;
+            Ok(report)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn revalidate_chain(&self, require_generation: bool) -> Result<TrialOutputChain, PolicyViolation> {
+        let stage = PolicyViolationStage::Finalized;
+        let verified_root = self.root_anchor.verify_identity()?;
+        let mount = directory_mount_identity_at(&verified_root.directory, stage)?;
+        if mount != self.mount {
+            return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
+        }
+        let root_record = research_directory_record_at(&verified_root.directory, mount, stage)?;
+        if root_record != self.root_record
+            || research_directory_record_at(&self.root, mount, stage)? != self.root_record
+        {
+            return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+        }
+        let service = open_directory_on_mount(&verified_root.directory, OsStr::new(PRIVATE_TEMP_ROOT), mount, stage)?;
+        let service_record = research_directory_record_at(&service, mount, stage)?;
+        if service_record != self.service_record
+            || research_directory_record_at(&self.service, mount, stage)? != self.service_record
+        {
+            return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+        }
+        let trials = open_directory_on_mount(&service, OsStr::new("trials"), mount, stage)?;
+        let trials_record = research_directory_record_at(&trials, mount, stage)?;
+        if trials_record != self.trials_record
+            || research_directory_record_at(&self.trials, mount, stage)? != self.trials_record
+        {
+            return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+        }
+        let generation = match open_optional_directory_on_mount(&trials, &self.generation_name, mount, stage)? {
+            Some(generation) => {
+                validate_private_directory_at(&generation, stage)?;
+                let record = research_directory_record_at(&generation, mount, stage)?;
+                if !require_generation {
+                    return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+                }
+                if Some(record.clone()) != Some(self.generation_record.clone())
+                    || research_directory_record_at(&self.generation, mount, stage)? != self.generation_record
+                {
+                    return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+                }
+                Some((generation, record))
+            }
+            None if require_generation => {
+                return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+            }
+            None => None,
+        };
+        Ok(TrialOutputChain {
+            trials,
+            generation: generation
+                .as_ref()
+                .map(|(file, _)| file.try_clone())
+                .transpose()
+                .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?,
+        })
+    }
 }
 
 /// The sole private-temp descriptor inherited by native agent targets.
@@ -1291,12 +1857,32 @@ fn hash_research_file(
 ) -> Result<(u64, String), PolicyViolation> {
     use std::os::unix::fs::FileExt;
 
+    hash_research_file_with_reader(max_bytes, stage, |buffer, offset| {
+        file.read_at(buffer, offset)
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hash_research_file_with_reader<F>(
+    max_bytes: u64,
+    stage: PolicyViolationStage,
+    mut read_at: F,
+) -> Result<(u64, String), PolicyViolation>
+where
+    F: FnMut(&mut [u8], u64) -> io::Result<usize>,
+{
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; RESEARCH_HASH_BUFFER_BYTES];
     let mut offset = 0_u64;
     loop {
-        let read = file
-            .read_at(&mut buffer, offset)
+        if offset > max_bytes {
+            return Err(temp_violation_at(TempUnsafeReason::ByteLimit, stage));
+        }
+        let remaining_with_sentinel = max_bytes.saturating_sub(offset).saturating_add(1);
+        let requested = usize::try_from(remaining_with_sentinel)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = read_at(&mut buffer[..requested], offset)
             .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
         if read == 0 {
             break;
@@ -4865,6 +5451,7 @@ impl PrivateRunTemp {
             &mut report,
             deadline,
             root_mount,
+            false,
             Some(&mut test_state),
             None,
         )?;
@@ -4910,6 +5497,7 @@ impl PrivateRunTemp {
             &mut report,
             deadline,
             root_mount,
+            false,
             Some(&mut *test_state),
             None,
         )?;
@@ -4956,6 +5544,7 @@ impl PrivateRunTemp {
             &mut report,
             deadline,
             root_mount,
+            false,
             Some(&mut cleanup_test_state),
             Some(&mut *mount_test_state),
         )?;
@@ -5752,6 +6341,45 @@ fn check_audit_deadline(
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn audit_trial_output_directory(
+    directory: &File,
+    depth: usize,
+    state: &mut AuditState,
+    deadline: Option<Instant>,
+    root_mount: MountIdentity,
+) -> Result<Vec<AuditedEntry>, PolicyViolation> {
+    let entries = audit_directory_with_child_mode(
+        directory,
+        depth,
+        state,
+        deadline,
+        PolicyViolationStage::Finalized,
+        root_mount,
+        true,
+        #[cfg(all(test, unix))]
+        None,
+    )?;
+    for entry in &entries {
+        let invalid_shape = match entry.name.as_os_str() {
+            name if name == OsStr::new("result.json") => {
+                entry.kind != AuditedEntryKind::Leaf
+            }
+            name if name == OsStr::new("artifacts") => {
+                entry.kind != AuditedEntryKind::Directory
+            }
+            _ => false,
+        };
+        if invalid_shape {
+            return Err(temp_violation_at(
+                TempUnsafeReason::InvalidEntry,
+                PolicyViolationStage::Finalized,
+            ));
+        }
+    }
+    Ok(entries)
+}
+
 #[cfg(unix)]
 fn audit_directory(
     directory: &File,
@@ -5760,6 +6388,30 @@ fn audit_directory(
     deadline: Option<Instant>,
     stage: PolicyViolationStage,
     root_mount: MountIdentity,
+    #[cfg(all(test, unix))] mount_test_state: Option<&mut MountBoundaryTestState>,
+) -> Result<Vec<AuditedEntry>, PolicyViolation> {
+    audit_directory_with_child_mode(
+        directory,
+        depth,
+        state,
+        deadline,
+        stage,
+        root_mount,
+        false,
+        #[cfg(all(test, unix))]
+        mount_test_state,
+    )
+}
+
+#[cfg(unix)]
+fn audit_directory_with_child_mode(
+    directory: &File,
+    depth: usize,
+    state: &mut AuditState,
+    deadline: Option<Instant>,
+    stage: PolicyViolationStage,
+    root_mount: MountIdentity,
+    allow_safe_child_directories: bool,
     #[cfg(all(test, unix))] mut mount_test_state: Option<&mut MountBoundaryTestState>,
 ) -> Result<Vec<AuditedEntry>, PolicyViolation> {
     check_audit_deadline(deadline, Some(state), stage)?;
@@ -5796,21 +6448,35 @@ fn audit_directory(
                 return Err(temp_violation_at(TempUnsafeReason::MountBoundary, stage));
             }
             let child = open_directory_on_mount(directory, &listed.name, root_mount, stage)?;
-            validate_private_directory_at(&child, stage)?;
+            if allow_safe_child_directories {
+                validate_safe_trial_child_directory(&child, stage)?;
+            } else {
+                validate_private_directory_at(&child, stage)?;
+            }
             if directory_identity_at(&child, stage)? != listed.identity {
                 return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
             }
-            audit_directory(
+            audit_directory_with_child_mode(
                 &child,
                 depth + 1,
                 state,
                 deadline,
                 stage,
                 root_mount,
+                allow_safe_child_directories,
                 #[cfg(all(test, unix))]
                 mount_test_state.as_deref_mut(),
             )?
         } else {
+            if allow_safe_child_directories {
+                validate_trial_output_leaf_at(
+                    directory,
+                    &listed.name,
+                    listed.identity,
+                    root_mount,
+                    stage,
+                )?;
+            }
             Vec::new()
         };
         entries.push(AuditedEntry {
@@ -5823,6 +6489,22 @@ fn audit_directory(
         });
     }
     Ok(entries)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_trial_output_leaf_at(
+    directory: &File,
+    name: &OsStr,
+    expected_identity: (u64, u64),
+    expected_mount: MountIdentity,
+    stage: PolicyViolationStage,
+) -> Result<(), PolicyViolation> {
+    let leaf = open_research_file_on_mount(directory, name, expected_mount, stage)?;
+    let snapshot = research_leaf_snapshot(&leaf, expected_mount, u64::MAX, stage)?;
+    if (snapshot.device, snapshot.inode) != expected_identity {
+        return Err(temp_violation_at(TempUnsafeReason::IdentityChanged, stage));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -5841,6 +6523,31 @@ fn remove_audited_entries(
         report,
         deadline,
         root_mount,
+        false,
+        #[cfg(all(test, unix))]
+        Some(&mut test_state),
+        #[cfg(all(test, unix))]
+        None,
+    )
+}
+
+#[cfg(unix)]
+fn remove_audited_trial_output_entries(
+    directory: &File,
+    entries: &[AuditedEntry],
+    report: &mut TempCleanupReport,
+    deadline: Option<Instant>,
+    root_mount: MountIdentity,
+) -> Result<(), PolicyViolation> {
+    #[cfg(all(test, unix))]
+    let mut test_state = CleanupTestState::default();
+    remove_audited_entries_impl(
+        directory,
+        entries,
+        report,
+        deadline,
+        root_mount,
+        true,
         #[cfg(all(test, unix))]
         Some(&mut test_state),
         #[cfg(all(test, unix))]
@@ -5855,6 +6562,7 @@ fn remove_audited_entries_impl(
     report: &mut TempCleanupReport,
     deadline: Option<Instant>,
     root_mount: MountIdentity,
+    allow_safe_child_directories: bool,
     #[cfg(all(test, unix))] mut test_state: Option<&mut CleanupTestState>,
     #[cfg(all(test, unix))] mut mount_test_state: Option<&mut MountBoundaryTestState>,
 ) -> Result<(), PolicyViolation> {
@@ -5867,6 +6575,7 @@ fn remove_audited_entries_impl(
             deadline,
             &mut modified,
             root_mount,
+            allow_safe_child_directories,
             #[cfg(all(test, unix))]
             test_state.as_deref_mut(),
             #[cfg(all(test, unix))]
@@ -5926,6 +6635,7 @@ fn remove_audited_entry(
     deadline: Option<Instant>,
     modified: &mut bool,
     root_mount: MountIdentity,
+    allow_safe_child_directories: bool,
     #[cfg(all(test, unix))] mut test_state: Option<&mut CleanupTestState>,
     #[cfg(all(test, unix))] mut mount_test_state: Option<&mut MountBoundaryTestState>,
 ) -> Result<(), PolicyViolation> {
@@ -5948,7 +6658,11 @@ fn remove_audited_entry(
             root_mount,
             PolicyViolationStage::RunBoundPreMarker,
         )?;
-        validate_private_directory(&child)?;
+        if allow_safe_child_directories {
+            validate_safe_trial_child_directory(&child, PolicyViolationStage::RunBoundPreMarker)?;
+        } else {
+            validate_private_directory(&child)?;
+        }
         if directory_identity(&child)? != entry.identity {
             return Err(temp_violation(TempUnsafeReason::IdentityChanged));
         }
@@ -5958,6 +6672,7 @@ fn remove_audited_entry(
             report,
             deadline,
             root_mount,
+            allow_safe_child_directories,
             #[cfg(all(test, unix))]
             test_state.as_deref_mut(),
             #[cfg(all(test, unix))]
@@ -5999,6 +6714,15 @@ fn remove_audited_entry(
                 test_state.mismatch_before_unlink = false;
             }
             return Err(temp_violation(TempUnsafeReason::MountBoundary));
+        }
+        if allow_safe_child_directories {
+            validate_trial_output_leaf_at(
+                directory,
+                &entry.name,
+                entry.identity,
+                root_mount,
+                PolicyViolationStage::Finalized,
+            )?;
         }
         check_cleanup_deadline(deadline)?;
         unlinkat(directory, &entry.name, false)?;
@@ -6844,6 +7568,26 @@ fn validate_private_temp_container_at(
 }
 
 #[cfg(unix)]
+fn validate_safe_trial_child_directory(
+    directory: &File,
+    stage: PolicyViolationStage,
+) -> Result<(), PolicyViolation> {
+    let metadata = directory
+        .metadata()
+        .map_err(|_| temp_violation_at(TempUnsafeReason::IoFailure, stage))?;
+    use std::os::unix::fs::MetadataExt;
+    let mode = metadata.mode() & 0o7777;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() as u32 }
+        || mode & 0o7022 != 0
+        || mode & 0o700 != 0o700
+    {
+        return Err(temp_violation_at(TempUnsafeReason::InvalidEntry, stage));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn validate_private_directory(directory: &File) -> Result<(), PolicyViolation> {
     validate_private_directory_at(directory, PolicyViolationStage::RunBoundPreMarker)
 }
@@ -7267,14 +8011,13 @@ fn map_temp_io_at(error: io::Error, stage: PolicyViolationStage) -> PolicyViolat
 mod tests {
     use super::*;
     use std::{
+        ffi::CString,
         fs,
         os::unix::ffi::OsStrExt,
-        os::unix::fs::{symlink, PermissionsExt},
+        os::unix::fs::{symlink, FileTypeExt, PermissionsExt},
         time::Duration,
     };
-
-    #[cfg(target_os = "linux")]
-    use std::os::unix::ffi::OsStringExt;
+    use uuid::Uuid;
 
     fn test_temp(run_id: i64) -> (tempfile::TempDir, PrivateRunTemp) {
         let holder = tempfile::tempdir().unwrap();
@@ -7307,6 +8050,888 @@ mod tests {
         let expected = temp.recovery_identity(&root).unwrap();
         (holder, root, temp, expected)
     }
+
+    #[test]
+    fn private_trial_output_creates_owner_only_generation_and_reads_atomic_result() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let trial_id = Uuid::new_v4();
+
+        let mut output = PrivateTrialOutput::create(&root, trial_id).unwrap();
+        let generation = output.result_path().parent().unwrap().to_owned();
+        assert_eq!(
+            generation.file_name().unwrap(),
+            OsStr::new(&trial_id.to_string())
+        );
+        assert_eq!(
+            Uuid::parse_str(generation.file_name().unwrap().to_str().unwrap()).unwrap(),
+            trial_id
+        );
+        assert_eq!(output.result_path(), generation.join("result.json"));
+        assert_eq!(output.artifact_dir(), generation.join("artifacts"));
+        assert!(!output.result_path().exists());
+        assert!(!output.artifact_dir().exists());
+        assert!(output.result_descriptor.borrow().is_none());
+        let trials = generation.parent().unwrap();
+        let service = trials.parent().unwrap();
+        for directory in [&root_path, service, trials, &generation] {
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o7777,
+                0o700
+            );
+        }
+        let generation_mode = fs::metadata(&generation).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(generation_mode, 0o700);
+
+        let sibling_id = Uuid::new_v4();
+        assert_ne!(sibling_id, trial_id);
+        let sibling_generation = trials.join(sibling_id.to_string());
+        fs::create_dir(&sibling_generation).unwrap();
+        fs::set_permissions(&sibling_generation, fs::Permissions::from_mode(0o700)).unwrap();
+        let sibling_sentinel = sibling_generation.join("sentinel");
+        fs::write(&sibling_sentinel, b"neighbor").unwrap();
+        fs::set_permissions(&sibling_sentinel, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let temporary_result = generation.join(".result.tmp");
+        fs::write(&temporary_result, b"atomic-result").unwrap();
+        fs::set_permissions(&temporary_result, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&temporary_result, output.result_path()).unwrap();
+        assert_eq!(output.read_result_bounded().unwrap(), b"atomic-result");
+        assert!(output.result_descriptor.borrow().is_some());
+
+        output.cleanup().unwrap();
+        assert!(!generation.exists());
+        assert!(service.exists());
+        assert!(trials.exists());
+        assert_eq!(fs::read(&sibling_sentinel).unwrap(), b"neighbor");
+    }
+
+    #[test]
+    fn private_trial_output_rejects_result_substitution_and_preserves_it() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let outside = holder.path().join("outside-result");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, output.result_path()).unwrap();
+
+        assert!(output.read_result_bounded().is_err());
+        assert!(output.cleanup().is_err());
+        assert!(fs::symlink_metadata(output.result_path())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let mut hardlink_output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let hardlink_source = holder.path().join("hardlink-source");
+        fs::write(&hardlink_source, b"hardlink").unwrap();
+        fs::set_permissions(&hardlink_source, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&hardlink_source, hardlink_output.result_path()).unwrap();
+        assert!(hardlink_output.read_result_bounded().is_err());
+        assert!(hardlink_output.cleanup().is_err());
+        assert!(hardlink_output.result_path().exists());
+
+        let mut wrong_mode_output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        fs::write(wrong_mode_output.result_path(), b"wrong mode").unwrap();
+        fs::set_permissions(
+            wrong_mode_output.result_path(),
+            fs::Permissions::from_mode(0o660),
+        )
+        .unwrap();
+        assert!(wrong_mode_output.read_result_bounded().is_err());
+        assert!(wrong_mode_output.cleanup().is_err());
+        assert!(wrong_mode_output.result_path().exists());
+
+        let mut directory_output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        fs::create_dir(directory_output.result_path()).unwrap();
+        fs::set_permissions(
+            directory_output.result_path(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(directory_output.read_result_bounded().is_err());
+        assert!(directory_output.cleanup().is_err());
+        assert!(directory_output.result_path().is_dir());
+
+        let mut fifo_output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let fifo_path = CString::new(fifo_output.result_path().as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        assert!(fifo_output.read_result_bounded().is_err());
+        assert!(fifo_output.cleanup().is_err());
+        assert!(fs::symlink_metadata(fifo_output.result_path())
+            .unwrap()
+            .file_type()
+            .is_fifo());
+
+        let mut wrong_owner_output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        fs::write(wrong_owner_output.result_path(), b"wrong owner").unwrap();
+        fs::set_permissions(
+            wrong_owner_output.result_path(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let wrong_owner_path =
+            CString::new(wrong_owner_output.result_path().as_os_str().as_bytes()).unwrap();
+        let wrong_owner = unsafe { libc::geteuid() }.wrapping_add(1);
+        if unsafe { libc::chown(wrong_owner_path.as_ptr(), wrong_owner, !0) } == 0 {
+            assert!(wrong_owner_output.read_result_bounded().is_err());
+            assert!(wrong_owner_output.cleanup().is_err());
+            assert!(wrong_owner_output.result_path().exists());
+        } else {
+            eprintln!("skipping wrong-owner leaf assertion because chown is not permitted");
+        }
+    }
+
+    #[test]
+    fn private_trial_output_rejects_result_replacement_after_open() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let generation = output.result_path().parent().unwrap().to_owned();
+        let original = output.result_path().to_owned();
+        let retired = generation.join("result.retired");
+        let replacement = generation.join(".result.replacement");
+        fs::write(&original, b"original result").unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&replacement, b"replacement result").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let result = output.read_result_bounded_after_read(|| {
+            fs::rename(&original, &retired).unwrap();
+            fs::rename(&replacement, &original).unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&original).unwrap(), b"replacement result");
+        assert_eq!(fs::read(&retired).unwrap(), b"original result");
+        assert!(output.cleanup().is_err());
+        assert_eq!(fs::read(&original).unwrap(), b"replacement result");
+        assert_eq!(fs::read(&retired).unwrap(), b"original result");
+    }
+
+    #[test]
+    fn private_trial_output_retains_result_identity_for_later_read_and_cleanup() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let result_path = output.result_path().to_owned();
+        fs::write(&result_path, b"original result").unwrap();
+        fs::set_permissions(&result_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(output.read_result_bounded().unwrap(), b"original result");
+
+        fs::remove_file(&result_path).unwrap();
+        fs::write(&result_path, b"replacement result").unwrap();
+        fs::set_permissions(&result_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(output.read_result_bounded().is_err());
+        assert!(output.cleanup().is_err());
+        assert_eq!(fs::read(&result_path).unwrap(), b"replacement result");
+        assert!(result_path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn private_trial_output_enforces_result_cap_and_cleans_child_artifacts() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let oversized = vec![b'x'; crate::result_manifest::MAX_RESULT_MANIFEST_BYTES + 1];
+        fs::write(output.result_path(), &oversized).unwrap();
+        fs::set_permissions(output.result_path(), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(output.read_result_bounded().is_err());
+        assert!(output.result_path().exists());
+        output.cleanup().unwrap();
+
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let generation = output.result_path().parent().unwrap().to_owned();
+        let exact = vec![b'x'; crate::result_manifest::MAX_RESULT_MANIFEST_BYTES];
+        fs::write(output.result_path(), &exact).unwrap();
+        fs::set_permissions(output.result_path(), fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(output.read_result_bounded().unwrap(), exact);
+        fs::create_dir(output.artifact_dir()).unwrap();
+        fs::set_permissions(output.artifact_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+        let artifact = output.artifact_dir().join("child.bin");
+        fs::write(&artifact, b"child artifact").unwrap();
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o600)).unwrap();
+        let report = output.cleanup().unwrap();
+        assert_eq!(report.entries_removed, 3);
+        assert!(!generation.exists());
+    }
+
+    #[test]
+    fn private_trial_output_cleanup_removes_invalid_result_and_abandoned_temp_safely() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let generation = output.result_path().parent().unwrap().to_owned();
+        let trials = generation.parent().unwrap().to_owned();
+        let service = trials.parent().unwrap().to_owned();
+        let oversized = vec![b'x'; crate::result_manifest::MAX_RESULT_MANIFEST_BYTES + 1];
+        fs::write(output.result_path(), oversized).unwrap();
+        fs::set_permissions(output.result_path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let abandoned_temp = generation.join(".result.tmp");
+        fs::write(&abandoned_temp, b"partially written manifest").unwrap();
+        fs::set_permissions(&abandoned_temp, fs::Permissions::from_mode(0o600)).unwrap();
+        let arbitrary_temp = generation.join(".result.tmp-atomic-writer-42");
+        fs::write(&arbitrary_temp, b"partially written manifest").unwrap();
+        fs::set_permissions(&arbitrary_temp, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let sibling = trials.join(Uuid::new_v4().to_string());
+        fs::create_dir(&sibling).unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
+        let sibling_sentinel = sibling.join("sentinel");
+        fs::write(&sibling_sentinel, b"preserve neighbor").unwrap();
+        fs::set_permissions(&sibling_sentinel, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(output.read_result_bounded().is_err());
+        let report = output.cleanup().unwrap();
+        assert_eq!(report.entries_removed, 3);
+        assert!(!generation.exists());
+        assert!(service.is_dir());
+        assert!(trials.is_dir());
+        assert_eq!(fs::read(sibling_sentinel).unwrap(), b"preserve neighbor");
+    }
+
+    #[test]
+    fn private_trial_output_preserves_replacement_after_oversized_read() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let original = output.result_path().to_owned();
+        let retired = original.with_file_name("result.retired");
+        let replacement = original.with_file_name(".result.replacement");
+        fs::write(
+            &original,
+            vec![
+                b'x';
+                crate::result_manifest::MAX_RESULT_MANIFEST_BYTES + 1
+            ],
+        )
+        .unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(output.read_result_bounded().is_err());
+        fs::rename(&original, &retired).unwrap();
+        fs::write(&replacement, b"replacement result").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&replacement, &original).unwrap();
+
+        assert!(output.cleanup().is_err());
+        assert_eq!(fs::read(&original).unwrap(), b"replacement result");
+        assert!(retired.exists());
+    }
+
+    #[test]
+    fn private_trial_output_cleanup_accepts_default_artifact_directory_modes() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let generation = output.result_path().parent().unwrap().to_owned();
+        let artifacts = output.artifact_dir();
+        let nested = artifacts.join("checkpoints");
+        fs::create_dir(artifacts).unwrap();
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(artifacts, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
+        let leaf = nested.join("history.csv");
+        fs::write(&leaf, b"step,loss\n1,0.5\n").unwrap();
+        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            fs::metadata(&generation).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(artifacts).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(&nested).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+
+        let report = output.cleanup().unwrap();
+        assert_eq!(report.entries_removed, 3);
+        assert!(!generation.exists());
+        assert!(root_path.join(PRIVATE_TEMP_ROOT).is_dir());
+    }
+
+    #[test]
+    fn private_trial_output_rejects_generation_replacement_without_touching_it() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let generation = output.result_path().parent().unwrap().to_owned();
+        let retired = generation.with_file_name("retired-generation");
+        fs::rename(&generation, &retired).unwrap();
+        fs::create_dir(&generation).unwrap();
+        fs::set_permissions(&generation, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(generation.join("sentinel"), b"replacement").unwrap();
+        assert!(output.read_result_bounded().is_err());
+        assert!(output.cleanup().is_err());
+        assert_eq!(fs::read(generation.join("sentinel")).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn private_trial_output_rechecks_generation_name_before_cleanup_unlink() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let generation = output.result_path().parent().unwrap().to_owned();
+        let retired = generation.with_file_name("retired-generation");
+        let replacement = generation.clone();
+
+        let result =
+            output.cleanup_before_with_hook(Instant::now() + Duration::from_secs(30), || {
+                fs::rename(&generation, &retired).unwrap();
+                fs::create_dir(&replacement).unwrap();
+                fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+            });
+        assert!(result.is_err());
+        assert!(generation.is_dir());
+        assert!(retired.is_dir());
+        assert!(output.read_result_bounded().is_err());
+    }
+
+    #[test]
+    fn private_trial_output_rejects_project_root_replacement() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let retired = root_path.with_file_name("retired-project");
+        fs::rename(&root_path, &retired).unwrap();
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement_service = root_path.join(PRIVATE_TEMP_ROOT);
+        let replacement_trials = replacement_service.join("trials");
+        fs::create_dir(&replacement_service).unwrap();
+        fs::set_permissions(&replacement_service, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&replacement_trials).unwrap();
+        fs::set_permissions(&replacement_trials, fs::Permissions::from_mode(0o700)).unwrap();
+        let sentinel = replacement_trials.join("replacement-sentinel");
+        fs::write(&sentinel, b"replacement").unwrap();
+
+        assert!(output.read_result_bounded().is_err());
+        assert!(output.cleanup().is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"replacement");
+        assert!(retired.join(PRIVATE_TEMP_ROOT).exists());
+    }
+
+    #[test]
+    fn private_trial_output_rejects_service_parent_replacement() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let service = root_path.join(PRIVATE_TEMP_ROOT);
+        let retired = service.with_file_name("retired-service");
+        fs::rename(&service, &retired).unwrap();
+        fs::create_dir(&service).unwrap();
+        fs::set_permissions(&service, fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement_trials = service.join("trials");
+        fs::create_dir(&replacement_trials).unwrap();
+        fs::set_permissions(&replacement_trials, fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement_generation =
+            replacement_trials.join(output.result_path().parent().unwrap().file_name().unwrap());
+        fs::create_dir(&replacement_generation).unwrap();
+        fs::set_permissions(&replacement_generation, fs::Permissions::from_mode(0o700)).unwrap();
+        let sentinel = replacement_generation.join("sentinel");
+        fs::write(&sentinel, b"replacement").unwrap();
+
+        assert!(output.read_result_bounded().is_err());
+        assert!(output.cleanup().is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"replacement");
+        assert!(retired.exists());
+    }
+
+    #[test]
+    fn private_trial_output_rejects_trials_parent_replacement() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let trials = output.result_path().parent().unwrap().parent().unwrap().to_owned();
+        let retired = trials.with_file_name("trials.retired");
+        fs::rename(&trials, &retired).unwrap();
+        fs::create_dir(&trials).unwrap();
+        fs::set_permissions(&trials, fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement_generation = trials.join(output.result_path().parent().unwrap().file_name().unwrap());
+        fs::create_dir(&replacement_generation).unwrap();
+        fs::set_permissions(&replacement_generation, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(output.read_result_bounded().is_err());
+        assert!(output.cleanup().is_err());
+        assert!(replacement_generation.exists());
+        let sentinel = replacement_generation.join("sentinel");
+        fs::write(&sentinel, b"replacement").unwrap();
+        assert!(output.read_result_bounded().is_err());
+        assert!(output.cleanup().is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn experiment_runtime_argv_with_outputs_preserves_campaign_bytes() {
+        let project = Path::new("/private/project");
+        let result = project.join(".pueue-agent").join("results").join("e.json");
+        let artifacts = project.join(".pueue-agent").join("artifacts").join("e");
+        let user = vec!["python".to_owned(), "train.py".to_owned()];
+        let campaign = campaign_experiment_runtime_argv(project, "c", "e", &user);
+        let shared = experiment_runtime_argv_with_outputs("c", "e", &result, &artifacts, &user);
+        assert_eq!(campaign, shared);
+        assert_eq!(
+            campaign,
+            vec![
+                OsString::from("/usr/bin/env"),
+                OsString::from("PUEUE_AGENT_EXPERIMENT_ID=e"),
+                OsString::from("PUEUE_AGENT_CAMPAIGN_ID=c"),
+                OsString::from(
+                    "PUEUE_AGENT_RESULT_PATH=/private/project/.pueue-agent/results/e.json"
+                ),
+                OsString::from(
+                    "PUEUE_AGENT_ARTIFACT_DIR=/private/project/.pueue-agent/artifacts/e"
+                ),
+                OsString::from("python"),
+                OsString::from("train.py"),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_trial_output_paths_and_runtime_argv_preserve_non_utf8_root_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let holder = tempfile::tempdir().unwrap();
+        let raw_root = holder
+            .path()
+            .join(OsString::from_vec(vec![b'p', b'r', b'o', b'j', 0xff]));
+        let trial_id = Uuid::from_u128(0x102030405060708090a0b0c0d0e0f000);
+        let (result_path, artifact_dir) = private_trial_output_paths(&raw_root, trial_id);
+
+        let generation = raw_root
+            .join(PRIVATE_TEMP_ROOT)
+            .join("trials")
+            .join(trial_id.to_string());
+        assert_eq!(result_path, generation.join("result.json"));
+        assert_eq!(artifact_dir, generation.join("artifacts"));
+        assert!(!raw_root.exists());
+        assert!(!raw_root.join(PRIVATE_TEMP_ROOT).exists());
+
+        let trial_argv = experiment_runtime_argv_with_outputs(
+            "campaign",
+            "experiment",
+            &result_path,
+            &artifact_dir,
+            &["python".to_owned(), "train.py".to_owned()],
+        );
+        assert_eq!(trial_argv[0], OsStr::new("/usr/bin/env"));
+        assert_eq!(
+            trial_argv[1],
+            OsStr::new("PUEUE_AGENT_EXPERIMENT_ID=experiment")
+        );
+        assert_eq!(
+            trial_argv[2],
+            OsStr::new("PUEUE_AGENT_CAMPAIGN_ID=campaign")
+        );
+        assert_eq!(
+            trial_argv[3].as_os_str().as_bytes(),
+            [
+                b"PUEUE_AGENT_RESULT_PATH=".as_slice(),
+                result_path.as_os_str().as_bytes(),
+            ]
+            .concat()
+        );
+        assert_eq!(
+            trial_argv[4].as_os_str().as_bytes(),
+            [
+                b"PUEUE_AGENT_ARTIFACT_DIR=".as_slice(),
+                artifact_dir.as_os_str().as_bytes(),
+            ]
+            .concat()
+        );
+        assert_eq!(trial_argv[5], OsStr::new("python"));
+        assert_eq!(trial_argv[6], OsStr::new("train.py"));
+
+        let campaign_result = raw_root
+            .join(PRIVATE_TEMP_ROOT)
+            .join(RESULTS_DIRECTORY)
+            .join("e.json");
+        let campaign_artifact = raw_root
+            .join(PRIVATE_TEMP_ROOT)
+            .join(ARTIFACTS_DIRECTORY)
+            .join("e");
+        let campaign_argv = campaign_experiment_runtime_argv(
+            &raw_root,
+            "c",
+            "e",
+            &["python".to_owned(), "train.py".to_owned()],
+        );
+        assert_eq!(campaign_argv[0], OsStr::new("/usr/bin/env"));
+        assert_eq!(campaign_argv[1], OsStr::new("PUEUE_AGENT_EXPERIMENT_ID=e"));
+        assert_eq!(campaign_argv[2], OsStr::new("PUEUE_AGENT_CAMPAIGN_ID=c"));
+        assert_eq!(
+            campaign_argv[3].as_os_str().as_bytes(),
+            [
+                b"PUEUE_AGENT_RESULT_PATH=".as_slice(),
+                campaign_result.as_os_str().as_bytes(),
+            ]
+            .concat()
+        );
+        assert_eq!(
+            campaign_argv[4].as_os_str().as_bytes(),
+            [
+                b"PUEUE_AGENT_ARTIFACT_DIR=".as_slice(),
+                campaign_artifact.as_os_str().as_bytes(),
+            ]
+            .concat()
+        );
+        assert_eq!(campaign_argv[5], OsStr::new("python"));
+        assert_eq!(campaign_argv[6], OsStr::new("train.py"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_trial_output_reads_and_cleans_under_non_utf8_project_root() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder
+            .path()
+            .join(OsString::from_vec(vec![b'p', b'r', b'o', b'j', 0xff]));
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let trial_id = Uuid::from_u128(0x102030405060708090a0b0c0d0e0f000);
+        let (expected_result, expected_artifact) = private_trial_output_paths(&root_path, trial_id);
+        let mut output = PrivateTrialOutput::create(&root, trial_id).unwrap();
+
+        assert_eq!(output.result_path(), expected_result.as_path());
+        assert_eq!(output.artifact_dir(), expected_artifact.as_path());
+        assert!(!output.result_path().exists());
+        assert!(!output.artifact_dir().exists());
+        fs::write(output.result_path(), b"non-UTF-8-root result").unwrap();
+        fs::set_permissions(output.result_path(), fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            output.read_result_bounded().unwrap(),
+            b"non-UTF-8-root result"
+        );
+        let generation = output.result_path().parent().unwrap().to_owned();
+        output.cleanup().unwrap();
+        assert!(!generation.exists());
+        assert!(generation.parent().unwrap().exists());
+        assert!(generation.parent().unwrap().parent().unwrap().exists());
+    }
+
+    #[test]
+    fn private_trial_output_accepts_verified_project_root_with_read_permissions() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o755)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let generation = output.result_path().parent().unwrap().to_owned();
+        let trials = generation.parent().unwrap();
+        let service = trials.parent().unwrap();
+        assert_eq!(
+            fs::metadata(&root_path).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        for directory in [service, trials, generation.as_path()] {
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o7777,
+                0o700
+            );
+        }
+
+        fs::write(output.result_path(), b"accepted result").unwrap();
+        fs::set_permissions(output.result_path(), fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(output.read_result_bounded().unwrap(), b"accepted result");
+        output.cleanup().unwrap();
+        assert!(!generation.exists());
+        assert!(root_path.join(PRIVATE_TEMP_ROOT).is_dir());
+    }
+
+    #[test]
+    fn private_trial_output_cleanup_uses_bounded_audit_limits() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let artifacts = output.artifact_dir();
+        fs::create_dir(artifacts).unwrap();
+        fs::set_permissions(artifacts, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut depth_limited =
+            AuditState::with_limits(0, MAX_PRIVATE_TEMP_CLEANUP_ENTRIES, u64::MAX);
+        let error = audit_trial_output_directory(
+            &output.generation,
+            0,
+            &mut depth_limited,
+            Some(Instant::now() + Duration::from_secs(30)),
+            output.mount,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::DepthLimit)
+        );
+        assert!(artifacts.exists());
+
+        let mut entry_limited =
+            AuditState::with_limits(MAX_PRIVATE_TEMP_CLEANUP_DEPTH, 0, u64::MAX);
+        let error = audit_trial_output_directory(
+            &output.generation,
+            0,
+            &mut entry_limited,
+            Some(Instant::now() + Duration::from_secs(30)),
+            output.mount,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::EntryLimit)
+        );
+        assert!(artifacts.exists());
+
+        fs::write(
+            output.result_path(),
+            vec![0xa5; crate::result_manifest::MAX_RESULT_MANIFEST_BYTES],
+        )
+        .unwrap();
+        fs::set_permissions(output.result_path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let mut byte_limited = AuditState::with_limits(
+            MAX_PRIVATE_TEMP_CLEANUP_DEPTH,
+            MAX_PRIVATE_TEMP_CLEANUP_ENTRIES,
+            0,
+        );
+        let error = audit_trial_output_directory(
+            &output.generation,
+            0,
+            &mut byte_limited,
+            Some(Instant::now() + Duration::from_secs(30)),
+            output.mount,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::ByteLimit)
+        );
+        assert!(output.result_path().exists());
+        output.cleanup().unwrap();
+    }
+
+    #[test]
+    fn private_trial_output_cleanup_before_uses_the_supplied_deadline() {
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        let generation = output.result_path().parent().unwrap().to_owned();
+
+        assert!(output
+            .cleanup_before(Instant::now() - Duration::from_secs(1))
+            .is_err());
+        assert!(generation.exists());
+        output.cleanup().unwrap();
+        assert!(!generation.exists());
+    }
+
+    #[test]
+    fn hash_research_file_caps_growth_reads_to_limit_plus_one() {
+        let limit = crate::result_manifest::MAX_RESULT_MANIFEST_BYTES;
+        let mut contents = vec![0xa5; limit - 2];
+        let mut requested_lengths = Vec::new();
+        let mut total_read = 0_usize;
+        let mut grew = false;
+        let error = hash_research_file_with_reader(
+            limit as u64,
+            PolicyViolationStage::Finalized,
+            |buffer, offset| {
+                requested_lengths.push(buffer.len());
+                let offset = usize::try_from(offset).unwrap();
+                if offset >= contents.len() {
+                    return Ok(0);
+                }
+                let count = buffer.len().min(contents.len() - offset);
+                buffer[..count].copy_from_slice(&contents[offset..offset + count]);
+                total_read += count;
+                if !grew {
+                    grew = true;
+                    contents.extend(vec![0x5a; RESEARCH_HASH_BUFFER_BYTES * 2]);
+                }
+                Ok(count)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::ByteLimit)
+        );
+        assert_eq!(total_read, limit + 1);
+        assert_eq!(requested_lengths, vec![limit + 1, 3]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_trial_output_rejects_mounted_artifact_directory_with_safe_shape() {
+        struct MountGuard {
+            target: CString,
+            mounted: bool,
+        }
+
+        impl Drop for MountGuard {
+            fn drop(&mut self) {
+                if self.mounted {
+                    unsafe { libc::umount(self.target.as_ptr()) };
+                }
+            }
+        }
+
+        let holder = tempfile::tempdir().unwrap();
+        let root_path = holder.path().join("project");
+        fs::create_dir(&root_path).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let root_path = fs::canonicalize(root_path).unwrap();
+        let anchor = crate::execution_policy::ProjectRootAnchor::resolve(&root_path).unwrap();
+        let root = anchor.verify_identity().unwrap();
+        let mut output = PrivateTrialOutput::create(&root, Uuid::new_v4()).unwrap();
+        fs::create_dir(output.artifact_dir()).unwrap();
+        fs::set_permissions(output.artifact_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut baseline_audit = AuditState::default();
+        assert!(audit_trial_output_directory(
+            &output.generation,
+            0,
+            &mut baseline_audit,
+            Some(Instant::now() + Duration::from_secs(30)),
+            output.mount,
+        )
+        .is_ok());
+
+        let target = CString::new(output.artifact_dir().as_os_str().as_bytes()).unwrap();
+        let tmpfs = CString::new("tmpfs").unwrap();
+        if unsafe {
+            libc::mount(
+                std::ptr::null(),
+                target.as_ptr(),
+                tmpfs.as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENODEV) | Some(libc::ENOSYS)
+            ) {
+                eprintln!("skipping mount-boundary assertion: {error}");
+                fs::remove_dir(output.artifact_dir()).unwrap();
+                output.cleanup().unwrap();
+                return;
+            }
+            panic!("temporary tmpfs mount failed: {error}");
+        }
+        let mut mount = MountGuard {
+            target,
+            mounted: true,
+        };
+        let sentinel = output.artifact_dir().join("sentinel");
+        fs::write(&sentinel, b"mounted replacement").unwrap();
+
+        let mut mounted_audit = AuditState::default();
+        let error = audit_trial_output_directory(
+            &output.generation,
+            0,
+            &mut mounted_audit,
+            Some(Instant::now() + Duration::from_secs(30)),
+            output.mount,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.detail,
+            PolicyViolationDetail::TempUnsafe(TempUnsafeReason::MountBoundary)
+        );
+        assert!(output.cleanup().is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"mounted replacement");
+        assert_eq!(unsafe { libc::umount(mount.target.as_ptr()) }, 0);
+        mount.mounted = false;
+        fs::remove_dir(output.artifact_dir()).unwrap();
+        output.cleanup().unwrap();
+    }
+
 
     #[test]
     fn recovery_cleanup_reopens_exact_original_generation() {
