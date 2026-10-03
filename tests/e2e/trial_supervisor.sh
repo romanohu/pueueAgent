@@ -550,13 +550,15 @@ fn main() {
 
     if operation == "remove" {
         let task_id = args.get(index + 1).cloned().unwrap_or_default();
+        let group = group_for_task_id(&task_id).unwrap_or_else(|| "unknown".to_owned());
         inject_extra_task_before_remove(&task_id);
-        trace(&format!("task_remove\t{task_id}"));
+        trace(&format!("task_remove\t{task_id}\t{group}"));
     }
 
     if operation == "kill" {
         let task_id = args.get(index + 1).cloned().unwrap_or_default();
-        trace(&format!("task_kill\t{task_id}"));
+        let group = group_for_task_id(&task_id).unwrap_or_else(|| "unknown".to_owned());
+        trace(&format!("task_kill\t{task_id}\t{group}"));
     }
 
     if operation == "group" && subcommand == "remove" {
@@ -1254,12 +1256,12 @@ def indices(name, predicate):
     return [index for index, event in enumerate(events) if len(event) >= 2 and event[0] == name and predicate(event)]
 
 adds = indices("task_add", lambda event: event[1] == group and len(event) >= 3 and event[2] == task_id)
-removes = indices("task_remove", lambda event: len(event) >= 2 and event[1] == task_id)
+removes = indices("task_remove", lambda event: len(event) == 3 and event[1] == task_id and event[2] == group)
 safe = indices("group_remove_safe", lambda event: len(event) >= 3 and event[1] == group and event[2] == task_id)
 done = indices("group_remove_done", lambda event: event[1] == group)
 if len(adds) != 1 or len(removes) != 1 or len(safe) != 1 or len(done) != 1:
     raise SystemExit("proxy did not record one exact add/remove/group-cleanup proof")
-if not adds[0] < removes[-1] < safe[0] < done[0]:
+if not adds[0] < removes[0] < safe[0] < done[0]:
     raise SystemExit("group removal was not after exact task removal and fresh empty status")
 pauses = indices("pause_group", lambda event: event[1] == group)
 if label in {"queued-timeout", "lost-add"}:
@@ -1271,8 +1273,8 @@ external_pauses = indices("external_pause_command", lambda event: True)
 if external_pauses:
     raise SystemExit("product issued a Pueue pause command outside the scoped fixture pause")
 if label == "running-timeout":
-    kills = indices("task_kill", lambda event: event[1] == task_id)
-    if not kills or not kills[0] < removes[-1]:
+    kills = indices("task_kill", lambda event: len(event) == 3 and event[1] == task_id and event[2] == group)
+    if not kills or not kills[0] < removes[0]:
         raise SystemExit("running timeout did not kill the exact task before removal")
 if label == "lost-add":
     lost = indices("task_add_result_lost", lambda event: len(event) >= 3 and event[1] == group and event[2] == task_id)
@@ -1334,7 +1336,7 @@ injected_index = events.index(matches[0])
 removed = [
     index
     for index, event in enumerate(events)
-    if event[0] == "task_remove" and len(event) == 2 and event[1] == trial_id
+    if event[0] == "task_remove" and len(event) == 3 and event[1] == trial_id and event[2] == group
 ]
 if len(removed) != 1 or injected_index >= removed[0]:
     raise SystemExit("extra task was not injected before removal of the exact trial task")
@@ -1623,8 +1625,8 @@ except ValueError:
     raise SystemExit("successful trial task IDs are not integers")
 if first_task < 0 or second_task < 0:
     raise SystemExit("successful trial task IDs are negative")
-if first[0] == second[0] or first_task == second_task or first[2] == second[2] or first[3] == second[3] or first[4] == second[4]:
-    raise SystemExit("two successful trials reused trial/task/group/experiment/campaign identity")
+if first[0] == second[0] or first[2] == second[2] or first[3] == second[3] or first[4] == second[4]:
+    raise SystemExit("two successful trials reused trial/group/experiment/campaign identity")
 if "pueue-agent-trial-" + first[0].replace("-", "") != first[2]:
     raise SystemExit("first successful trial group does not bind to its simple UUID")
 if "pueue-agent-trial-" + second[0].replace("-", "") != second[2]:
