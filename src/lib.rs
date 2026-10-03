@@ -55,6 +55,7 @@ pub mod signals;
 pub mod state;
 pub mod status;
 pub mod submit;
+pub mod trial;
 pub mod termination;
 pub mod upgrade;
 pub mod version;

@@ -4,13 +4,14 @@ use std::{
     fmt,
     io,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     environment::SanitizedEnvironment,
@@ -24,6 +25,75 @@ use crate::{
 };
 
 pub const PUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PueueControlBoundary {
+    TargetNotReleased,
+    TargetReleasedClientQuiescent,
+    CleanupUncertain,
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ControlledPueueFailure {
+    error: AppError,
+    boundary: PueueControlBoundary,
+}
+
+impl ControlledPueueFailure {
+    pub fn target_not_released(error: AppError) -> Self {
+        Self {
+            error,
+            boundary: PueueControlBoundary::TargetNotReleased,
+        }
+    }
+
+    pub fn target_released_client_quiescent(error: AppError) -> Self {
+        Self {
+            error,
+            boundary: PueueControlBoundary::TargetReleasedClientQuiescent,
+        }
+    }
+
+    pub fn cleanup_uncertain(error: AppError) -> Self {
+        Self {
+            error,
+            boundary: PueueControlBoundary::CleanupUncertain,
+        }
+    }
+
+    pub fn boundary(&self) -> PueueControlBoundary {
+        self.boundary
+    }
+
+    pub fn into_error(self) -> AppError {
+        self.error
+    }
+}
+
+#[doc(hidden)]
+pub type ControlledPueueResult<T> = Result<T, ControlledPueueFailure>;
+
+fn controlled_operation_unsupported() -> ControlledPueueFailure {
+    ControlledPueueFailure::target_not_released(AppError::Configuration {
+        field: "pueue_controlled_operation",
+    })
+}
+
+fn group_already_exists() -> AppError {
+    AppError::Validation {
+        field: "pueue_group",
+        message: "already exists and is not owned by this operation",
+    }
+}
+
+fn group_missing_after_creation() -> AppError {
+    AppError::Validation {
+        field: "pueue_group",
+        message: "was absent after creation",
+    }
+}
 
 /// Validate the complete native Pueue argv that `CommandPueue::add` will
 /// eventually launch. This keeps durable submission intent from referring to
@@ -195,6 +265,93 @@ pub trait PueueApi: Send + Sync {
     async fn remove(&self, task_id: i64) -> Result<(), AppError>;
 
     async fn ensure_group(&self, group: &str) -> Result<(), AppError>;
+
+    async fn group_exists(&self, _group: &str) -> Result<bool, AppError> {
+        Err(AppError::Configuration {
+            field: "pueue_group_api",
+        })
+    }
+
+    async fn create_group_exclusive(&self, _group: &str) -> Result<(), AppError> {
+        Err(AppError::Configuration {
+            field: "pueue_group_api",
+        })
+    }
+
+    async fn remove_group(&self, _group: &str) -> Result<(), AppError> {
+        Err(AppError::Configuration {
+            field: "pueue_group_api",
+        })
+    }
+
+    #[doc(hidden)]
+    async fn status_json_controlled_before(
+        &self,
+        _deadline: Instant,
+        _cancellation: CancellationToken,
+    ) -> ControlledPueueResult<Vec<PueueTask>> {
+        Err(controlled_operation_unsupported())
+    }
+
+    #[doc(hidden)]
+    async fn add_controlled_before(
+        &self,
+        _args: &[OsString],
+        _deadline: Instant,
+        _cancellation: CancellationToken,
+    ) -> ControlledPueueResult<i64> {
+        Err(controlled_operation_unsupported())
+    }
+
+    #[doc(hidden)]
+    async fn kill_controlled_before(
+        &self,
+        _task_id: i64,
+        _deadline: Instant,
+        _cancellation: CancellationToken,
+    ) -> ControlledPueueResult<()> {
+        Err(controlled_operation_unsupported())
+    }
+
+    #[doc(hidden)]
+    async fn remove_controlled_before(
+        &self,
+        _task_id: i64,
+        _deadline: Instant,
+        _cancellation: CancellationToken,
+    ) -> ControlledPueueResult<()> {
+        Err(controlled_operation_unsupported())
+    }
+
+    #[doc(hidden)]
+    async fn group_exists_controlled_before(
+        &self,
+        _group: &str,
+        _deadline: Instant,
+        _cancellation: CancellationToken,
+    ) -> ControlledPueueResult<bool> {
+        Err(controlled_operation_unsupported())
+    }
+
+    #[doc(hidden)]
+    async fn create_group_exclusive_controlled_before(
+        &self,
+        _group: &str,
+        _deadline: Instant,
+        _cancellation: CancellationToken,
+    ) -> ControlledPueueResult<()> {
+        Err(controlled_operation_unsupported())
+    }
+
+    #[doc(hidden)]
+    async fn remove_group_controlled_before(
+        &self,
+        _group: &str,
+        _deadline: Instant,
+        _cancellation: CancellationToken,
+    ) -> ControlledPueueResult<()> {
+        Err(controlled_operation_unsupported())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +412,41 @@ impl CommandPueue {
             CommandPueueBackend::Unconfigured => Err(AppError::Configuration {
                 field: "pueue_test_policy",
             }),
+        }
+    }
+
+    async fn execute_controlled_before(
+        &self,
+        operation: &'static str,
+        operation_args: &[OsString],
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> ControlledPueueResult<BoundedOutput> {
+        match &self.backend {
+            CommandPueueBackend::Verified {
+                policy,
+                environment,
+                runner,
+            } => {
+                let mut argv = Vec::with_capacity(operation_args.len() + 1);
+                argv.push(OsString::from(operation));
+                argv.extend_from_slice(operation_args);
+                runner
+                    .run_with_environment_controlled_before(
+                        policy,
+                        environment,
+                        &argv,
+                        deadline,
+                        cancellation,
+                    )
+                    .await
+            }
+            #[cfg(test)]
+            CommandPueueBackend::Unconfigured => Err(ControlledPueueFailure::target_not_released(
+                AppError::Configuration {
+                    field: "pueue_test_policy",
+                },
+            )),
         }
     }
 }
@@ -334,7 +526,7 @@ impl PueueApi for CommandPueue {
 
     async fn ensure_group(&self, group: &str) -> Result<(), AppError> {
         validate_group(group)?;
-        if self.group_exists(group).await? {
+        if self.group_exists_legacy(group).await? {
             return Ok(());
         }
 
@@ -348,7 +540,7 @@ impl PueueApi for CommandPueue {
                     operation: "group",
                     ..
                 })
-            ) && matches!(self.group_exists(group).await, Ok(true))
+            ) && matches!(self.group_exists_legacy(group).await, Ok(true))
             {
                 return Ok(());
             }
@@ -358,10 +550,204 @@ impl PueueApi for CommandPueue {
 
         Ok(())
     }
+
+    async fn group_exists(&self, group: &str) -> Result<bool, AppError> {
+        validate_group(group)?;
+        self.group_exists_legacy(group).await
+    }
+
+    async fn create_group_exclusive(&self, group: &str) -> Result<(), AppError> {
+        validate_group(group)?;
+        if self.group_exists_legacy(group).await? {
+            return Err(group_already_exists());
+        }
+        self.execute("group", &[OsString::from("add"), OsString::from(group)])
+            .await?;
+        if self.group_exists_legacy(group).await? {
+            Ok(())
+        } else {
+            Err(group_missing_after_creation())
+        }
+    }
+
+    async fn remove_group(&self, group: &str) -> Result<(), AppError> {
+        validate_group(group)?;
+        self.execute("group", &[OsString::from("remove"), OsString::from(group)])
+            .await?;
+        Ok(())
+    }
+
+    async fn status_json_controlled_before(
+        &self,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> ControlledPueueResult<Vec<PueueTask>> {
+        let output = self
+            .execute_controlled_before(
+                "status",
+                &[OsString::from("--json")],
+                deadline,
+                cancellation,
+            )
+            .await?;
+        let status: RawStatus = serde_json::from_slice(&output.stdout).map_err(|source| {
+            ControlledPueueFailure::target_released_client_quiescent(
+                PueueError::InvalidStatusJson { source }.into(),
+            )
+        })?;
+        let mut tasks = status
+            .tasks
+            .into_values()
+            .map(PueueTask::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                ControlledPueueFailure::target_released_client_quiescent(error.into())
+            })?;
+        tasks.sort_unstable_by_key(|task| task.id);
+        Ok(tasks)
+    }
+
+    async fn add_controlled_before(
+        &self,
+        args: &[OsString],
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> ControlledPueueResult<i64> {
+        validate_add_argv(args).map_err(ControlledPueueFailure::target_not_released)?;
+        let operation_args = add_operation_args(args);
+        let output = self
+            .execute_controlled_before("add", &operation_args, deadline, cancellation)
+            .await?;
+        std::str::from_utf8(&output.stdout)
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|task_id| *task_id >= 0)
+            .ok_or_else(|| {
+                ControlledPueueFailure::target_released_client_quiescent(
+                    PueueError::InvalidTaskId {
+                        stdout: output.stdout,
+                    }
+                    .into(),
+                )
+            })
+    }
+
+    async fn kill_controlled_before(
+        &self,
+        task_id: i64,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> ControlledPueueResult<()> {
+        self.execute_controlled_before(
+            "kill",
+            &[OsString::from(task_id.to_string())],
+            deadline,
+            cancellation,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_controlled_before(
+        &self,
+        task_id: i64,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> ControlledPueueResult<()> {
+        self.execute_controlled_before(
+            "remove",
+            &[OsString::from(task_id.to_string())],
+            deadline,
+            cancellation,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn group_exists_controlled_before(
+        &self,
+        group: &str,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> ControlledPueueResult<bool> {
+        validate_group(group).map_err(ControlledPueueFailure::target_not_released)?;
+        let output = self
+            .execute_controlled_before("group", &[OsString::from("-j")], deadline, cancellation)
+            .await?;
+        let groups: BTreeMap<String, Value> =
+            serde_json::from_slice(&output.stdout).map_err(|source| {
+                ControlledPueueFailure::target_released_client_quiescent(
+                    PueueError::InvalidGroupJson { source }.into(),
+                )
+            })?;
+        Ok(groups.contains_key(group))
+    }
+
+    async fn create_group_exclusive_controlled_before(
+        &self,
+        group: &str,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> ControlledPueueResult<()> {
+        validate_group(group).map_err(ControlledPueueFailure::target_not_released)?;
+        if self
+            .group_exists_controlled_before(group, deadline, cancellation.clone())
+            .await?
+        {
+            return Err(ControlledPueueFailure::target_released_client_quiescent(
+                group_already_exists(),
+            ));
+        }
+
+        self.execute_controlled_before(
+            "group",
+            &[OsString::from("add"), OsString::from(group)],
+            deadline,
+            cancellation.clone(),
+        )
+        .await?;
+
+        let exists = self
+            .group_exists_controlled_before(group, deadline, cancellation)
+            .await
+            .map_err(|failure| {
+                let boundary = failure.boundary();
+                let error = failure.into_error();
+                if boundary == PueueControlBoundary::CleanupUncertain {
+                    ControlledPueueFailure::cleanup_uncertain(error)
+                } else {
+                    ControlledPueueFailure::target_released_client_quiescent(error)
+                }
+            })?;
+        if exists {
+            Ok(())
+        } else {
+            Err(ControlledPueueFailure::target_released_client_quiescent(
+                group_missing_after_creation(),
+            ))
+        }
+    }
+
+    async fn remove_group_controlled_before(
+        &self,
+        group: &str,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> ControlledPueueResult<()> {
+        validate_group(group).map_err(ControlledPueueFailure::target_not_released)?;
+        self.execute_controlled_before(
+            "group",
+            &[OsString::from("remove"), OsString::from(group)],
+            deadline,
+            cancellation,
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 impl CommandPueue {
-    async fn group_exists(&self, group: &str) -> Result<bool, AppError> {
+    async fn group_exists_legacy(&self, group: &str) -> Result<bool, AppError> {
         let output = self.execute("group", &[OsString::from("-j")]).await?;
         let groups: BTreeMap<String, Value> = serde_json::from_slice(&output.stdout)
             .map_err(|source| PueueError::InvalidGroupJson { source })?;

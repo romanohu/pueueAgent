@@ -22,9 +22,13 @@ use crate::{
     environment::SanitizedEnvironment,
     execution_policy::{ExecutableIdentity, ResolvedExecutionPolicy},
     process::{ControlFrame, LaunchFlags, LaunchMode, MAX_FIELD_SIZE},
-    pueue::{PueueError, PUEUE_TIMEOUT},
+    pueue::{
+        ControlledPueueFailure, ControlledPueueResult, PueueControlBoundary, PueueError,
+        PUEUE_TIMEOUT,
+    },
     AppError,
 };
+use tokio_util::sync::CancellationToken;
 
 pub use crate::pueue_security::MAX_PUEUE_OUTPUT_BYTES;
 
@@ -185,14 +189,49 @@ impl PueueProcessRunner {
         environment: &SanitizedEnvironment,
         operation_argv: &[OsString],
     ) -> Result<BoundedOutput, AppError> {
-        let operation_arg = operation_argv.first().ok_or(AppError::Validation {
-            field: "pueue_operation",
-            message: "must not be empty",
-        })?;
-        let operation = operation_name(operation_arg).ok_or(AppError::Validation {
-            field: "pueue_operation",
-            message: "is not supported",
-        })?;
+        self.run_with_environment_controlled(
+            policy,
+            environment,
+            operation_argv,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(ControlledPueueFailure::into_error)
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn run_with_environment_controlled_before(
+        &self,
+        policy: &ResolvedExecutionPolicy,
+        environment: &SanitizedEnvironment,
+        operation_argv: &[OsString],
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> ControlledPueueResult<BoundedOutput> {
+        self.run_with_environment_controlled(
+            policy,
+            environment,
+            operation_argv,
+            Some(deadline),
+            cancellation,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn run_with_environment_controlled(
+        &self,
+        policy: &ResolvedExecutionPolicy,
+        environment: &SanitizedEnvironment,
+        operation_argv: &[OsString],
+        caller_deadline: Option<Instant>,
+        cancellation: CancellationToken,
+    ) -> ControlledPueueResult<BoundedOutput> {
+        let operation = operation_argv
+            .first()
+            .and_then(operation_name)
+            .unwrap_or("unknown");
         let runner = *self;
         let policy = policy.clone();
         let environment = environment.clone();
@@ -202,16 +241,22 @@ impl PueueProcessRunner {
         // cancelling the caller cannot bypass the bounded cleanup path.
         tokio::spawn(async move {
             runner
-                .run_owned(&policy, &environment, &operation_argv)
+                .run_owned_controlled(
+                    &policy,
+                    &environment,
+                    &operation_argv,
+                    caller_deadline,
+                    cancellation,
+                )
                 .await
         })
-            .await
-            .map_err(|_| {
-                AppError::Pueue(PueueError::Cleanup {
-                    operation,
-                    stage: "supervisor",
-                })
-            })?
+        .await
+        .map_err(|_| {
+            ControlledPueueFailure::cleanup_uncertain(AppError::Pueue(PueueError::Cleanup {
+                operation,
+                stage: "supervisor",
+            }))
+        })?
     }
 
     #[cfg(not(unix))]
@@ -226,40 +271,74 @@ impl PueueProcessRunner {
         })
     }
 
+    #[cfg(not(unix))]
+    pub(crate) async fn run_with_environment_controlled_before(
+        &self,
+        _policy: &ResolvedExecutionPolicy,
+        _environment: &SanitizedEnvironment,
+        _operation_argv: &[OsString],
+        _deadline: Instant,
+        _cancellation: CancellationToken,
+    ) -> ControlledPueueResult<BoundedOutput> {
+        Err(ControlledPueueFailure::target_not_released(
+            AppError::Runtime {
+                operation: "run verified Pueue on this platform",
+            },
+        ))
+    }
+
     #[cfg(unix)]
-    async fn run_owned(
+    async fn run_owned_controlled(
         &self,
         policy: &ResolvedExecutionPolicy,
         environment: &SanitizedEnvironment,
         operation_argv: &[OsString],
-    ) -> Result<BoundedOutput, AppError> {
+        caller_deadline: Option<Instant>,
+        cancellation: CancellationToken,
+    ) -> ControlledPueueResult<BoundedOutput> {
         use crate::process::{
             spawn_verified_command_before_classified, terminate_process_group,
-            ProcessGroupRequirement,
-            VerifiedChildIo, VerifiedCommandSpec,
+            ProcessGroupRequirement, VerifiedChildIo, VerifiedCommandSpec,
         };
 
-        let (operation_arg, operation_args) = operation_argv
-            .split_first()
-            .ok_or(AppError::Validation {
+        let (operation_arg, operation_args) = operation_argv.split_first().ok_or_else(|| {
+            ControlledPueueFailure::target_not_released(AppError::Validation {
                 field: "pueue_operation",
                 message: "must not be empty",
-            })?;
-        let operation = operation_name(operation_arg).ok_or(AppError::Validation {
-            field: "pueue_operation",
-            message: "is not supported",
+            })
+        })?;
+        let operation = operation_name(operation_arg).ok_or_else(|| {
+            ControlledPueueFailure::target_not_released(AppError::Validation {
+                field: "pueue_operation",
+                message: "is not supported",
+            })
         })?;
         // The operation budget starts before the final config verification so
         // every launch, handshake, wait, and output phase shares one limit.
-        let deadline = Instant::now()
-            .checked_add(self.timeout)
-            .ok_or(AppError::Pueue(PueueError::Timeout { operation }))?;
+        let operation_deadline = Instant::now().checked_add(self.timeout).ok_or_else(|| {
+            ControlledPueueFailure::target_not_released(AppError::Pueue(PueueError::Timeout {
+                operation,
+            }))
+        })?;
+        let deadline =
+            caller_deadline.map_or(operation_deadline, |caller| caller.min(operation_deadline));
+        if cancellation.is_cancelled() {
+            return Err(ControlledPueueFailure::target_not_released(
+                AppError::Pueue(PueueError::Timeout { operation }),
+            ));
+        }
 
         // This is deliberately the final path/config check before the core
         // launcher call.  Do not replace it with a path-based argument.
         let verified_config = policy
             .pueue_config_anchor
-            .verify_identity(&policy.project_roots)?;
+            .verify_identity(&policy.project_roots)
+            .map_err(ControlledPueueFailure::target_not_released)?;
+        if cancellation.is_cancelled() {
+            return Err(ControlledPueueFailure::target_not_released(
+                AppError::Pueue(PueueError::Timeout { operation }),
+            ));
+        }
         let mut argv = Vec::with_capacity(operation_args.len() + 4);
         // execveat receives argv verbatim. Keep argv[0] a stable display name
         // for the already-verified executable so Pueue sees --config as its
@@ -270,43 +349,109 @@ impl PueueProcessRunner {
         argv.push(OsString::from(operation));
         argv.extend_from_slice(operation_args);
 
-        let mut verified = match spawn_verified_command_before_classified(VerifiedCommandSpec {
-            launcher: policy.launcher_anchor.clone(),
-            executable: policy.pueue_anchor.clone(),
-            argv,
-            environment: environment.clone(),
-            working_directory: None,
-            process_group: ProcessGroupRequirement::Required,
-            start_suspended: true,
-            project_root: None,
-            pueue_config: Some(verified_config),
-            git_directories: None,
-            child_io: VerifiedChildIo::Capture,
-        }, deadline).await {
+        let mut verified = match spawn_verified_command_before_classified(
+            VerifiedCommandSpec {
+                launcher: policy.launcher_anchor.clone(),
+                executable: policy.pueue_anchor.clone(),
+                argv,
+                environment: environment.clone(),
+                working_directory: None,
+                process_group: ProcessGroupRequirement::Required,
+                start_suspended: true,
+                project_root: None,
+                pueue_config: Some(verified_config),
+                git_directories: None,
+                child_io: VerifiedChildIo::Capture,
+            },
+            deadline,
+        )
+        .await
+        {
             Ok(child) => child,
-            Err(error) => return Err(map_spawn_before_error(operation, error)),
+            Err(error) => {
+                let boundary = match &error {
+                    crate::process::SpawnVerifiedCommandBeforeError::Launch(_) => {
+                        PueueControlBoundary::TargetNotReleased
+                    }
+                    crate::process::SpawnVerifiedCommandBeforeError::Cleanup(_) => {
+                        PueueControlBoundary::CleanupUncertain
+                    }
+                };
+                let error = map_spawn_before_error(operation, error);
+                return Err(classify_controlled_failure(error, boundary));
+            }
         };
 
+        if cancellation.is_cancelled() {
+            let (error, cleaned) = cleanup_after_failure(
+                &mut verified,
+                operation,
+                AppError::Pueue(PueueError::Timeout { operation }),
+                deadline,
+            )
+            .await;
+            return Err(classify_after_cleanup(error, false, cleaned));
+        }
         if let Err(error) = verified.release_before(deadline) {
-            return Err(cleanup_after_failure(&mut verified, operation, error, deadline).await);
+            let (error, cleaned) =
+                cleanup_after_failure(&mut verified, operation, error, deadline).await;
+            return Err(classify_after_cleanup(error, false, cleaned));
+        }
+        if cancellation.is_cancelled() {
+            let (error, cleaned) = cleanup_after_failure(
+                &mut verified,
+                operation,
+                AppError::Pueue(PueueError::Timeout { operation }),
+                deadline,
+            )
+            .await;
+            return Err(classify_after_cleanup(error, true, cleaned));
         }
         if let Err(error) = verified.confirm_exec_before(deadline).await {
-            return Err(cleanup_after_failure(&mut verified, operation, error, deadline).await);
+            let (error, cleaned) =
+                cleanup_after_failure(&mut verified, operation, error, deadline).await;
+            return Err(classify_after_cleanup(error, true, cleaned));
+        }
+        if cancellation.is_cancelled() {
+            let (error, cleaned) = cleanup_after_failure(
+                &mut verified,
+                operation,
+                AppError::Pueue(PueueError::Timeout { operation }),
+                deadline,
+            )
+            .await;
+            return Err(classify_after_cleanup(error, true, cleaned));
         }
         if let Err(error) = verified.wait_for_release_ack_before(deadline).await {
-            return Err(cleanup_after_failure(&mut verified, operation, error, deadline).await);
+            let (error, cleaned) =
+                cleanup_after_failure(&mut verified, operation, error, deadline).await;
+            return Err(classify_after_cleanup(error, true, cleaned));
+        }
+        if cancellation.is_cancelled() {
+            let (error, cleaned) = cleanup_after_failure(
+                &mut verified,
+                operation,
+                AppError::Pueue(PueueError::Timeout { operation }),
+                deadline,
+            )
+            .await;
+            return Err(classify_after_cleanup(error, true, cleaned));
         }
 
         let stdout = match verified.take_stdout() {
             Ok(stream) => stream,
             Err(error) => {
-                return Err(cleanup_after_failure(&mut verified, operation, error, deadline).await)
+                let (error, cleaned) =
+                    cleanup_after_failure(&mut verified, operation, error, deadline).await;
+                return Err(classify_after_cleanup(error, true, cleaned));
             }
         };
         let stderr = match verified.take_stderr() {
             Ok(stream) => stream,
             Err(error) => {
-                return Err(cleanup_after_failure(&mut verified, operation, error, deadline).await)
+                let (error, cleaned) =
+                    cleanup_after_failure(&mut verified, operation, error, deadline).await;
+                return Err(classify_after_cleanup(error, true, cleaned));
             }
         };
 
@@ -321,17 +466,20 @@ impl PueueProcessRunner {
             stdout_task,
             stderr_task,
             deadline,
+            &cancellation,
         )
         .await;
 
         match outcome {
             Ok(output) if output.status.success() => Ok(output),
-            Ok(output) => Err(AppError::Pueue(PueueError::CommandFailed {
-                operation,
-                exit_code: output.status.code(),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })),
+            Ok(output) => Err(ControlledPueueFailure::target_released_client_quiescent(
+                AppError::Pueue(PueueError::CommandFailed {
+                    operation,
+                    exit_code: output.status.code(),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                }),
+            )),
             Err(mut pending) => {
                 // `collect_until_terminal` drops its wait future before
                 // returning the pending readers.  Keep those readers owned
@@ -340,19 +488,30 @@ impl PueueProcessRunner {
                 let cleanup = terminate_process_group(&mut verified).await;
                 let readers = pending.finish_readers().await;
                 if let Err(error) = cleanup {
-                    return Err(AppError::Pueue(PueueError::Cleanup {
-                        operation,
-                        stage: cleanup_stage(&error),
-                    }));
+                    return Err(ControlledPueueFailure::cleanup_uncertain(AppError::Pueue(
+                        PueueError::Cleanup {
+                            operation,
+                            stage: cleanup_stage(&error),
+                        },
+                    )));
                 }
                 if let Err(stage) = readers {
-                    return Err(AppError::Pueue(PueueError::Cleanup { operation, stage }));
+                    return Err(ControlledPueueFailure::cleanup_uncertain(AppError::Pueue(
+                        PueueError::Cleanup { operation, stage },
+                    )));
                 }
-                Err(pending.failure.into_app_error(operation))
+                let boundary = if pending.failure.is_cleanup_uncertain() {
+                    PueueControlBoundary::CleanupUncertain
+                } else {
+                    PueueControlBoundary::TargetReleasedClientQuiescent
+                };
+                Err(classify_controlled_failure(
+                    pending.failure.into_app_error(operation),
+                    boundary,
+                ))
             }
         }
     }
-
 }
 
 fn operation_name(value: &OsString) -> Option<&'static str> {
@@ -369,6 +528,7 @@ fn operation_name(value: &OsString) -> Option<&'static str> {
 #[cfg(unix)]
 #[derive(Debug)]
 enum CollectionFailure {
+    Cancelled,
     Timeout,
     OutputLimit(&'static str),
     Reader(&'static str),
@@ -417,9 +577,13 @@ impl PendingCollection {
 
 #[cfg(unix)]
 impl CollectionFailure {
+    fn is_cleanup_uncertain(&self) -> bool {
+        matches!(self, Self::Reader(_) | Self::Wait)
+    }
+
     fn into_app_error(self, operation: &'static str) -> AppError {
         let error = match self {
-            Self::Timeout => PueueError::Timeout { operation },
+            Self::Cancelled | Self::Timeout => PueueError::Timeout { operation },
             Self::OutputLimit(stream) => PueueError::OutputLimit { operation, stream },
             Self::Reader(stream) => PueueError::Cleanup {
                 operation,
@@ -473,6 +637,7 @@ async fn collect_until_terminal(
     mut stdout_task: JoinHandle<Result<Vec<u8>, ReadFailure>>,
     mut stderr_task: JoinHandle<Result<Vec<u8>, ReadFailure>>,
     deadline: Instant,
+    cancellation: &CancellationToken,
 ) -> Result<BoundedOutput, PendingCollection> {
     let mut wait = Box::pin(child.wait());
     let mut deadline = Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)));
@@ -507,6 +672,7 @@ async fn collect_until_terminal(
                 }
             }
             _ = &mut deadline => break Err(CollectionFailure::Timeout),
+            _ = cancellation.cancelled() => break Err(CollectionFailure::Cancelled),
         }
 
         if status.is_some() && stdout.is_some() && stderr.is_some() {
@@ -534,14 +700,47 @@ async fn cleanup_after_failure(
     operation: &'static str,
     original: AppError,
     deadline: Instant,
-) -> AppError {
+) -> (AppError, bool) {
     match crate::process::terminate_process_group_before(child, deadline).await {
-        Ok(()) => map_operation_error(operation, original),
-        Err(error) => AppError::Pueue(PueueError::Cleanup {
-            operation,
-            stage: cleanup_stage(&error),
-        }),
+        Ok(()) => (map_operation_error(operation, original), true),
+        Err(error) => (
+            AppError::Pueue(PueueError::Cleanup {
+                operation,
+                stage: cleanup_stage(&error),
+            }),
+            false,
+        ),
     }
+}
+
+fn classify_controlled_failure(
+    error: AppError,
+    boundary: PueueControlBoundary,
+) -> ControlledPueueFailure {
+    match boundary {
+        PueueControlBoundary::TargetNotReleased => {
+            ControlledPueueFailure::target_not_released(error)
+        }
+        PueueControlBoundary::TargetReleasedClientQuiescent => {
+            ControlledPueueFailure::target_released_client_quiescent(error)
+        }
+        PueueControlBoundary::CleanupUncertain => ControlledPueueFailure::cleanup_uncertain(error),
+    }
+}
+
+fn classify_after_cleanup(
+    error: AppError,
+    released: bool,
+    cleanup_succeeded: bool,
+) -> ControlledPueueFailure {
+    let boundary = if !cleanup_succeeded {
+        PueueControlBoundary::CleanupUncertain
+    } else if released {
+        PueueControlBoundary::TargetReleasedClientQuiescent
+    } else {
+        PueueControlBoundary::TargetNotReleased
+    };
+    classify_controlled_failure(error, boundary)
 }
 
 #[cfg(unix)]
@@ -575,7 +774,9 @@ fn map_spawn_error(operation: &'static str, error: AppError) -> AppError {
 
 #[cfg(unix)]
 fn map_operation_error(operation: &'static str, error: AppError) -> AppError {
-    if crate::process::is_lifecycle_deadline_exceeded(&error) {
+    if matches!(&error, AppError::Pueue(PueueError::Timeout { .. }))
+        || crate::process::is_lifecycle_deadline_exceeded(&error)
+    {
         AppError::Pueue(PueueError::Timeout { operation })
     } else {
         map_spawn_error(operation, error)
@@ -602,15 +803,8 @@ fn map_spawn_before_error(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{
-        cleanup_stage, map_spawn_before_error, read_bounded, BoundedOutput,
-        ReadFailure,
-    };
-    use crate::{
-        process::SpawnVerifiedCommandBeforeError,
-        pueue::PueueError,
-        AppError,
-    };
+    use super::{cleanup_stage, map_spawn_before_error, read_bounded, BoundedOutput, ReadFailure};
+    use crate::{process::SpawnVerifiedCommandBeforeError, pueue::PueueError, AppError};
     use std::os::unix::process::ExitStatusExt;
     use tokio::io::AsyncWriteExt;
 
@@ -680,10 +874,7 @@ mod tests {
         };
 
         assert!(matches!(
-            map_spawn_before_error(
-                "status",
-                SpawnVerifiedCommandBeforeError::Cleanup(cleanup)
-            ),
+            map_spawn_before_error("status", SpawnVerifiedCommandBeforeError::Cleanup(cleanup)),
             AppError::Pueue(PueueError::Cleanup {
                 operation: "status",
                 stage: "terminate"

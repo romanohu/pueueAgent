@@ -105,12 +105,103 @@ use pueue_agent::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 fn accepts_api<P: PueueApi>(_api: &P) {}
 
 #[test]
 fn shared_fake_preserves_the_pueue_api_contract() {
     accepts_api(&FakePueue::new());
+}
+
+struct LegacyCallCounter {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl PueueApi for LegacyCallCounter {
+    async fn status_json(&self) -> Result<Vec<PueueTask>, AppError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+
+    async fn add(&self, _args: &[OsString]) -> Result<i64, AppError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(1)
+    }
+
+    async fn kill(&self, _task_id: i64) -> Result<(), AppError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn remove(&self, _task_id: i64) -> Result<(), AppError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn ensure_group(&self, _group: &str) -> Result<(), AppError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn controlled_api_defaults_deny_without_calling_legacy_methods() {
+    let fake = LegacyCallCounter {
+        calls: AtomicUsize::new(0),
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let operations = [
+        fake.status_json_controlled_before(deadline, CancellationToken::new())
+            .await
+            .map(|_| ()),
+        fake.add_controlled_before(&[], deadline, CancellationToken::new())
+            .await
+            .map(|_| ()),
+        fake.kill_controlled_before(1, deadline, CancellationToken::new())
+            .await,
+        fake.remove_controlled_before(1, deadline, CancellationToken::new())
+            .await,
+        fake.group_exists_controlled_before("pa-trial", deadline, CancellationToken::new())
+            .await
+            .map(|_| ()),
+        fake.create_group_exclusive_controlled_before(
+            "pa-trial",
+            deadline,
+            CancellationToken::new(),
+        )
+        .await,
+        fake.remove_group_controlled_before("pa-trial", deadline, CancellationToken::new())
+            .await,
+    ];
+
+    for operation in operations {
+        let failure = operation.expect_err("default controlled method must deny");
+        assert_eq!(
+            failure.boundary(),
+            pueue_agent::pueue::PueueControlBoundary::TargetNotReleased
+        );
+        assert!(matches!(
+            failure.into_error(),
+            AppError::Configuration {
+                field: "pueue_controlled_operation"
+            }
+        ));
+    }
+    for operation in [
+        fake.group_exists("pa-trial").await.map(|_| ()),
+        fake.create_group_exclusive("pa-trial").await,
+        fake.remove_group("pa-trial").await,
+    ] {
+        assert!(matches!(
+            operation,
+            Err(AppError::Configuration {
+                field: "pueue_group_api"
+            })
+        ));
+    }
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -623,6 +714,227 @@ async fn cancelling_the_caller_still_terminates_and_reaps_the_process_group() {
         .is_cancelled());
 
     assert_native_cleanup_contract(&fixture).await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn controlled_deadline_during_exec_proof_reports_cleanup_uncertainty() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = NativeFakePueue::delays(0, 12_000, 0);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+    // Native helper readiness has measured at roughly 1.28 seconds. Keep a
+    // broad pre-release margin while holding exec proof beyond the deadline.
+    let deadline = Instant::now() + Duration::from_secs(8);
+
+    let failure = tokio::time::timeout(
+        Duration::from_secs(20),
+        adapter.kill_controlled_before(41, deadline, CancellationToken::new()),
+    )
+    .await
+    .expect("controlled launch deadline exceeded the outer test bound")
+    .expect_err("controlled deadline unexpectedly succeeded");
+    let lifecycle_trace = std::env::var_os("PUEUE_AGENT_TEST_LIFECYCLE_TRACE")
+        .and_then(|path| fs::read_to_string(path).ok())
+        .unwrap_or_else(|| "unavailable".to_owned());
+
+    assert_eq!(
+        failure.boundary(),
+        pueue_agent::pueue::PueueControlBoundary::CleanupUncertain,
+        "unexpected exec-proof deadline failure: {failure:?}; lifecycle trace={lifecycle_trace:?}"
+    );
+    assert!(matches!(
+        failure.into_error(),
+        AppError::Pueue(PueueError::Cleanup {
+            operation: "kill",
+            ..
+        })
+    ));
+    fixture.assert_no_execution_artifacts();
+    fixture.assert_helper_lifecycle_deadline_started().await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controlled_pre_release_cancellation_reaps_before_returning() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = NativeFakePueue::delays(1_500, 0, 0);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+    let cancellation = CancellationToken::new();
+    let operation_cancellation = cancellation.clone();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let operation = tokio::spawn(async move {
+        adapter
+            .kill_controlled_before(41, deadline, operation_cancellation)
+            .await
+    });
+
+    // The trace is published before the helper sends its readiness record;
+    // the injected delay keeps the runner in the pre-release launch await.
+    let trace_path = PathBuf::from(
+        std::env::var_os("PUEUE_AGENT_TEST_LIFECYCLE_TRACE")
+            .expect("fixture lifecycle trace path is installed"),
+    );
+    let trace_deadline = Instant::now() + Duration::from_secs(4);
+    let readiness = loop {
+        if let Ok(trace) = fs::read_to_string(&trace_path) {
+            if let Some(readiness) = trace.lines().next() {
+                break readiness.to_owned();
+            }
+        }
+        assert!(
+            Instant::now() < trace_deadline,
+            "helper did not publish its readiness phase"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(readiness.starts_with("readiness:"));
+    let helper_pid = readiness
+        .split_once(':')
+        .and_then(|(_, pid)| pid.parse::<libc::pid_t>().ok())
+        .expect("readiness trace has helper pid");
+
+    cancellation.cancel();
+    let operation_result = tokio::time::timeout(Duration::from_secs(8), operation)
+        .await
+        .expect("controlled pre-release cancellation exceeded the outer test bound")
+        .expect("controlled pre-release operation task panicked");
+    // Probe the exact captured PGID immediately after the owned call returns;
+    // a later polling observer would not prove the state at this boundary.
+    let group_probe = unsafe { libc::kill(-helper_pid, 0) };
+    let group_probe_errno = (group_probe == -1)
+        .then(|| std::io::Error::last_os_error().raw_os_error())
+        .flatten();
+    let leader_probe = unsafe { libc::kill(helper_pid, 0) };
+    let leader_probe_errno = (leader_probe == -1)
+        .then(|| std::io::Error::last_os_error().raw_os_error())
+        .flatten();
+    let helper_group_is_gone = group_probe == -1 && group_probe_errno == Some(libc::ESRCH);
+    let failure =
+        operation_result.expect_err("cancelled controlled operation unexpectedly succeeded");
+
+    assert_eq!(
+        failure.boundary(),
+        pueue_agent::pueue::PueueControlBoundary::TargetNotReleased
+    );
+    assert!(matches!(
+        failure.into_error(),
+        AppError::Pueue(PueueError::Timeout { operation: "kill" })
+    ));
+    assert!(
+        helper_group_is_gone,
+        "controlled operation returned before helper process-group quiescence: pid/pgid={helper_pid}, group kill(0)={group_probe}, errno={group_probe_errno:?}, leader kill(0)={leader_probe}, errno={leader_probe_errno:?}, trace={readiness:?}"
+    );
+    let trace = fs::read_to_string(trace_path).expect("helper lifecycle trace remains available");
+    assert_eq!(
+        trace.lines().count(),
+        1,
+        "pre-release cancellation advanced the helper beyond readiness: {trace:?}"
+    );
+    fixture.assert_no_execution_artifacts();
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn controlled_collection_cancellation_reaps_the_native_group_before_returning() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = NativeFakePueue::new(NativeBehavior::Hold);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+    let cancellation = CancellationToken::new();
+    let operation_cancellation = cancellation.clone();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let operation = tokio::spawn(async move {
+        adapter
+            .kill_controlled_before(41, deadline, operation_cancellation)
+            .await
+    });
+
+    fixture.wait_until_ready().await;
+    cancellation.cancel();
+    let failure = tokio::time::timeout(Duration::from_secs(8), operation)
+        .await
+        .expect("controlled cancellation exceeded the outer test bound")
+        .expect("controlled operation task panicked")
+        .expect_err("cancelled controlled operation unexpectedly succeeded");
+
+    assert_eq!(
+        failure.boundary(),
+        pueue_agent::pueue::PueueControlBoundary::TargetReleasedClientQuiescent
+    );
+    assert!(matches!(
+        failure.into_error(),
+        AppError::Pueue(PueueError::Timeout { operation: "kill" })
+    ));
+    assert_eq!(
+        fixture.captured_argv().await,
+        vec![
+            b"--config".to_vec(),
+            b"/dev/fd/9".to_vec(),
+            b"kill".to_vec(),
+            b"41".to_vec(),
+        ]
+    );
+    assert_eq!(fixture.captured_config().await, b"fixture-config-fd9\n");
+    assert_eq!(fixture.term_observation().await, b"pipe-open");
+    fixture.wait_for_processes_gone().await;
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[tokio::test]
+async fn controlled_handshake_cancellation_awaits_exec_proof_join_before_cleanup() {
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = NativeFakePueue::delays(0, 400, 0);
+    let trace_path = PathBuf::from(
+        std::env::var_os("PUEUE_AGENT_TEST_LIFECYCLE_TRACE")
+            .expect("native fixture publishes its lifecycle trace path"),
+    );
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+    let cancellation = CancellationToken::new();
+    let operation_cancellation = cancellation.clone();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let operation = tokio::spawn(async move {
+        adapter
+            .kill_controlled_before(41, deadline, operation_cancellation)
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let trace = fs::read_to_string(&trace_path).unwrap_or_default();
+            if trace.lines().any(|line| line.starts_with("exec-proof:")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("helper did not enter the exec-proof phase");
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    let cancelled_at = Instant::now();
+    cancellation.cancel();
+    let failure = tokio::time::timeout(Duration::from_secs(8), operation)
+        .await
+        .expect("controlled handshake cancellation exceeded the outer test bound")
+        .expect("controlled operation task panicked")
+        .expect_err("cancelled controlled operation unexpectedly succeeded");
+
+    assert!(
+        cancelled_at.elapsed() >= Duration::from_millis(150),
+        "exec-proof reader was dropped instead of being awaited"
+    );
+    assert_eq!(
+        failure.boundary(),
+        pueue_agent::pueue::PueueControlBoundary::TargetReleasedClientQuiescent
+    );
+    let error = failure.into_error();
+    assert!(
+        matches!(
+            error,
+            AppError::Pueue(PueueError::Timeout { operation: "kill" })
+        ),
+        "unexpected controlled handshake error: {error:?}"
+    );
+    fixture.assert_helper_lifecycle_deadline_started().await;
 }
 
 #[cfg(all(unix, debug_assertions))]
@@ -4424,6 +4736,8 @@ async fn campaign_submit_reserved_intent_resumes_with_exactly_one_add() {
 #[cfg(all(unix, target_os = "linux"))]
 #[tokio::test]
 async fn campaign_submit_candidate_uses_nested_candidate_cwd_and_durable_argv() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = candidate_submission_fixture("nested").await;
     let root_anchor = ProjectRootAnchor::resolve(&fixture.project.root_path).unwrap();
     let coordinator = CampaignCoordinator::new(
@@ -4555,6 +4869,8 @@ async fn campaign_submit_candidate_uses_nested_candidate_cwd_and_durable_argv() 
 #[cfg(all(unix, target_os = "linux"))]
 #[tokio::test]
 async fn campaign_submit_attached_candidate_links_deterministic_successor_and_replays_without_duplicate_add() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = attached_candidate_submission_fixture("nested").await;
     let review_id = fixture
         .attached_review_id
@@ -4687,6 +5003,8 @@ async fn campaign_submit_attached_candidate_links_deterministic_successor_and_re
 #[cfg(all(unix, target_os = "linux"))]
 #[tokio::test]
 async fn campaign_submit_candidate_defers_paused_replay_without_runtime_side_effects() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = candidate_submission_fixture("nested").await;
     let experiment_id = format!("code-change-experiment:{}", fixture.run_id);
     let submission_id = format!("code-change-submission:{}", fixture.run_id);
@@ -4831,6 +5149,8 @@ async fn campaign_submit_candidate_defers_paused_replay_without_runtime_side_eff
 #[cfg(all(unix, target_os = "linux"))]
 #[tokio::test]
 async fn campaign_submit_candidate_defers_campaign_paused_replay_before_runtime() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = candidate_submission_fixture("nested").await;
     let experiment_id = format!("code-change-experiment:{}", fixture.run_id);
     let submission_id = format!("code-change-submission:{}", fixture.run_id);
@@ -4920,6 +5240,8 @@ async fn campaign_submit_candidate_defers_campaign_paused_replay_before_runtime(
 #[cfg(all(unix, target_os = "linux"))]
 #[tokio::test]
 async fn campaign_submit_candidate_allows_ignored_python_check_caches() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = candidate_submission_fixture("nested").await;
     let pytest_cache = fixture.candidate_root.join(".pytest_cache");
     let pycache = fixture.candidate_root.join("nested/__pycache__");
@@ -4966,6 +5288,8 @@ async fn campaign_submit_candidate_allows_ignored_python_check_caches() {
 #[cfg(all(unix, target_os = "linux"))]
 #[tokio::test]
 async fn candidate_terminal_result_is_ingested_from_candidate_worktree() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = candidate_submission_fixture("nested").await;
     let objective_metric = ObjectiveMetric {
         name: "validation_loss".to_owned(),
@@ -5084,6 +5408,8 @@ async fn candidate_terminal_result_is_ingested_from_candidate_worktree() {
 #[cfg(all(unix, target_os = "linux"))]
 #[tokio::test]
 async fn candidate_terminal_result_rejects_replaced_nested_working_directory() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = candidate_submission_fixture("nested").await;
     let objective_metric = ObjectiveMetric {
         name: "validation_loss".to_owned(),
@@ -5177,6 +5503,8 @@ async fn candidate_terminal_result_rejects_replaced_nested_working_directory() {
 #[cfg(all(unix, target_os = "linux"))]
 #[tokio::test]
 async fn campaign_submit_candidate_rejects_unsafe_cwd_before_pueue_add() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     for (working_directory, symlink_target, replace_root) in [
         ("/tmp", None, false),
         ("../sibling", None, false),
@@ -5237,6 +5565,8 @@ async fn campaign_submit_candidate_rejects_unsafe_cwd_before_pueue_add() {
 #[cfg(all(unix, target_os = "linux"))]
 #[tokio::test]
 async fn campaign_submit_candidate_rejects_precreated_runtime_tree_before_pueue_add() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = candidate_submission_fixture_with_runtime_git(".", true).await;
     let experiment_id = format!("code-change-experiment:{}", fixture.run_id);
     let service_root = fixture.candidate_root.join(".pueue-agent");
@@ -5308,6 +5638,8 @@ async fn campaign_submit_candidate_rejects_precreated_runtime_tree_before_pueue_
 #[tokio::test]
 async fn campaign_submit_candidate_restart_reuses_submission_reconciliation_without_duplicate_add()
 {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = candidate_submission_fixture("nested").await;
     let run = CodeChangeRepository::new(&fixture.harness.db)
         .find_by_id(&fixture.run_id)
@@ -5628,6 +5960,8 @@ fn pueue_config_anchor_rejects_weak_mode_and_project_root_config() {
 
 #[tokio::test]
 async fn command_adapter_preserves_fixed_and_arbitrary_arguments() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
     let adapter = configured_pueue(fixture.policy()).unwrap();
     let add_args = [
@@ -5667,6 +6001,8 @@ async fn command_adapter_preserves_fixed_and_arbitrary_arguments() {
 
 #[tokio::test]
 async fn command_adapter_kills_only_the_requested_task_id() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
     let adapter = configured_pueue(fixture.policy()).unwrap();
 
@@ -5683,6 +6019,8 @@ async fn command_adapter_kills_only_the_requested_task_id() {
 
 #[tokio::test]
 async fn command_adapter_removes_only_the_requested_task_id() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
     let adapter = configured_pueue(fixture.policy()).unwrap();
 
@@ -5699,6 +6037,8 @@ async fn command_adapter_removes_only_the_requested_task_id() {
 
 #[tokio::test]
 async fn command_adapter_provisions_group_without_shell() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
     let adapter = configured_pueue(fixture.policy()).unwrap();
 
@@ -5715,6 +6055,8 @@ async fn command_adapter_provisions_group_without_shell() {
 
 #[tokio::test]
 async fn command_adapter_rejects_invalid_group_before_pueue_execution() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
     let adapter = configured_pueue(fixture.policy()).unwrap();
 
@@ -5732,6 +6074,8 @@ async fn command_adapter_rejects_invalid_group_before_pueue_execution() {
 
 #[tokio::test]
 async fn command_adapter_skips_group_add_when_group_already_exists() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new_with_group_lists(
         STATUS_JSON,
         "73\n",
@@ -5753,6 +6097,8 @@ async fn command_adapter_skips_group_add_when_group_already_exists() {
 
 #[tokio::test]
 async fn command_adapter_adds_missing_group_after_json_list_check() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new_with_group_lists(
         STATUS_JSON,
         "73\n",
@@ -5780,6 +6126,8 @@ async fn command_adapter_adds_missing_group_after_json_list_check() {
 
 #[tokio::test]
 async fn command_adapter_rejects_non_object_group_json() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     for groups in ["[]", "null", "\"pa-project\""] {
         let fixture = FakePueueCommand::new_with_group_lists(STATUS_JSON, "73\n", &[groups], None);
         let adapter = configured_pueue(fixture.policy()).unwrap();
@@ -5796,6 +6144,8 @@ async fn command_adapter_rejects_non_object_group_json() {
 
 #[tokio::test]
 async fn command_adapter_treats_racing_group_add_as_success_when_group_appears() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new_with_group_lists(
         STATUS_JSON,
         "73\n",
@@ -5830,6 +6180,8 @@ async fn command_adapter_treats_racing_group_add_as_success_when_group_appears()
 
 #[tokio::test]
 async fn command_adapter_preserves_group_add_error_when_group_remains_absent() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new_with_group_lists(
         STATUS_JSON,
         "73\n",
@@ -5874,7 +6226,214 @@ async fn command_adapter_preserves_group_add_error_when_group_remains_absent() {
 }
 
 #[tokio::test]
+async fn command_adapter_exclusively_creates_and_verifies_an_absent_group() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = FakePueueCommand::new_with_group_lists(
+        STATUS_JSON,
+        "73\n",
+        &[
+            r#"{"default":{"parallel_tasks":1}}"#,
+            r#"{"default":{"parallel_tasks":1},"pa-trial":{"parallel_tasks":1}}"#,
+        ],
+        None,
+    );
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+
+    adapter.create_group_exclusive("pa-trial").await.unwrap();
+
+    assert_eq!(
+        fixture.captured_invocations(),
+        vec![
+            vec!["--config", "/dev/fd/9", "group", "-j"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            vec!["--config", "/dev/fd/9", "group", "add", "pa-trial"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            vec!["--config", "/dev/fd/9", "group", "-j"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn command_adapter_rejects_existing_group_without_adopting_it() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = FakePueueCommand::new_with_group_lists(
+        STATUS_JSON,
+        "73\n",
+        &[r#"{"default":{"parallel_tasks":1},"pa-trial":{"parallel_tasks":1}}"#],
+        None,
+    );
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+
+    assert!(adapter.create_group_exclusive("pa-trial").await.is_err());
+
+    assert_eq!(
+        fixture.captured_invocations(),
+        vec![vec!["--config", "/dev/fd/9", "group", "-j"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()]
+    );
+}
+
+#[tokio::test]
+async fn command_adapter_does_not_adopt_group_after_an_ambiguous_add_error() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = FakePueueCommand::new_with_group_lists(
+        STATUS_JSON,
+        "73\n",
+        &[r#"{"default":{"parallel_tasks":1}}"#],
+        Some("group-add"),
+    );
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+
+    assert!(adapter.create_group_exclusive("pa-trial").await.is_err());
+
+    assert_eq!(
+        fixture.captured_invocations(),
+        vec![
+            vec!["--config", "/dev/fd/9", "group", "-j"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            vec!["--config", "/dev/fd/9", "group", "add", "pa-trial"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn command_adapter_removes_only_the_requested_group_without_a_shell() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+
+    adapter.remove_group("pa-trial").await.unwrap();
+
+    assert_eq!(
+        fixture.captured_invocations(),
+        vec![vec!["--config", "/dev/fd/9", "group", "remove", "pa-trial"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()]
+    );
+}
+
+#[tokio::test]
+async fn command_adapter_controlled_group_lifecycle_uses_direct_exact_argv() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let fixture = FakePueueCommand::new_with_group_lists(
+        STATUS_JSON,
+        "73\n",
+        &[
+            r#"{"default":{"parallel_tasks":1}}"#,
+            r#"{"default":{"parallel_tasks":1},"pa-trial":{"parallel_tasks":1}}"#,
+        ],
+        None,
+    );
+    let adapter = configured_pueue(fixture.policy()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+
+    adapter
+        .create_group_exclusive_controlled_before("pa-trial", deadline, CancellationToken::new())
+        .await
+        .unwrap();
+    adapter
+        .remove_group_controlled_before("pa-trial", deadline, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture.captured_invocations(),
+        vec![
+            vec!["--config", "/dev/fd/9", "group", "-j"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            vec!["--config", "/dev/fd/9", "group", "add", "pa-trial"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            vec!["--config", "/dev/fd/9", "group", "-j"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            vec!["--config", "/dev/fd/9", "group", "remove", "pa-trial"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn controlled_group_parsing_fails_closed_at_the_observed_boundary() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
+    let invalid_name_fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
+    let invalid_name_adapter = configured_pueue(invalid_name_fixture.policy()).unwrap();
+    let invalid_name = invalid_name_adapter
+        .group_exists_controlled_before(
+            "bad group",
+            std::time::Instant::now() + Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("invalid group name must be rejected before native execution");
+
+    assert_eq!(
+        invalid_name.boundary(),
+        pueue_agent::pueue::PueueControlBoundary::TargetNotReleased
+    );
+    assert!(matches!(
+        invalid_name.into_error(),
+        AppError::Validation {
+            field: "pueue_group",
+            ..
+        }
+    ));
+    assert!(invalid_name_fixture.captured_invocations().is_empty());
+
+    let invalid_json_fixture =
+        FakePueueCommand::new_with_group_lists(STATUS_JSON, "73\n", &["[]"], None);
+    let invalid_json_adapter = configured_pueue(invalid_json_fixture.policy()).unwrap();
+    let invalid_json = invalid_json_adapter
+        .group_exists_controlled_before(
+            "pa-trial",
+            std::time::Instant::now() + Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("invalid group JSON must be rejected");
+
+    assert_eq!(
+        invalid_json.boundary(),
+        pueue_agent::pueue::PueueControlBoundary::TargetReleasedClientQuiescent
+    );
+    assert!(matches!(
+        invalid_json.into_error(),
+        AppError::Pueue(PueueError::InvalidGroupJson { .. })
+    ));
+    assert_eq!(invalid_json_fixture.captured_invocations().len(), 1);
+}
+
+#[tokio::test]
 async fn status_json_preserves_task_identity_timestamps_and_result() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", None);
     let adapter = configured_pueue(fixture.policy()).unwrap();
 
@@ -5901,6 +6460,8 @@ async fn status_json_preserves_task_identity_timestamps_and_result() {
 
 #[tokio::test]
 async fn status_json_rejects_state_details_that_are_not_objects() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let status_json = r#"{
       "tasks": {
         "41": {
@@ -5928,6 +6489,8 @@ async fn status_json_rejects_state_details_that_are_not_objects() {
 
 #[tokio::test]
 async fn status_json_rejects_wrong_typed_optional_timestamps() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let status_json = r#"{
       "tasks": {
         "41": {
@@ -5958,6 +6521,8 @@ async fn status_json_rejects_wrong_typed_optional_timestamps() {
 
 #[tokio::test]
 async fn non_zero_exit_is_a_typed_error_with_captured_output() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", Some("kill"));
     let adapter = configured_pueue(fixture.policy()).unwrap();
 
@@ -5981,6 +6546,8 @@ async fn non_zero_exit_is_a_typed_error_with_captured_output() {
 
 #[tokio::test]
 async fn remove_non_zero_exit_is_a_typed_error_with_captured_output() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new(STATUS_JSON, "73\n", Some("remove"));
     let adapter = configured_pueue(fixture.policy()).unwrap();
 
@@ -5996,6 +6563,8 @@ async fn remove_non_zero_exit_is_a_typed_error_with_captured_output() {
 
 #[tokio::test]
 async fn malformed_status_json_is_a_typed_integration_error() {
+    #[cfg(all(unix, debug_assertions))]
+    let _guard = NATIVE_PROCESS_FIXTURE_LOCK.lock().await;
     let fixture = FakePueueCommand::new("not-json", "73\n", None);
     let adapter = configured_pueue(fixture.policy()).unwrap();
 
