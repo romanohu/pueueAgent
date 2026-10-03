@@ -690,6 +690,20 @@ pub fn build_doctor_report_with_policy_and_roots(
             "inspect campaign rows without mutating them from doctor",
         )
     });
+    if campaign.live_campaign_count == 0 {
+        checks.push(match state::load_objective(&project.root_path) {
+            Ok(_) => doctor_ok(
+                "state.objective",
+                "project objective is ready for a new campaign",
+                "none",
+            ),
+            Err(_) => doctor_error(
+                "state.objective",
+                "project objective is not ready for a new campaign",
+                "write a meaningful bounded objective to STATE.md before starting a campaign",
+            ),
+        });
+    }
     if campaign.live_campaign_count != 0 {
         checks.push(if campaign.baseline_linkage_errors == 0 {
             doctor_ok(

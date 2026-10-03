@@ -1,7 +1,7 @@
 use std::fs;
 
 #[cfg(unix)]
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
 use pueue_agent::{
     code_change::{best_ref, candidate_ref},
@@ -3342,6 +3342,298 @@ fn operator_surfaces_render_idle_research_for_existing_campaign_without_state() 
     assert!(doctor_human.contains("research: state=idle"));
     assert!(!doctor_json.contains("research_history"));
     assert!(!doctor_human.contains("research_history"));
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DoctorObjectiveFileSnapshot {
+    bytes: Vec<u8>,
+    len: u64,
+    modified: std::time::SystemTime,
+    readonly: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    links: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+}
+
+fn doctor_objective_file_snapshot(
+    path: &std::path::Path,
+) -> std::io::Result<Option<DoctorObjectiveFileSnapshot>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "objective fixture is not a regular file",
+        ));
+    }
+    let bytes = fs::read(path)?;
+    Ok(Some(DoctorObjectiveFileSnapshot {
+        bytes,
+        len: metadata.len(),
+        modified: metadata.modified()?,
+        readonly: metadata.permissions().readonly(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        mode: metadata.mode(),
+        #[cfg(unix)]
+        links: metadata.nlink(),
+        #[cfg(unix)]
+        modified_seconds: metadata.mtime(),
+        #[cfg(unix)]
+        modified_nanoseconds: metadata.mtime_nsec(),
+    }))
+}
+
+fn doctor_database_row_snapshot(
+    db: &Db,
+) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+    let connection = db.connect().unwrap();
+    let table_names = connection
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    table_names
+        .into_iter()
+        .map(|table_name| {
+            let escaped_name = table_name.replace('"', "\"\"");
+            let sql = format!("SELECT * FROM \"{escaped_name}\" ORDER BY rowid");
+            let rows = connection
+                .prepare(&sql)
+                .unwrap()
+                .query_map([], |row| {
+                    (0..row.as_ref().column_count())
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (table_name, rows)
+        })
+        .collect()
+}
+
+#[test]
+fn doctor_reports_objective_readiness_without_live_campaign() {
+    let harness = DiagnosticsHarness::new();
+    let objective_path = harness.project().root_path.join(".pueue-agent/STATE.md");
+    fs::create_dir_all(objective_path.parent().unwrap()).unwrap();
+
+    let mut oversized = b"OBJECTIVE_SECRET_OVERSIZE\n".to_vec();
+    oversized.resize(pueue_agent::state::MAX_OBJECTIVE_BYTES + 1, b'x');
+    let cases = vec![
+        ("missing", None, DoctorCheckStatus::Error, vec![]),
+        (
+            "generated template",
+            Some(include_str!("../../templates/STATE.md").as_bytes().to_vec()),
+            DoctorCheckStatus::Error,
+            vec!["目的をここに書く"],
+        ),
+        (
+            "generated placeholder",
+            Some("Objective: (目的をここに書く)\n".as_bytes().to_vec()),
+            DoctorCheckStatus::Error,
+            vec!["目的をここに書く"],
+        ),
+        (
+            "oversized",
+            Some(oversized),
+            DoctorCheckStatus::Error,
+            vec!["OBJECTIVE_SECRET_OVERSIZE"],
+        ),
+        (
+            "invalid UTF-8",
+            Some(b"OBJECTIVE_SECRET_INVALID_UTF8\xff\n".to_vec()),
+            DoctorCheckStatus::Error,
+            vec!["OBJECTIVE_SECRET_INVALID_UTF8"],
+        ),
+        (
+            "control character",
+            Some(b"OBJECTIVE_SECRET_CONTROL\x01\n".to_vec()),
+            DoctorCheckStatus::Error,
+            vec!["OBJECTIVE_SECRET_CONTROL"],
+        ),
+        (
+            "heading and table only",
+            Some(b"# OBJECTIVE_SECRET_HEADING\n|OBJECTIVE_SECRET_TABLE|\n|---|\n".to_vec()),
+            DoctorCheckStatus::Error,
+            vec!["OBJECTIVE_SECRET_HEADING", "OBJECTIVE_SECRET_TABLE"],
+        ),
+        (
+            "meaningful objective",
+            Some(b"Reduce OBJECTIVE_SECRET_VALID loss below 0.20\n".to_vec()),
+            DoctorCheckStatus::Ok,
+            vec!["OBJECTIVE_SECRET_VALID"],
+        ),
+    ];
+
+    let db_before = doctor_database_row_snapshot(&harness.db);
+    let mut first_error_copy: Option<(String, String)> = None;
+    for (case_name, contents, expected_status, source_markers) in cases {
+        if let Some(contents) = contents.as_deref() {
+            fs::write(&objective_path, contents).unwrap();
+        } else if objective_path.exists() {
+            fs::remove_file(&objective_path).unwrap();
+        }
+        let file_before = doctor_objective_file_snapshot(&objective_path).unwrap();
+        let report = build_doctor_report(
+            &harness.db,
+            &harness.project(),
+            &doctor_paths(&harness),
+            doctor_external(),
+            100,
+        )
+        .unwrap();
+        let objective_checks = report
+            .checks
+            .iter()
+            .filter(|check| check.name == "state.objective")
+            .collect::<Vec<_>>();
+        assert_eq!(objective_checks.len(), 1, "{case_name}");
+        let check = objective_checks[0];
+        assert_eq!(check.status, expected_status, "{case_name}");
+        assert!(check.summary.len() <= 256, "{case_name}: {}", check.summary);
+        assert!(check.remediation.len() <= 256, "{case_name}: {}", check.remediation);
+
+        if expected_status == DoctorCheckStatus::Error {
+            if let Some((summary, remediation)) = first_error_copy.as_ref() {
+                assert_eq!(&check.summary, summary, "error summary changed for {case_name}");
+                assert_eq!(
+                    &check.remediation, remediation,
+                    "error remediation changed for {case_name}"
+                );
+            } else {
+                first_error_copy = Some((check.summary.clone(), check.remediation.clone()));
+            }
+        }
+        let rendered_json = render_doctor_report_value(&report, true).unwrap();
+        let rendered_text = render_doctor_report_value(&report, false).unwrap();
+        for marker in source_markers {
+            assert!(!check.summary.contains(marker), "{case_name}: {marker}");
+            assert!(!check.remediation.contains(marker), "{case_name}: {marker}");
+            assert!(!rendered_json.contains(marker), "{case_name}: {marker}");
+            assert!(!rendered_text.contains(marker), "{case_name}: {marker}");
+        }
+        let repeated_report = build_doctor_report(
+            &harness.db,
+            &harness.project(),
+            &doctor_paths(&harness),
+            doctor_external(),
+            100,
+        )
+        .unwrap();
+        let repeated_check = repeated_report
+            .checks
+            .iter()
+            .find(|check| check.name == "state.objective")
+            .unwrap_or_else(|| panic!("{case_name}: repeated report omitted state.objective"));
+        assert_eq!(repeated_check.status, check.status, "{case_name}");
+        assert_eq!(repeated_check.summary, check.summary, "{case_name}");
+        assert_eq!(repeated_check.remediation, check.remediation, "{case_name}");
+        assert_eq!(
+            file_before,
+            doctor_objective_file_snapshot(&objective_path).unwrap(),
+            "doctor changed objective bytes or stable file metadata for {case_name}"
+        );
+    }
+    assert_eq!(db_before, doctor_database_row_snapshot(&harness.db));
+}
+
+#[test]
+fn doctor_keeps_active_campaign_objective_digest_semantics() {
+    let harness = DiagnosticsHarness::new();
+    let campaign_id = harness.start_campaign();
+    let objective_path = harness.project().root_path.join(".pueue-agent/STATE.md");
+    let stored_digest = CampaignRepository::new(&harness.db)
+        .find_by_id(&campaign_id)
+        .unwrap()
+        .unwrap()
+        .objective_digest;
+    let db_before = doctor_database_row_snapshot(&harness.db);
+    let cases = [
+        (
+            "matching objective",
+            b"Reach SECRET_OBJECTIVE validation loss below 0.20\n".as_slice(),
+            DoctorCheckStatus::Ok,
+            "SECRET_OBJECTIVE",
+        ),
+        (
+            "changed objective",
+            b"Changed ACTIVE_OBJECTIVE_SECRET without changing the snapshot\n".as_slice(),
+            DoctorCheckStatus::Warning,
+            "ACTIVE_OBJECTIVE_SECRET",
+        ),
+        (
+            "unreadable objective",
+            b"ACTIVE_OBJECTIVE_UNREADABLE_SECRET\xff\n".as_slice(),
+            DoctorCheckStatus::Warning,
+            "ACTIVE_OBJECTIVE_UNREADABLE_SECRET",
+        ),
+    ];
+    for (case_name, contents, expected_status, secret_marker) in cases {
+        fs::write(&objective_path, contents).unwrap();
+        let file_before = doctor_objective_file_snapshot(&objective_path).unwrap();
+        let report = build_doctor_report(
+            &harness.db,
+            &harness.project(),
+            &doctor_paths(&harness),
+            doctor_external(),
+            100,
+        )
+        .unwrap();
+        assert!(
+            report.checks.iter().all(|check| check.name != "state.objective"),
+            "{case_name}: active campaigns must not get state.objective"
+        );
+        let digest_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "campaign.objective_digest")
+            .unwrap_or_else(|| panic!("{case_name}: objective digest check missing"));
+        assert_eq!(digest_check.status, expected_status, "{case_name}");
+        let rendered_json = render_doctor_report_value(&report, true).unwrap();
+        let rendered_text = render_doctor_report_value(&report, false).unwrap();
+        assert!(!digest_check.summary.contains(secret_marker), "{case_name}");
+        assert!(!digest_check.remediation.contains(secret_marker), "{case_name}");
+        assert!(!rendered_json.contains(secret_marker), "{case_name}");
+        assert!(!rendered_text.contains(secret_marker), "{case_name}");
+        assert_eq!(
+            file_before,
+            doctor_objective_file_snapshot(&objective_path).unwrap(),
+            "{case_name}: doctor changed objective bytes or stable file metadata"
+        );
+    }
+    assert_eq!(db_before, doctor_database_row_snapshot(&harness.db));
+    assert_eq!(
+        CampaignRepository::new(&harness.db)
+            .find_by_id(&campaign_id)
+            .unwrap()
+            .unwrap()
+            .objective_digest,
+        stored_digest
+    );
 }
 
 #[test]
