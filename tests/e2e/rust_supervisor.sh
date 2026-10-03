@@ -2003,6 +2003,29 @@ wait_for_sql "SELECT status FROM events WHERE dedup_key = '$restart_key'" "retry
   "restart did not park the expired event lease"
 stop_daemon
 
+# Restore only PROJECT_A's expired rolling agent-run capacity before the
+# standalone resume continuation fixture below. Use the production wake path.
+resume_budget_now="$(date +%s)"
+sql "UPDATE budget_reservations
+     SET window_started_at = $((resume_budget_now - 2)), window_ends_at = $((resume_budget_now - 1))
+     WHERE campaign_id = '$CAMPAIGN_A' AND dimension = 'agent_run' AND status = 'consumed';
+     UPDATE campaigns SET next_eligible_at = $((resume_budget_now - 1))
+     WHERE campaign_id = '$CAMPAIGN_A' AND state = 'budget_waiting';"
+start_daemon
+wait_for_sql "SELECT state FROM campaigns WHERE campaign_id = '$CAMPAIGN_A'" "active" \
+  "expired PROJECT_A rolling budget did not reactivate"
+stop_daemon
+[ "$(sql "SELECT state FROM campaigns WHERE campaign_id = '$CAMPAIGN_A'")" = "active" ] \
+  || fail "expired PROJECT_A rolling budget did not remain active after wake"
+[ "$(sql "SELECT CASE WHEN COUNT(*) < 6 THEN 1 ELSE 0 END
+              FROM budget_reservations
+              WHERE campaign_id = '$CAMPAIGN_A' AND dimension = 'agent_run'
+                AND status IN ('reserved', 'consumed') AND window_ends_at > $resume_budget_now")" = "1" ] \
+  || fail "legacy resume campaign did not regain agent-run headroom"
+[ "$(sql "SELECT CASE WHEN enabled = 1 AND paused = 0 AND halted_reason IS NULL THEN 1 ELSE 0 END
+              FROM projects WHERE project_id = '$PROJECT_ID_A'")" = "1" ] \
+  || fail "legacy resume project is not runnable"
+
 # Explicit Codex continuation exposes the production-derived network argument and no credentials.
 : > "$PUEUE_AGENT_TEST_CODEX_LOG"
 context_session_id="019f9f30-5f31-7a40-8e28-bd95e1f6c537"

@@ -415,6 +415,7 @@ fn inject_extra_task_before_remove(task_id: &str) {
     }
     let output = real(&[
         "add".to_owned(),
+        "--print-task-id".to_owned(),
         "--group".to_owned(),
         group.clone(),
         "--".to_owned(),
