@@ -17,7 +17,8 @@ use pueue_agent::{
         build_doctor_report, build_doctor_report_with_policy, render_doctor_report,
         render_doctor_report_value, render_events,
         render_incident_explanation, render_project_status_json, render_task_inspection,
-        DoctorCheckStatus, DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
+        DoctorAgentRuntime, DoctorCheckStatus, DoctorExternal, EventFilter,
+        MAX_EVENT_LIST_LIMIT,
     },
     execution_policy::{
         CampaignLimits, PolicyViolation, PolicyViolationCode, PolicyViolationStage,
@@ -88,7 +89,66 @@ fn doctor_external() -> DoctorExternal {
         pueue: Ok(Vec::new()),
         service: Ok(ServiceStatus::Stopped),
         callback: Ok(None),
+        agent_runtime: DoctorAgentRuntime::Supported,
     }
+}
+
+#[test]
+fn doctor_reports_installed_codex_runtime() {
+    let harness = DiagnosticsHarness::new();
+    let paths = doctor_paths(&harness);
+    let policy = Err(PolicyViolation::new(
+        PolicyViolationCode::PolicyMissing,
+        PolicyViolationStage::Startup,
+    ));
+    let check_for = |agent_runtime| {
+        let report = build_doctor_report_with_policy(
+            &harness.db,
+            &harness.project(),
+            &paths,
+            DoctorExternal {
+                pueue: Ok(Vec::new()),
+                service: Ok(ServiceStatus::Stopped),
+                callback: Ok(None),
+                agent_runtime,
+            },
+            100,
+            &policy,
+        )
+        .unwrap();
+        let index = report
+            .checks
+            .iter()
+            .position(|check| check.name == "execution.agent_runtime")
+            .expect("doctor must report the installed Codex runtime");
+        (report.checks[index].clone(), report.checks)
+    };
+
+    let (supported, checks) = check_for(DoctorAgentRuntime::Supported);
+    assert_eq!(supported.status, DoctorCheckStatus::Ok);
+    let anchor_index = checks
+        .iter()
+        .position(|check| check.name == "execution.anchors")
+        .unwrap();
+    let runtime_index = checks
+        .iter()
+        .position(|check| check.name == "execution.agent_runtime")
+        .unwrap();
+    assert_eq!(runtime_index, anchor_index + 1);
+
+    let (blocked, _) = check_for(DoctorAgentRuntime::Blocked {
+        code: PolicyViolationCode::UnsafeCodexArgument,
+    });
+    assert_eq!(blocked.status, DoctorCheckStatus::Error);
+    assert_eq!(
+        blocked.summary,
+        "installed Codex capability probe blocked (unsafe_codex_argument)"
+    );
+    assert!(!blocked.summary.contains("help"));
+    assert!(!blocked.summary.contains("stdout"));
+
+    let (skipped, _) = check_for(DoctorAgentRuntime::SkippedPolicyUnavailable);
+    assert_eq!(skipped.status, DoctorCheckStatus::Warning);
 }
 
 #[test]
@@ -5520,6 +5580,7 @@ fn doctor_projection_reports_unavailable_integrations_as_errors_without_repairin
             pueue: Err("Pueue unavailable".to_owned()),
             service: Err("service status unavailable".to_owned()),
             callback: Err("callback config unavailable".to_owned()),
+            agent_runtime: DoctorAgentRuntime::SkippedPolicyUnavailable,
         },
         100,
         true,
@@ -5700,6 +5761,7 @@ fn doctor_reports_missing_submission_kind_or_origin_indexes() {
             pueue: Ok(Vec::new()),
             service: Ok(ServiceStatus::Stopped),
             callback: Ok(None),
+            agent_runtime: DoctorAgentRuntime::Supported,
         },
         100,
         true,
@@ -5851,6 +5913,7 @@ fn doctor_expired_lease_check_is_scoped_to_the_requested_project() {
             pueue: Ok(Vec::new()),
             service: Ok(ServiceStatus::Stopped),
             callback: Ok(None),
+            agent_runtime: DoctorAgentRuntime::Supported,
         },
         200,
         true,

@@ -8,6 +8,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
+    codex_command::probe_installed_codex_capabilities,
     config,
     db::{
         inferred_pre_binding_policy_code, AgentRunRepository, CampaignRepository,
@@ -446,6 +447,34 @@ pub struct DoctorExternal {
     pub pueue: Result<Vec<PueueTask>, String>,
     pub service: Result<ServiceStatus, String>,
     pub callback: Result<Option<String>, String>,
+    pub agent_runtime: DoctorAgentRuntime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorAgentRuntime {
+    Supported,
+    Blocked { code: PolicyViolationCode },
+    SkippedPolicyUnavailable,
+}
+
+pub async fn probe_doctor_agent_runtime(
+    policy: &Result<ResolvedExecutionPolicy, PolicyViolation>,
+) -> DoctorAgentRuntime {
+    let Ok(policy) = policy else {
+        return DoctorAgentRuntime::SkippedPolicyUnavailable;
+    };
+
+    match probe_installed_codex_capabilities(&policy.codex_anchor).await {
+        Ok(capabilities) if capabilities.supports_research_policy() => {
+            DoctorAgentRuntime::Supported
+        }
+        Ok(_) => DoctorAgentRuntime::Blocked {
+            code: PolicyViolationCode::UnsafeCodexArgument,
+        },
+        Err(violation) => DoctorAgentRuntime::Blocked {
+            code: violation.code,
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1052,6 +1081,26 @@ pub fn build_doctor_report_with_policy_and_roots(
         ),
     });
     checks.extend(execution_doctor_checks(db, project, policy));
+    checks.push(match external.agent_runtime {
+        DoctorAgentRuntime::Supported => doctor_ok(
+            "execution.agent_runtime",
+            "installed Codex supports the required research CLI capabilities",
+            "none",
+        ),
+        DoctorAgentRuntime::Blocked { code } => doctor_error(
+            "execution.agent_runtime",
+            &format!(
+                "installed Codex capability probe blocked ({})",
+                code.as_str()
+            ),
+            "restore the pinned Codex executable with the supported capability surface",
+        ),
+        DoctorAgentRuntime::SkippedPolicyUnavailable => doctor_warning(
+            "execution.agent_runtime",
+            "installed Codex runtime was not probed because execution policy is unavailable",
+            "restore the service-owned execution policy before probing Codex",
+        ),
+    });
     checks.push(match &external.pueue {
         Ok(tasks) if tasks.iter().any(|task| task.group == project.pueue_group) => doctor_ok(
             "pueue.status",
@@ -1369,7 +1418,11 @@ pub fn build_doctor_report_with_policy_and_roots(
         )
     });
 
-    checks.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    checks.sort_unstable_by(|left, right| match (left.name.as_str(), right.name.as_str()) {
+        ("execution.anchors", "execution.agent_runtime") => Ordering::Less,
+        ("execution.agent_runtime", "execution.anchors") => Ordering::Greater,
+        _ => left.name.cmp(&right.name),
+    });
     let status = if checks
         .iter()
         .any(|check| check.status == DoctorCheckStatus::Error)

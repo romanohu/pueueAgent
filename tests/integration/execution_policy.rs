@@ -6,7 +6,9 @@ use std::{
 use pueue_agent::{
     config::{AgentConfig, AgentCodexConfig, AgentExecutionConfig, ProjectConfig},
     db::{Db, ProjectRepository},
-    diagnostics::{build_doctor_report_with_policy, DoctorCheckStatus, DoctorExternal},
+    diagnostics::{
+        build_doctor_report_with_policy, DoctorAgentRuntime, DoctorCheckStatus, DoctorExternal,
+    },
     execution_policy::{
         load_existing_policy, load_or_create_policy, preflight_code_change_uid,
         resolve_project_policy, AgentKind, CampaignLimits, CodeChangeTool, NetworkMode,
@@ -61,6 +63,7 @@ fn doctor_detects_replaced_pueue_executable_and_config_anchors() {
                 pueue: Ok(Vec::new()),
                 service: Ok(ServiceStatus::Stopped),
                 callback: Ok(None),
+                agent_runtime: DoctorAgentRuntime::SkippedPolicyUnavailable,
             },
             0,
             &Ok(policy),

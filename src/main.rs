@@ -106,7 +106,8 @@ mod commands {
         diagnostics::{
             build_doctor_report_with_policy_and_roots, render_doctor_report_value,
             render_events, render_incident_explanation, render_project_status_json,
-            render_task_inspection, DoctorExternal, EventFilter, MAX_EVENT_LIST_LIMIT,
+            probe_doctor_agent_runtime, render_task_inspection, DoctorExternal, EventFilter,
+            MAX_EVENT_LIST_LIMIT,
         },
         events::{
             callback_group_for_task, record_callback, record_operator_wake_with, CallbackMetadata,
@@ -325,6 +326,7 @@ mod commands {
             project_roots.clone(),
             current_launcher_path()?,
         ));
+        let agent_runtime = probe_doctor_agent_runtime(&policy).await;
         let pueue_status = match &policy {
             Ok(policy) => match configured_pueue(Arc::new(policy.clone())) {
                 Ok(pueue) => pueue.status_json().await.map_err(|error| error.render()),
@@ -337,6 +339,7 @@ mod commands {
             pueue: pueue_status,
             service: ServiceManager.status().map_err(|error| error.render()),
             callback: callbacks.current_callback().map_err(|error| error.render()),
+            agent_runtime,
         };
         let report = build_doctor_report_with_policy_and_roots(
             &db,

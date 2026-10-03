@@ -14,8 +14,8 @@ use pueue_agent::{
     },
     execution_policy::{
         load_or_create_policy, AgentKind, ExecutableAnchor, ExecutableIdentity, NetworkMode,
-        PolicyLoadInput, PolicyViolationCode, ProjectRootAnchor, ResolvedProjectExecutionPolicy,
-        StartupEnvironment,
+        PolicyLoadInput, PolicyViolationCode, ProjectRootAnchor,
+        ResolvedProjectExecutionPolicy, StartupEnvironment,
     },
     decision_evidence::{
         MAX_ARTIFACT_HINT_DEPTH, MAX_ARTIFACT_HINT_FIELD_BYTES, MAX_ARTIFACT_HINTS,
@@ -25,10 +25,17 @@ use pueue_agent::{
 };
 use tempfile::TempDir;
 
+#[cfg(unix)]
+use pueue_agent::{
+    diagnostics::{probe_doctor_agent_runtime, DoctorAgentRuntime},
+    execution_policy::{PolicyViolation, PolicyViolationStage, ResolvedExecutionPolicy},
+};
+
+#[cfg(unix)]
+use std::{os::unix::fs::PermissionsExt, process::Command};
+
 #[cfg(target_os = "linux")]
 use std::{
-    os::unix::fs::PermissionsExt,
-    process::Command,
     sync::Arc,
 };
 #[cfg(target_os = "linux")]
@@ -251,6 +258,319 @@ fn forbidden_codex_security_args_fail_but_structured_model_reasoning_survive() {
             .unwrap_err();
         assert_eq!(error.code, PolicyViolationCode::UnsafeCodexArgument);
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn installed_codex_capability_probe_requires_exact_research_surface() {
+    let root_help = "--strict-config --sandbox read-only workspace-write --ask-for-approval never";
+    let exec_help = "--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message --json";
+    let supported = DoctorCodexFixture::new("codex-cli 0.138.0", root_help, exec_help, "");
+    assert_eq!(
+        probe_doctor_agent_runtime(&Ok(supported.policy.clone())).await,
+        DoctorAgentRuntime::Supported
+    );
+
+    let custom = DoctorCodexFixture::with_custom_agent(
+        "codex-cli 0.148.0",
+        root_help,
+        exec_help,
+        "",
+    );
+    assert_eq!(custom.policy.custom_allowlist.len(), 1);
+    assert_eq!(
+        probe_doctor_agent_runtime(&Ok(custom.policy.clone())).await,
+        DoctorAgentRuntime::Supported,
+        "a custom standard agent must not replace the pinned global Codex anchor"
+    );
+
+    let lookalike = DoctorCodexFixture::new(
+        "codex-cli 0.148.0",
+        root_help,
+        &exec_help.replace("--json", "--json-schema"),
+        "",
+    );
+    assert_eq!(
+        probe_doctor_agent_runtime(&Ok(lookalike.policy.clone())).await,
+        DoctorAgentRuntime::Blocked {
+            code: PolicyViolationCode::UnsafeCodexArgument,
+        }
+    );
+
+    let missing = [
+        (
+            "workspace-write",
+            root_help.replace(" workspace-write", ""),
+            exec_help.to_owned(),
+        ),
+        (
+            "read-only",
+            root_help.replace("read-only ", ""),
+            exec_help.to_owned(),
+        ),
+        (
+            "--ask-for-approval",
+            root_help.replace("--ask-for-approval ", ""),
+            exec_help.to_owned(),
+        ),
+        (
+            "never",
+            root_help.replace(" never", ""),
+            exec_help.to_owned(),
+        ),
+        (
+            "root --strict-config",
+            root_help.replace("--strict-config ", ""),
+            exec_help.to_owned(),
+        ),
+        (
+            "--ignore-user-config",
+            root_help.to_owned(),
+            exec_help.replace("--ignore-user-config ", ""),
+        ),
+        (
+            "--ignore-rules",
+            root_help.to_owned(),
+            exec_help.replace("--ignore-rules ", ""),
+        ),
+        (
+            "exec --strict-config",
+            root_help.to_owned(),
+            exec_help.replace("--strict-config ", ""),
+        ),
+        (
+            "--output-schema",
+            root_help.to_owned(),
+            exec_help.replace("--output-schema ", ""),
+        ),
+        (
+            "--output-last-message",
+            root_help.to_owned(),
+            exec_help.replace("--output-last-message ", ""),
+        ),
+        (
+            "--json",
+            root_help.to_owned(),
+            exec_help.replace("--json", ""),
+        ),
+    ];
+    for (missing_flag, root_help, exec_help) in missing {
+        let fixture = DoctorCodexFixture::new("codex-cli 0.148.0", &root_help, &exec_help, "");
+        let runtime = probe_doctor_agent_runtime(&Ok(fixture.policy.clone())).await;
+        assert_eq!(
+            runtime,
+            DoctorAgentRuntime::Blocked {
+                code: PolicyViolationCode::UnsafeCodexArgument,
+            },
+            "missing capability {missing_flag}"
+        );
+    }
+
+    let old_version = DoctorCodexFixture::new("codex-cli 0.137.9", root_help, exec_help, "");
+    assert_eq!(
+        probe_doctor_agent_runtime(&Ok(old_version.policy.clone())).await,
+        DoctorAgentRuntime::Blocked {
+            code: PolicyViolationCode::UnsafeCodexArgument,
+        }
+    );
+
+    for (label, version_behavior) in [
+        ("nonzero", "exit 9".to_owned()),
+        ("timeout", "/bin/sleep 5".to_owned()),
+        ("oversize", "printf '%262145s' ''".to_owned()),
+    ] {
+        let fixture = DoctorCodexFixture::new(
+            "codex-cli 0.148.0",
+            root_help,
+            exec_help,
+            &version_behavior,
+        );
+        let runtime = probe_doctor_agent_runtime(&Ok(fixture.policy.clone())).await;
+        assert_eq!(
+            runtime,
+            DoctorAgentRuntime::Blocked {
+                code: PolicyViolationCode::UnsafeCodexArgument,
+            },
+            "{label} probe"
+        );
+    }
+
+    let replaced = DoctorCodexFixture::new("codex-cli 0.148.0", root_help, exec_help, "");
+    fs::rename(&replaced.codex, replaced.codex.with_extension("old")).unwrap();
+    fs::write(&replaced.codex, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&replaced.codex, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        probe_doctor_agent_runtime(&Ok(replaced.policy.clone())).await,
+        DoctorAgentRuntime::Blocked {
+            code: PolicyViolationCode::AnchorReplaced,
+        }
+    );
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("descendant-survived");
+    let descendant = format!(
+        "( /bin/sleep 1; printf '%s\\n' survived > {} ) >/dev/null 2>&1 &",
+        shell_quote(&marker.to_string_lossy())
+    );
+    let no_survivor = DoctorCodexFixture::new(
+        "codex-cli 0.148.0",
+        root_help,
+        exec_help,
+        &descendant,
+    );
+    let runtime = probe_doctor_agent_runtime(&Ok(no_survivor.policy.clone())).await;
+    assert_eq!(
+        runtime,
+        DoctorAgentRuntime::Blocked {
+            code: PolicyViolationCode::UnsafeCodexArgument,
+        }
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    assert!(!marker.exists(), "a Codex probe process group survived");
+}
+
+#[cfg(unix)]
+struct DoctorCodexFixture {
+    _temp: TempDir,
+    policy: ResolvedExecutionPolicy,
+    #[cfg(target_os = "linux")]
+    codex: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl DoctorCodexFixture {
+    fn new(version: &str, root_help: &str, exec_help: &str, version_behavior: &str) -> Self {
+        Self::build(version, root_help, exec_help, version_behavior, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_custom_agent(
+        version: &str,
+        root_help: &str,
+        exec_help: &str,
+        version_behavior: &str,
+    ) -> Self {
+        Self::build(version, root_help, exec_help, version_behavior, true)
+    }
+
+    fn build(
+        version: &str,
+        root_help: &str,
+        exec_help: &str,
+        version_behavior: &str,
+        custom_agent: bool,
+    ) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let service_dir = project.join(".pueue-agent");
+        let bin = temp.path().join("execution-policy-bin");
+        fs::create_dir_all(&service_dir).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        for directory in [temp.path(), project.as_path(), service_dir.as_path(), bin.as_path()] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let codex = bin.join("codex");
+        fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  {version_behavior}\n  printf '%s\\n' '{version}'\n  exit 0\nfi\nif [ \"$1\" = \"--help\" ]; then\n  printf '%s\\n' '{root_help}'\n  exit 0\nfi\nif [ \"$1\" = \"exec\" ] && [ \"$2\" = \"--help\" ]; then\n  printf '%s\\n' '{exec_help}'\n  exit 0\nfi\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+        let project_program = if custom_agent {
+            let custom = bin.join("custom-standard-agent");
+            fs::write(&custom, "#!/bin/sh\nexit 19\n").unwrap();
+            fs::set_permissions(&custom, fs::Permissions::from_mode(0o700)).unwrap();
+            custom
+        } else {
+            std::path::PathBuf::from("codex")
+        };
+        let policy = execution_policy_fixture::resolved_policy(
+            temp.path(),
+            &[("doctor-project", &project, &project_program)],
+        );
+        Self {
+            _temp: temp,
+            policy: policy.as_ref().clone(),
+            #[cfg(target_os = "linux")]
+            codex,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unavailable_policy_skips_ambient_codex_probe() {
+    const CHILD_MARKER: &str = "PUEUE_AGENT_TEST_AMBIENT_CODEX_CHILD";
+    const MARKER_PATH: &str = "PUEUE_AGENT_TEST_AMBIENT_CODEX_MARKER";
+
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let unavailable = Err(PolicyViolation::new(
+            PolicyViolationCode::PolicyMissing,
+            PolicyViolationStage::Startup,
+        ));
+        assert_eq!(
+            probe_doctor_agent_runtime(&unavailable).await,
+            DoctorAgentRuntime::SkippedPolicyUnavailable
+        );
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("ambient-bin");
+    fs::create_dir(&bin).unwrap();
+    let marker = temp.path().join("ambient-codex-ran");
+    let codex = bin.join("codex");
+    fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' ran > {}\n",
+            shell_quote(&marker.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "unavailable_policy_skips_ambient_codex_probe",
+            "--nocapture",
+        ])
+        .env(CHILD_MARKER, "1")
+        .env(MARKER_PATH, &marker)
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated policy-unavailable probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!marker.exists(), "doctor executed ambient Codex without policy");
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+#[tokio::test]
+async fn installed_codex_capability_probe_fails_closed_off_linux() {
+    let fixture = DoctorCodexFixture::new(
+        "codex-cli 0.148.0",
+        "--strict-config --sandbox read-only workspace-write --ask-for-approval never",
+        "--ignore-user-config --ignore-rules --strict-config --output-schema --output-last-message --json",
+        "",
+    );
+    assert_eq!(
+        probe_doctor_agent_runtime(&Ok(fixture.policy.clone())).await,
+        DoctorAgentRuntime::Blocked {
+            code: PolicyViolationCode::UnsupportedPlatform,
+        }
+    );
 }
 
 #[test]
