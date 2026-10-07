@@ -2815,6 +2815,20 @@ impl<'db> SubmissionRepository<'db> {
             )
             .map_err(database_error("insert submission"))?;
         let stored = read_submission(&transaction, &submission.submission_id)?;
+        // A submission ID identifies one immutable intent. Replays may have a
+        // newer timestamp or status, but cannot silently reuse another
+        // project's command, metadata, or agent-run lineage.
+        if stored.project_id != submission.project_id
+            || stored.argv != submission.argv
+            || stored.kind != submission.kind
+            || stored.metadata != submission.metadata
+            || stored.origin_agent_run_id != submission.origin_agent_run_id
+        {
+            return Err(AppError::Validation {
+                field: "submission_id",
+                message: "conflicts with the existing submission intent",
+            });
+        }
         transaction
             .commit()
             .map_err(database_error("commit idempotent submission insert"))?;
@@ -7146,7 +7160,8 @@ impl<'db> TaskObservationRepository<'db> {
                     END,
                     ended_at = excluded.ended_at,
                     result = excluded.result,
-                    observed_at = excluded.observed_at",
+                    observed_at = excluded.observed_at
+                 WHERE excluded.observed_at >= task_observations.observed_at",
                 params![
                     observation.project_id,
                     observation.task_signature,

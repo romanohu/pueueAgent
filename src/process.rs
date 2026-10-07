@@ -1,9 +1,9 @@
-//! The bounded control codec used by the native launch helper.
+//! The bounded native launch protocol and owned subprocess lifecycle.
 //!
-//! This module intentionally contains no process creation.  The supervisor
-//! and the hidden helper exchange one complete, length-delimited frame over a
-//! pipe.  Keeping the codec separate from launch code makes it possible to
-//! validate the untrusted byte stream before any target descriptor is used.
+//! The supervisor and hidden helper exchange a length-delimited control
+//! frame and verified descriptors. The codec validates untrusted bytes before
+//! target descriptors are used, while process-group ownership keeps leaders
+//! unreaped until the final group signal has been issued.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -910,90 +910,55 @@ impl VerifiedChild {
         let Some(group) = self.process_group.id() else {
             return self.verify_pending_group_quiescence_blocking();
         };
-        let signal = unsafe { libc::kill(-group, libc::SIGTERM) };
-        if signal < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(AppError::Io {
-                    operation: "terminate verified child process group",
-                    source: error,
-                });
-            }
+        if self.terminal_observed()? == TerminalObservation::OwnershipLost {
+            return self.verify_pending_group_quiescence_blocking();
         }
+        signal_owned_process_group(self, group, libc::SIGTERM)?;
         // Do not wait indefinitely on a misbehaving descendant.  Escalate
         // immediately after the bounded grace; the leader is always reaped
         // before this method returns.
         let deadline = Instant::now()
             .checked_add(PROCESS_GROUP_TERM_GRACE)
             .unwrap_or_else(Instant::now);
-        let mut leader_reaped = false;
         while Instant::now() < deadline {
-            let result = unsafe { libc::waitpid(self.pid as libc::pid_t, ptr::null_mut(), libc::WNOHANG) };
-            if result == self.pid as libc::pid_t {
-                leader_reaped = true;
-                break;
-            }
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ECHILD) {
-                    leader_reaped = true;
-                    break;
-                }
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(AppError::Io {
-                        operation: "observe verified child termination",
-                        source: error,
-                    });
+            match self.terminal_observed()? {
+                TerminalObservation::Terminal => break,
+                TerminalObservation::Running => {}
+                TerminalObservation::OwnershipLost => {
+                    return self.verify_pending_group_quiescence_blocking();
                 }
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        if !leader_reaped {
-            let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
-            loop {
-                let result = unsafe { libc::waitpid(self.pid as libc::pid_t, ptr::null_mut(), 0) };
-                if result == self.pid as libc::pid_t {
+
+        // Keep the leader unreaped until the final group signal. Reaping it
+        // first releases the PID/PGID reservation and could let this signal
+        // target an unrelated process group after identifier reuse.
+        signal_owned_process_group(self, group, libc::SIGKILL)?;
+        loop {
+            let result = unsafe { libc::waitpid(self.pid as libc::pid_t, ptr::null_mut(), 0) };
+            if result == self.pid as libc::pid_t {
+                break;
+            }
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.raw_os_error() == Some(libc::ECHILD) {
                     break;
                 }
-                if result < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    if error.raw_os_error() == Some(libc::ECHILD) {
-                        break;
-                    }
-                    return Err(AppError::Io {
-                        operation: "reap verified child after cancellation",
-                        source: error,
-                    });
-                }
+                return Err(AppError::Io {
+                    operation: "reap verified child after cancellation",
+                    source: error,
+                });
             }
         }
-        // Once the leader is reaped, force any remaining group member down
-        // and wait a short bounded interval for the kernel to retire it.
-        let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
-        let settle_deadline = Instant::now()
-            .checked_add(Duration::from_secs(1))
-            .unwrap_or_else(Instant::now);
-        while Instant::now() < settle_deadline {
-            match unsafe { libc::kill(-group, 0) } {
-                0 => std::thread::sleep(Duration::from_millis(5)),
-                -1 if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) => break,
-                -1 => return Err(AppError::Io {
-                    operation: "verify verified child process-group quiescence",
-                    source: io::Error::last_os_error(),
-                }),
-                _ => {}
-            }
-        }
-        if unsafe { libc::kill(-group, 0) } == 0 {
-            return Err(AppError::Runtime {
-                operation: "retain verified child process group for recovery",
-            });
-        }
+        // Failed quiescence checks retain observation authority only. Neither
+        // a retry nor Drop may signal a group after its leader was reaped.
+        self.remember_group_for_quiescence(Some(group));
         self.process_group.release();
-        Ok(())
+        self.verify_pending_group_quiescence_blocking()
     }
 
     pub fn release(&mut self) -> Result<(), AppError> {
@@ -1100,6 +1065,116 @@ impl VerifiedChild {
             }
         }
     }
+
+    /// A capability probe must finish without leaving another group member.
+    /// Observe that condition before normal cleanup signals the group, while
+    /// the unreaped leader still reserves the group identifier.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn wait_for_probe(&mut self) -> Result<ExitStatus, AppError> {
+        loop {
+            match self.terminal_observed()? {
+                TerminalObservation::Running => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                TerminalObservation::Terminal => {
+                    let group = self.process_group.id().ok_or(AppError::Runtime {
+                        operation: "observe capability probe process-group ownership",
+                    })?;
+                    let membership = probe_group_has_other_members(group, self.pid);
+                    let status = self.reap_after_terminal_group_cleanup().await?;
+                    if membership? {
+                        return Err(AppError::Runtime {
+                            operation: "reject capability probe with remaining group members",
+                        });
+                    }
+                    return Ok(status);
+                }
+                TerminalObservation::OwnershipLost => {
+                    return Err(AppError::Runtime {
+                        operation: "wait for capability probe after ownership loss",
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_group_has_other_members(group: libc::pid_t, leader: i64) -> Result<bool, AppError> {
+    let io_error = |source| AppError::Io {
+        operation: "inspect capability probe process-group members",
+        source,
+    };
+    let own_pid = unsafe { libc::getpid() }.to_string();
+    if std::fs::read_link("/proc/self").map_err(io_error)? != std::path::Path::new(&own_pid) {
+        return Err(AppError::Runtime {
+            operation: "reject capability probe with mismatched procfs PID namespace",
+        });
+    }
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").map_err(io_error)?;
+    if !probe_procfs_is_unfiltered(&mountinfo) {
+        return Err(AppError::Runtime {
+            operation: "reject capability probe with filtered procfs visibility",
+        });
+    }
+    let mut saw_leader = false;
+    for entry in std::fs::read_dir("/proc").map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<libc::pid_t>() else {
+            continue;
+        };
+        if i64::from(pid) == leader {
+            saw_leader = true;
+            continue;
+        }
+        if pid <= 0 {
+            continue;
+        }
+        let candidate_group = unsafe { libc::getpgid(pid) };
+        if candidate_group == group {
+            return Ok(true);
+        }
+        if candidate_group == -1 {
+            let error = io::Error::last_os_error();
+            // A process may exit between the directory scan and getpgid.
+            // Other observation failures cannot establish probe quiescence.
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(io_error(error));
+            }
+        }
+    }
+    if !saw_leader {
+        return Err(AppError::Runtime {
+            operation: "reject capability probe with invisible reserved leader",
+        });
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn probe_procfs_is_unfiltered(mountinfo: &str) -> bool {
+    let mut saw_procfs = false;
+    for line in mountinfo.lines() {
+        let Some((mount, filesystem)) = line.split_once(" - ") else {
+            return false;
+        };
+        if mount.split_ascii_whitespace().nth(4) != Some("/proc") {
+            continue;
+        }
+        let fields = filesystem.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3 || fields[0] != "proc" {
+            return false;
+        }
+        // hidepid can silently omit processes, so a successful directory scan
+        // is insufficient evidence on a filtered procfs. Fail closed there.
+        if fields[2].split(',').any(|option| {
+            option.starts_with("hidepid=") && option != "hidepid=0" && option != "hidepid=off"
+        }) {
+            return false;
+        }
+        saw_procfs = true;
+    }
+    saw_procfs
 }
 
 #[cfg(unix)]
@@ -1215,6 +1290,56 @@ fn verify_process_group_quiescence_after_reap_blocking(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Start a short, read-only capability probe of a pinned native executable.
+/// The normal marker/release protocol is not used for these startup probes,
+/// but they retain the same unreaped process-group ownership and Drop cleanup.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_pinned_probe(
+    anchor: &ExecutableAnchor,
+    argv: &[&str],
+) -> Result<VerifiedChild, AppError> {
+    use std::os::unix::process::CommandExt;
+
+    let _guard = process_launch_guard()
+        .map_err(|_| native_gate_error(PolicyViolationStage::NativeGate))?;
+    let executable = anchor.verify_identity()?;
+    let mut command = StdCommand::new(format!("/proc/self/fd/{}", executable.file.as_raw_fd()));
+    command
+        .args(argv)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut command = tokio::process::Command::from(command);
+    // VerifiedChild must signal the owned group before Tokio can reap its
+    // leader. Its Drop implementation also covers cancelled probe futures.
+    command.kill_on_drop(false);
+    let child = command.spawn().map_err(|source| AppError::Io {
+        operation: "spawn pinned capability probe",
+        source,
+    })?;
+    let pid = child.id().ok_or(AppError::Runtime {
+        operation: "read pinned capability probe process ID",
+    })? as i64;
+    Ok(VerifiedChild {
+        child,
+        pid,
+        process_group: ProcessGroupOwnership::Owned(OwnedProcessGroup(pid)),
+        group_quiescence_pending: None,
+        start_gate: StartGate { writer: None },
+        exec_status: ExecStatusReceiver { reader: None },
+        ack: AckReceiver { reader: None },
+        capture: true,
+        released: true,
+        exec_confirmed: true,
+        #[cfg(test)]
+        injected_group_signal_error: false,
+        #[cfg(test)]
+        force_ownership_loss_before_reap: false,
+    })
 }
 
 #[cfg(all(test, unix))]
@@ -4468,6 +4593,32 @@ mod tests {
         let _ = accepts_public_api as fn(VerifiedCommandSpec);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capability_probe_rejects_filtered_or_unverifiable_procfs_views() {
+        for options in ["rw", "rw,hidepid=0", "rw,hidepid=off"] {
+            assert!(probe_procfs_is_unfiltered(&format!(
+                "25 1 0:5 / /proc rw,nosuid - proc proc {options}\n"
+            )));
+        }
+        for options in ["rw,hidepid=1", "rw,hidepid=2", "rw,hidepid=4", "rw,hidepid=invisible"] {
+            assert!(!probe_procfs_is_unfiltered(&format!(
+                "25 1 0:5 / /proc rw,nosuid - proc proc {options}\n"
+            )));
+        }
+        assert!(!probe_procfs_is_unfiltered(""));
+        assert!(!probe_procfs_is_unfiltered("malformed"));
+        assert!(!probe_procfs_is_unfiltered(
+            "25 1 0:5 / /proc rw - tmpfs tmpfs rw\n"
+        ));
+        assert!(!probe_procfs_is_unfiltered(
+            "25 1 0:5 / /other rw - proc proc rw\n"
+        ));
+        assert!(!probe_procfs_is_unfiltered(
+            "25 1 0:5 / /proc rw - proc proc rw\n26 25 0:6 / /proc rw - proc proc rw,hidepid=4\n"
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn startup_process_quiescence_reports_current_process_live() {
@@ -4825,6 +4976,59 @@ mod tests {
         child.terminate_and_reap_blocking().unwrap();
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocking_cleanup_never_signals_a_group_after_child_ownership_is_lost() {
+        let mut child = observation_child("exit");
+        await_terminal_observation(&mut child).await;
+        child.child.wait().await.unwrap();
+
+        let mut sentinel = observation_child("hold");
+        let sentinel_pid = sentinel.pid as libc::pid_t;
+        // Model identifier reuse after an external reaper consumed the owned
+        // leader. The recorded group must become observation-only on ECHILD.
+        child.process_group =
+            ProcessGroupOwnership::Owned(OwnedProcessGroup(sentinel.pid));
+        assert!(child.terminate_and_reap_blocking().is_err());
+        assert!(matches!(child.process_group, ProcessGroupOwnership::Released));
+        assert_eq!(child.group_quiescence_pending, Some(sentinel_pid));
+        drop(child);
+        assert_eq!(sentinel.terminal_observed().unwrap(), TerminalObservation::Running);
+        terminate_process_group(&mut sentinel).await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn blocking_cleanup_retains_only_observation_after_reaping_its_leader() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = observation_child("hold");
+        let group = child.pid as libc::pid_t;
+        let mut sibling = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "process::tests::terminal_observation_subprocess",
+                "--nocapture",
+            ])
+            .env("PUEUE_AGENT_OBSERVATION_MODE", "hold")
+            .process_group(group)
+            .spawn()
+            .unwrap();
+
+        // A terminated but deliberately unreaped sibling keeps the group
+        // present, forcing the post-reap quiescence check to remain uncertain.
+        let cleanup = child.terminate_and_reap_blocking();
+        let released = matches!(child.process_group, ProcessGroupOwnership::Released);
+        let pending = child.group_quiescence_pending;
+        sibling.wait().unwrap();
+        assert!(cleanup.is_err());
+        assert!(released, "reaped leader retained process-group signal authority");
+        assert_eq!(pending, Some(group));
+        child.terminate_and_reap_blocking().unwrap();
+        assert_eq!(child.group_quiescence_pending, None);
     }
 
     #[cfg(unix)]

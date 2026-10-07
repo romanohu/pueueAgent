@@ -27,8 +27,6 @@ use crate::{
 };
 
 #[cfg(target_os = "linux")]
-use std::{os::fd::AsRawFd, os::unix::process::CommandExt, process::Stdio};
-#[cfg(target_os = "linux")]
 use tokio::io::AsyncReadExt;
 
 /// Capabilities discovered from the installed Codex CLI.
@@ -192,54 +190,46 @@ async fn probe_pinned_codex(
     const MAX_PROBE_BYTES: u64 = 256 * 1024;
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-    let verified = anchor.verify_identity().map_err(pre_binding_violation)?;
-    let program = format!("/proc/self/fd/{}", verified.file.as_raw_fd());
-    let mut command = std::process::Command::new(program);
-    command
-        .args(args)
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    command.process_group(0);
-    let mut command = tokio::process::Command::from(command);
-    command.kill_on_drop(true);
-    let mut child = command.spawn().map_err(|_| unsafe_argument())?;
-    let pid = child.id().ok_or_else(unsafe_argument)? as libc::pid_t;
-    let stdout = child.stdout.take().ok_or_else(unsafe_argument)?;
-    let reader = tokio::spawn(async move {
+    anchor.verify_identity().map_err(pre_binding_violation)?;
+    let mut child = crate::process::spawn_pinned_probe(anchor, args)
+        .map_err(|_| unsafe_argument())?;
+    let stdout = child.take_stdout().map_err(|_| unsafe_argument())?;
+    // Both futures stay owned by this probe. A timeout or caller cancellation
+    // drops the reader instead of detaching a task with an open pipe, while
+    // VerifiedChild retains group signal authority until its leader is reaped.
+    let reader = async move {
         let mut bytes = Vec::new();
         stdout
             .take(MAX_PROBE_BYTES + 1)
             .read_to_end(&mut bytes)
             .await
-            .map(|_| bytes)
-    });
-    let status = match tokio::time::timeout(PROBE_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) => status,
+            .map_err(|_| unsafe_argument())?;
+        if bytes.len() as u64 > MAX_PROBE_BYTES {
+            return Err(unsafe_argument());
+        }
+        Ok(bytes)
+    };
+    let outcome = tokio::time::timeout(PROBE_TIMEOUT, async {
+        tokio::try_join!(
+            async { child.wait_for_probe().await.map_err(|_| unsafe_argument()) },
+            reader,
+        )
+    })
+    .await;
+    let (status, bytes) = match outcome {
+        Ok(Ok(output)) => output,
         Ok(Err(_)) | Err(_) => {
-            unsafe { libc::kill(-pid, libc::SIGKILL); }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            reader.abort();
+            // An exhausted probe budget grants no new grace period. Signal
+            // the group before reaping and fail closed if cleanup is uncertain.
+            let _ = crate::process::terminate_process_group_before(
+                &mut child,
+                std::time::Instant::now(),
+            )
+            .await;
             return Err(unsafe_argument());
         }
     };
-    let bytes = match tokio::time::timeout(PROBE_TIMEOUT, reader).await {
-        Ok(Ok(Ok(bytes))) => bytes,
-        Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
-            unsafe { libc::kill(-pid, libc::SIGKILL); }
-            return Err(unsafe_argument());
-        }
-    };
-    if !status.success() || bytes.len() as u64 > MAX_PROBE_BYTES {
-        return Err(unsafe_argument());
-    }
-    if unsafe { libc::kill(-pid, 0) } == 0 {
-        unsafe { libc::kill(-pid, libc::SIGKILL); }
-        return Err(unsafe_argument());
-    }
-    if std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+    if !status.success() {
         return Err(unsafe_argument());
     }
     anchor.verify_identity().map_err(pre_binding_violation)?;
@@ -930,6 +920,135 @@ mod tests {
         )
         .unwrap()
         .supports_research_policy());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_fixture() -> (ExecutableAnchor, TempDir) {
+        let temporary = tempdir().unwrap();
+        let executable = temporary.path().join("probe-shell");
+        fs::copy("/bin/sh", &executable).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let anchor = ExecutableAnchor::from_absolute(&executable, &[]).unwrap();
+        (anchor, temporary)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn probe_with_owned_sibling(
+        tail: &'static str,
+    ) -> (
+        tokio::task::JoinHandle<Result<String, PolicyViolation>>,
+        tokio::process::Child,
+        TempDir,
+    ) {
+        use std::{os::unix::process::CommandExt, process::Stdio, time::Duration};
+
+        let (anchor, temporary) = probe_fixture();
+        let pid_path = temporary.path().join("probe.pid");
+        let release_path = temporary.path().join("release");
+        let pid_arg = pid_path.to_str().unwrap().to_owned();
+        let release_arg = release_path.to_str().unwrap().to_owned();
+        let probe = tokio::spawn(async move {
+            let script = format!(
+                "printf '%s' \"$$\" > \"$1\"; \
+                 while [ ! -f \"$2\" ]; do /bin/sleep 0.01; done; {tail}"
+            );
+            probe_pinned_codex(
+                &anchor,
+                &["-c", &script, "probe-fixture", &pid_arg, &release_arg],
+            )
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let pid = loop {
+            if let Ok(contents) = fs::read_to_string(&pid_path) {
+                if let Ok(pid) = contents.parse::<libc::pid_t>() {
+                    break pid;
+                }
+            }
+            assert!(tokio::time::Instant::now() < deadline, "probe did not start");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        // Keep this group member owned by the test so no orphan/zombie or
+        // system-wide subreaper setting is needed to verify descendant cleanup.
+        let mut command = std::process::Command::new("/bin/sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(pid);
+        let mut command = tokio::process::Command::from(command);
+        command.kill_on_drop(true);
+        let sibling = command.spawn().unwrap();
+        assert_eq!(unsafe { libc::getpgid(sibling.id().unwrap() as libc::pid_t) }, pid);
+        fs::write(release_path, b"release").unwrap();
+        (probe, sibling, temporary)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pinned_probe_collects_valid_output_and_rejects_failed_or_invalid_output() {
+        let (anchor, _temporary) = probe_fixture();
+        assert_eq!(probe_pinned_codex(&anchor, &["-c", "printf fixture"]).await.unwrap(), "fixture");
+        assert!(probe_pinned_codex(&anchor, &["-c", "exit 7"]).await.is_err());
+        assert!(probe_pinned_codex(&anchor, &["-c", "printf '\\377'"]).await.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_pinned_probe_terminates_its_remaining_process_group() {
+        let (probe, mut sibling, _temporary) = probe_with_owned_sibling("exit 7").await;
+        let (result, terminated) = tokio::join!(
+            probe,
+            tokio::time::timeout(std::time::Duration::from_secs(3), sibling.wait()),
+        );
+        assert!(result.unwrap().is_err());
+        assert!(terminated.is_ok(), "failed probe left a group member running");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn successful_pinned_probe_rejects_its_remaining_process_group() {
+        let (probe, mut sibling, _temporary) =
+            probe_with_owned_sibling("printf fixture; exit 0").await;
+        let (result, terminated) = tokio::join!(
+            probe,
+            tokio::time::timeout(std::time::Duration::from_secs(3), sibling.wait()),
+        );
+        assert!(result.unwrap().is_err(), "probe accepted a remaining group member");
+        assert!(terminated.is_ok(), "successful probe left a group member running");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelled_pinned_probe_terminates_its_remaining_process_group() {
+        let (probe, mut sibling, _temporary) =
+            probe_with_owned_sibling("exec /bin/sleep 30").await;
+        probe.abort();
+        assert!(probe.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), sibling.wait())
+                .await
+                .is_ok(),
+            "cancelled probe left a group member running",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn oversized_pinned_probe_output_terminates_without_waiting_for_exit() {
+        let (probe, mut sibling, _temporary) =
+            probe_with_owned_sibling("/usr/bin/head -c 262145 /dev/zero; exec /bin/sleep 30")
+                .await;
+        let started = std::time::Instant::now();
+        let (result, terminated) = tokio::join!(
+            probe,
+            tokio::time::timeout(std::time::Duration::from_secs(3), sibling.wait()),
+        );
+        assert!(result.unwrap().is_err());
+        assert!(terminated.is_ok(), "oversized probe left a group member running");
+        assert!(started.elapsed() < std::time::Duration::from_millis(1500));
     }
 
     #[cfg(target_os = "linux")]

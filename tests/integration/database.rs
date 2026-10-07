@@ -20261,3 +20261,219 @@ fn metrics_repository_upsert_updates_single_row_and_get_missing_returns_none() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn submission_idempotency_rejects_conflicting_immutable_intent() {
+    let test = TestDatabase::new();
+    for project_id in ["project-a", "project-b"] {
+        let root = test.project_root(project_id);
+        register_project(&test.db, project_id, &root, &format!("pa-{project_id}"));
+    }
+    let repository = SubmissionRepository::new(&test.db);
+    let original = NewSubmission::new(
+        "immutable-submission",
+        "project-a",
+        vec!["python".to_owned(), "train.py".to_owned()],
+        100,
+    );
+    repository.insert_idempotent(&original).unwrap();
+    let accepted = repository
+        .mark_accepted(&original.submission_id, 41, "task-41")
+        .unwrap();
+
+    let event_id = insert_event(&test.db, "project-a", "submission-origin", 100);
+    let run = AgentRunRepository::new(&test.db)
+        .insert(&NewAgentRun::new(
+            "project-a",
+            event_id,
+            None,
+            AgentRunStatus::Starting,
+            100,
+            "/tmp/immutable-submission.log",
+        ))
+        .unwrap();
+    for conflicting in [
+        NewSubmission {
+            project_id: "project-b".to_owned(),
+            ..original.clone()
+        },
+        NewSubmission {
+            argv: vec!["different-command".to_owned()],
+            ..original.clone()
+        },
+        NewSubmission {
+            kind: SubmissionKind::Control,
+            ..original.clone()
+        },
+        NewSubmission {
+            metadata: json!({"changed": true}),
+            ..original.clone()
+        },
+        NewSubmission {
+            origin_agent_run_id: Some(run.run_id),
+            ..original.clone()
+        },
+    ] {
+        assert!(matches!(
+            repository.insert_idempotent(&conflicting),
+            Err(AppError::Validation {
+                field: "submission_id",
+                ..
+            })
+        ));
+        assert_eq!(
+            repository
+                .find_by_id(&original.submission_id)
+                .unwrap()
+                .unwrap(),
+            accepted
+        );
+    }
+
+    // A replay does not reset durable state or replace its original timestamp.
+    let replay = NewSubmission {
+        created_at: 200,
+        ..original
+    };
+    assert_eq!(repository.insert_idempotent(&replay).unwrap(), accepted);
+}
+
+#[test]
+fn task_observation_ignores_out_of_order_snapshots() {
+    let test = TestDatabase::new();
+    let root = test.project_root("project");
+    register_project(&test.db, "project-a", &root, "pa-project");
+    let repository = TaskObservationRepository::new(&test.db);
+    let running = NewTaskObservation::new(
+        "project-a",
+        "signature-a",
+        41,
+        "pa-project",
+        vec!["python".to_owned(), "train.py".to_owned()],
+        "running",
+        Some(90),
+        Some(100),
+        None,
+        None,
+        110,
+    );
+    repository.upsert(&running).unwrap();
+    let terminal = NewTaskObservation {
+        state: "finished".to_owned(),
+        ended_at: Some(120),
+        result: Some("success".to_owned()),
+        observed_at: 130,
+        ..running.clone()
+    };
+    let latest = repository.upsert(&terminal).unwrap();
+
+    let stale = NewTaskObservation {
+        observed_at: 125,
+        ..running
+    };
+    assert_eq!(repository.upsert(&stale).unwrap(), latest);
+    assert_eq!(
+        repository.find("project-a", "signature-a").unwrap(),
+        Some(latest)
+    );
+    assert_eq!(
+        repository.first_observed_at("project-a", "signature-a").unwrap(),
+        Some(110)
+    );
+
+    // Equal-timestamp observations retain the existing last-writer semantics.
+    let corrected = NewTaskObservation {
+        result: Some("corrected".to_owned()),
+        ..terminal
+    };
+    assert_eq!(
+        repository.upsert(&corrected).unwrap().result.as_deref(),
+        Some("corrected")
+    );
+}
+
+#[test]
+fn health_diagnosis_selection_reaches_eligible_rows_after_exhausted_prefix() {
+    let harness = CampaignDbHarness::with_experiment(ExperimentStatus::Accepted);
+    let connection = harness.db.connect().unwrap();
+    // Reuse a valid campaign/proposal lineage for independent selector fixtures.
+    // Every row has matching accepted experiment/submission identities; foreign
+    // keys stay enabled while creating the exhausted diagnosis backlog.
+    for ordinal in 0..12 {
+        let experiment_id = format!("health-candidate-{ordinal:02}");
+        let submission_id = format!("health-submission-{ordinal:02}");
+        let signature = format!("health-task-{ordinal:02}");
+        connection
+            .execute(
+                "INSERT INTO submissions (
+                    submission_id, project_id, argv_json, created_at, status,
+                    kind, metadata_json, pueue_task_id, task_signature
+                 ) VALUES (?1, ?2, '[\"python\",\"train.py\"]', 100, 'accepted',
+                           'experiment', '{}', ?3, ?4)",
+                params![submission_id, harness.project_id, 100 + ordinal, signature],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO experiments (
+                    experiment_id, campaign_id, proposal_id, submission_id, attempt,
+                    status, created_at, updated_at, pueue_task_id, task_signature
+                 ) VALUES (?1, ?2, 'proposal-baseline', ?3, ?4, 'accepted', 100, 100, ?5, ?6)",
+                params![
+                    experiment_id,
+                    harness.campaign_id,
+                    submission_id,
+                    ordinal + 1,
+                    100 + ordinal,
+                    signature,
+                ],
+            )
+            .unwrap();
+        HealthRepository::ensure_running(
+            &harness.db,
+            &harness.project_id,
+            &harness.campaign_id,
+            &experiment_id,
+            100 + ordinal,
+            100,
+        )
+        .unwrap();
+        let diagnosis_json = match ordinal {
+            0..=8 => Some(r#"{"attempt":3}"#),
+            9 => Some(r#"{"attempt":2}"#),
+            10 => Some("malformed diagnostic evidence"),
+            _ => None,
+        };
+        connection
+            .execute(
+                "UPDATE running_health SET state = 'suspicious', diagnosis_json = ?1,
+                     updated_at = ?2 WHERE experiment_id = ?3",
+                params![diagnosis_json, 200 + ordinal, experiment_id],
+            )
+            .unwrap();
+    }
+
+    let due = HealthRepository::due_diagnoses(&harness.db, 2).unwrap();
+    assert_eq!(
+        due.iter()
+            .map(|row| row.experiment_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["health-candidate-09", "health-candidate-10"]
+    );
+    let all = HealthRepository::due_diagnoses(&harness.db, 10).unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[2].experiment_id, "health-candidate-11");
+    assert!(HealthRepository::due_diagnoses(&harness.db, 0)
+        .unwrap()
+        .is_empty());
+
+    let blocked = BTreeSet::from([harness.project_id.clone()]);
+    assert!(HealthRepository::due_diagnoses_excluding_projects(&harness.db, 2, &blocked)
+        .unwrap()
+        .is_empty());
+    let unrelated = BTreeSet::from(["other-project".to_owned(), "another-project".to_owned()]);
+    assert_eq!(
+        HealthRepository::due_diagnoses_excluding_projects(&harness.db, 2, &unrelated).unwrap(),
+        due
+    );
+}

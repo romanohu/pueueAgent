@@ -264,7 +264,7 @@ impl HealthRepository {
     }
 
     /// Suspicious rows excluding projects whose native cleanup owner is still
-    /// unresolved.  The project filter is part of the bounded SQL prefix so a
+    /// unresolved.  The project filter is part of the SQL selection so a
     /// blocked oldest row cannot consume this pass's diagnosis capacity.
     pub fn due_diagnoses_excluding_projects(
         db: &Db,
@@ -274,7 +274,6 @@ impl HealthRepository {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let fetch_limit = i64::try_from(limit.saturating_mul(4).max(limit)).unwrap_or(i64::MAX);
         let connection = db.connect()?;
         let mut query = format!(
             "{RUNNING_HEALTH_SELECT}
@@ -284,30 +283,36 @@ impl HealthRepository {
             query.push_str(" AND project_id NOT IN (");
             query.push_str(
                 &(0..blocked_projects.len())
-                    .map(|index| format!("?{}", index + 2))
+                    .map(|index| format!("?{}", index + 1))
                     .collect::<Vec<_>>()
                     .join(","),
             );
             query.push(')');
         }
-        query.push_str(" ORDER BY updated_at, experiment_id LIMIT ?1");
+        query.push_str(" ORDER BY updated_at, experiment_id");
         let mut statement = connection
             .prepare(&query)
             .map_err(database_error("prepare due running health diagnoses query"))?;
-        let mut values: Vec<&dyn ToSql> = Vec::with_capacity(blocked_projects.len() + 1);
-        values.push(&fetch_limit);
+        let mut values: Vec<&dyn ToSql> = Vec::with_capacity(blocked_projects.len());
         values.extend(blocked_projects.iter().map(|project| project as &dyn ToSql));
         let rows = statement
             .query_map(params_from_iter(values), read_running_health_row)
             .map_err(database_error("query due running health diagnoses"))?;
-        let rows = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(database_error("read due running health diagnoses"))?;
-        Ok(rows
-            .into_iter()
-            .filter(|row| row.diagnosis_attempt_count() < crate::models::MAX_DIAGNOSIS_ATTEMPTS)
-            .take(limit)
-            .collect())
+        // Exhausted rows intentionally remain suspicious so their failure
+        // history stays visible. A fixed SQL prefix can therefore permanently
+        // hide eligible rows behind them. Stream through the candidates using
+        // the canonical JSON parser and retain only the requested eligible rows.
+        let mut eligible = Vec::new();
+        for row in rows {
+            let row = row.map_err(database_error("read due running health diagnoses"))?;
+            if row.diagnosis_attempt_count() < crate::models::MAX_DIAGNOSIS_ATTEMPTS {
+                eligible.push(row);
+                if eligible.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(eligible)
     }
 
     /// ActionPending rows carrying a stored diagnosis, oldest update first.
