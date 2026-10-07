@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  shell:
+    name: Shell entry points
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check shell syntax
+        run: |
+          bash -n install.sh bin/pueue-agent
+          find tests -name '*.sh' -print0 | xargs -0 -r -n 1 bash -n
+      - name: Test installer and development launcher without services
+        run: bash tests/shell/install_and_launcher.sh
+
+  format:
+    name: Rust formatting (baseline diagnostic)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install official stable Rust formatting tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      # The existing Stage 3 verification records a failing formatting baseline.
+      # Keep this visible without blocking semantic checks until it is normalized.
+      - name: Report formatting debt
+        id: format
+        continue-on-error: true
+        run: cargo +stable fmt --all -- --check
+      - name: Explain existing formatting baseline
+        if: steps.format.outcome == 'failure'
+        run: echo '::warning::Rust formatting differs from rustfmt. See docs/development-ja.md before making this a required gate.'
+
+  rust:
+    name: Rust checks and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install official stable Rust tooling
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Check all targets with the committed lockfile
+        run: cargo +stable check --locked --all-targets
+      - name: Clippy
+        run: cargo +stable clippy --locked --all-targets
+      - name: Unit and integration tests
+        run: cargo +stable test --locked --all-targets -- --test-threads=1

@@ -131,9 +131,10 @@ cargo fmt --check
 cargo check --all-targets
 cargo test --all-targets -- --test-threads=1
 bash -n install.sh bin/pueue-agent
+bash tests/shell/install_and_launcher.sh
 ```
 
-実装の入口と状態遷移は[内部アーキテクチャ](docs/architecture-ja.md)にまとめています。
+Rust 不要の shell 回帰テスト、CI、lockfile を固定した検証手順は[開発ガイド](docs/development-ja.md)を参照してください。実装の入口と状態遷移は[内部アーキテクチャ](docs/architecture-ja.md)にまとめています。
 
 ## ライセンス
 

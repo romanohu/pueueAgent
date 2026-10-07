@@ -871,14 +871,19 @@ $context"
   fake_bin="$BATS_TEST_TMPDIR/bin"
   prefix="$BATS_TEST_TMPDIR/install"
   cargo_log="$BATS_TEST_TMPDIR/cargo.log"
-  mkdir -p "$fake_bin"
+  fixture_repo="$BATS_TEST_TMPDIR/repository"
+  mkdir -p "$fake_bin" "$fixture_repo/target/release"
+  cp "$REPO_ROOT/install.sh" "$fixture_repo/install.sh"
+  : > "$fixture_repo/Cargo.toml"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fixture_repo/target/release/pueue-agent"
+  chmod +x "$fixture_repo/target/release/pueue-agent"
   printf '%s\n' '#!/usr/bin/env bash' \
     "printf '%s\\n' \"\$*\" > \"\$TEST_CARGO_LOG\"" \
     > "$fake_bin/cargo"
   chmod +x "$fake_bin/cargo"
 
   if env -u CARGO_TARGET_DIR TEST_CARGO_LOG="$cargo_log" PA_INSTALL_PREFIX="$prefix" \
-    PATH="$fake_bin:/usr/bin:/bin" bash "$REPO_ROOT/install.sh"; then
+    PATH="$fake_bin:/usr/bin:/bin" bash "$fixture_repo/install.sh"; then
     status=0
   else
     status=$?
@@ -886,17 +891,19 @@ $context"
 
   [ "$status" -eq 0 ]
   [ -L "$prefix/pueue-agent" ]
-  [ "$(readlink "$prefix/pueue-agent")" = "$REPO_ROOT/target/release/pueue-agent" ]
-  [ "$(cat "$cargo_log")" = "build --locked --release --manifest-path $REPO_ROOT/Cargo.toml" ]
+  [ "$(readlink "$prefix/pueue-agent")" = "$fixture_repo/target/release/pueue-agent" ]
+  [ -x "$prefix/pueue-agent" ]
+  [ "$(cat "$cargo_log")" = "build --locked --release --manifest-path $fixture_repo/Cargo.toml --target-dir $fixture_repo/target" ]
 }
 
 @test "installer honors an absolute Cargo target directory" {
   fake_bin="$BATS_TEST_TMPDIR/bin"
   prefix="$BATS_TEST_TMPDIR/install"
   cargo_target="$BATS_TEST_TMPDIR/cargo-target"
-  mkdir -p "$fake_bin"
+  mkdir -p "$fake_bin" "$cargo_target/release"
   printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$fake_bin/cargo"
-  chmod +x "$fake_bin/cargo"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$cargo_target/release/pueue-agent"
+  chmod +x "$fake_bin/cargo" "$cargo_target/release/pueue-agent"
 
   run env CARGO_TARGET_DIR="$cargo_target" PA_INSTALL_PREFIX="$prefix" \
     PATH="$fake_bin:/usr/bin:/bin" bash "$REPO_ROOT/install.sh"
@@ -904,4 +911,5 @@ $context"
   [ "$status" -eq 0 ]
   [ -L "$prefix/pueue-agent" ]
   [ "$(readlink "$prefix/pueue-agent")" = "$cargo_target/release/pueue-agent" ]
+  [ -x "$prefix/pueue-agent" ]
 }

@@ -707,6 +707,15 @@ fn redact_sensitive_tokens(
             continue;
         }
 
+        // Check provider credentials before preserving any assignment label:
+        // a credential-shaped string can itself appear as a key or flag.
+        if is_bare_secret_token(&token.value) {
+            redacted.push("[REDACTED]".to_owned());
+            redacted_any = true;
+            index += 1;
+            continue;
+        }
+
         if let Some((key, _)) = token.value.split_once('=') {
             if is_sensitive_key(key) {
                 redacted.push(format!("{key}=[REDACTED]"));
@@ -810,13 +819,6 @@ fn redact_sensitive_tokens(
                 redact_next = true;
                 index += 1;
             }
-            continue;
-        }
-
-        if is_bare_secret_token(&token.value) {
-            redacted.push("[REDACTED]".to_owned());
-            redacted_any = true;
-            index += 1;
             continue;
         }
 
@@ -990,15 +992,25 @@ fn is_session_id_punctuation(character: char) -> bool {
 }
 
 fn is_bare_secret_token(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    let prefix = ["ghp_", "github_pat_", "sk-", "xoxb-", "xoxp-", "akia"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix));
-    prefix
-        && value.len() >= 20
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    // Logs and structured diagnostics commonly wrap credentials in punctuation
+    // or attach them to otherwise innocuous labels. Check each credential-shaped
+    // component so `value=<credential>`, `(<credential>)`, and JSON arrays cannot
+    // bypass the same policy used for standalone provider tokens. Redact the
+    // containing lexical token as a whole rather than publishing a partial value.
+    value
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-')
+        })
+        .any(|component| {
+            component.len() >= 20
+                && ["ghp_", "github_pat_", "sk-", "xoxb-", "xoxp-", "akia"]
+                    .iter()
+                    .any(|prefix| {
+                        component
+                            .get(..prefix.len())
+                            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+                    })
+        })
 }
 
 fn is_path_token(token: &str) -> bool {
@@ -1125,6 +1137,43 @@ fn lex_tokens(value: &str) -> Vec<LexToken> {
 #[cfg(test)]
 mod tests {
     use super::{permits_lossless_evidence_text, redact_sensitive_text};
+
+    #[test]
+    fn provider_credentials_are_redacted_inside_punctuation_and_plain_labels() {
+        for prefix in ["ghp_", "github_pat_", "sk-", "xoxb-", "xoxp-", "AKIA"] {
+            let credential = format!("{prefix}abcdefghijklmnopqrstuvwxyz123456");
+            for value in [
+                credential.clone(),
+                format!("({credential})"),
+                format!("[{credential}],"),
+                format!("value={credential}"),
+                format!("detail:{credential}."),
+                format!(r#"{{"values":["{credential}"]}}"#),
+                format!("ordinary,{credential},text"),
+                format!("「{credential}」"),
+                format!("{credential}=value"),
+                format!("{credential}:value"),
+            ] {
+                let source = format!("inspect {value} now");
+                assert_eq!(redact_sensitive_text(&source), "inspect [REDACTED] now");
+                assert!(!permits_lossless_evidence_text(&source));
+            }
+        }
+    }
+
+    #[test]
+    fn provider_credential_detection_preserves_short_and_embedded_lookalikes() {
+        for source in [
+            "inspect ghp_short now",
+            "inspect (ghp_short) now",
+            "inspect notghp_abcdefghijklmnopqrstuvwxyz123456 now",
+            "inspect github_project now",
+            "inspect value=ordinary now",
+        ] {
+            assert_eq!(redact_sensitive_text(source), source);
+            assert!(permits_lossless_evidence_text(source));
+        }
+    }
 
     #[test]
     fn lossless_source_allows_multiline_indentation_and_cpu_fixture_syntax() {
